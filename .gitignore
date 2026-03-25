@@ -1,1 +1,9 @@
 **/iara-engine/target
+.agent/
+**.safetensors
+generation_config.json
+model.safetensors.index.json
+tokenizer_config.json
+tokenizer.json
+vocab.json
+Cargo.lock

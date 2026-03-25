@@ -1,0 +1,56 @@
+[package]
+name = "iara-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Motor de Ressonância IARA — Liquid Neural Network Physics Engine"
+
+[features]
+default  = ["stdp", "circadian", "actuator"]
+stdp     = []
+circadian = []
+actuator  = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+
+# Parallelism
+rayon = "1.10"
+
+# Machine Learning (GPU Acceleration)
+candle-core = { version = "0.8" }
+candle-nn = { version = "0.8" }
+
+# Native AMD ROCm Support (Direct Point)
+# Esta dependência exige o container ROCm para compilar (headers .h)
+rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", features = ["rocm_smi"] }
+
+# Float conversion (BF16 → F32)
+half = { version = "2", features = ["serde"] }
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Error handling (usado no liquid_network)
+anyhow = "1"
+
+# HuggingFace Tokenizer (BPE)
+tokenizers = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

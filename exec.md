@@ -1,0 +1,1 @@
+docker run --rm -it --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v /home/leonardo/projects/LLM/llm-lab:/models -p 8080:8080 iara-engine-rocm
