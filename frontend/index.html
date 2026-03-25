@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="IARA Resonance Engine — Painel de Observabilidade para Liquid Neural Networks">
+    <title>🧬 IARA — Motor de Ressonância</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- ── Header ── -->
+        <header class="header">
+            <div class="header-brand">
+                <span class="header-icon">🧬</span>
+                <div>
+                    <h1 class="header-title">IARA</h1>
+                    <p class="header-subtitle">Motor de Ressonância — Liquid Neural Network</p>
+                </div>
+            </div>
+            <div class="header-status">
+                <div id="connectionIndicator" class="status-dot disconnected"></div>
+                <span id="connectionText" class="status-text">Desconectado</span>
+            </div>
+        </header>
+
+        <!-- ── Main Layout ── -->
+        <main class="main">
+            <!-- ── Sidebar ── -->
+            <aside class="sidebar">
+                <!-- Estímulo -->
+                <section class="panel">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">💬</span> Estímulo
+                    </h2>
+                    <div class="input-group">
+                        <input type="text" id="promptInput" class="input-text"
+                               placeholder="Ex: carro, universo, amor..."
+                               autocomplete="off">
+                        <button id="btnSend" class="btn btn-secondary" title="Enviar estímulo rápido">Enviar</button>
+                    </div>
+                    <button id="btnResonate" class="btn btn-primary btn-full">🧬 Ressonar (Pipeline Completo)</button>
+                    <button id="btnReset" class="btn btn-secondary">🔄 Resetar</button>
+                </section>
+
+                <!-- Pipeline Progress -->
+                <section class="panel" id="pipelinePanel" style="display:none">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">⚡</span> Pipeline
+                    </h2>
+                    <div id="pipelinePhase" class="pipeline-phase">—</div>
+                    <div class="progress-bar-track">
+                        <div id="pipelineProgress" class="progress-bar-fill" style="width:0%"></div>
+                    </div>
+                </section>
+
+                <!-- Resposta do Modelo -->
+                <section class="panel" id="responsePanel" style="display:none">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">🎯</span> Resposta (Top Tokens)
+                    </h2>
+                    <div id="responseTime" class="response-time"></div>
+                    <div id="responseTokens" class="response-tokens"></div>
+                </section>
+
+                <!-- Métricas -->
+                <section class="panel">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">📊</span> Telemetria
+                    </h2>
+                    <div class="metrics-grid">
+                        <div class="metric">
+                            <span class="metric-label">Tick</span>
+                            <span id="metricTick" class="metric-value">0</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">FPS</span>
+                            <span id="metricFps" class="metric-value">0</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Energia</span>
+                            <span id="metricEnergy" class="metric-value">0.0</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Nós Ativos</span>
+                            <span id="metricActive" class="metric-value">0</span>
+                        </div>
+                        <div class="metric metric-wide">
+                            <span class="metric-label">Total de Nós</span>
+                            <span id="metricTotal" class="metric-value">0</span>
+                        </div>
+                        <div class="metric metric-wide">
+                            <span class="metric-label">Grid</span>
+                            <span id="metricGrid" class="metric-value">-</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Seletor de Camada -->
+                <section class="panel">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">🧩</span> Camada Ativa
+                    </h2>
+                    <div id="currentLayer" class="current-layer">—</div>
+                    <button id="btnListLayers" class="btn btn-secondary">📋 Listar Tensores</button>
+                    <div id="layerList" class="layer-list hidden"></div>
+                </section>
+
+                <!-- Log -->
+                <section class="panel">
+                    <h2 class="panel-title">
+                        <span class="panel-icon">📝</span> Log
+                    </h2>
+                    <div id="logContainer" class="log-container"></div>
+                </section>
+            </aside>
+
+            <!-- ── Visualização ── -->
+            <div class="visualization">
+                <div class="canvas-container">
+                    <!-- Mapa Cerebral (CfC LNN) -->
+                    <div class="canvas-wrapper brain-wrapper">
+                        <h3 class="canvas-label">🧠 Cérebro Líquido (CfC LNN)</h3>
+                        <canvas id="brainCanvas"></canvas>
+                        <div class="brain-stats">
+                            <div class="b-stat focus"><span>Focus</span><div id="barFocus" class="b-bar"></div></div>
+                            <div class="b-stat novelty"><span>Novelty</span><div id="barNovelty" class="b-bar"></div></div>
+                            <div class="b-stat drive"><span>Drive</span><div id="barDrive" class="b-bar"></div></div>
+                        </div>
+                    </div>
+
+                    <!-- Heatmap de Ativação -->
+                    <div class="canvas-wrapper heatmap-wrapper">
+                        <h3 class="canvas-label">🕸️ Ativação do Tensor</h3>
+                        <canvas id="heatmapCanvas"></canvas>
+                        <div class="canvas-overlay" id="canvasOverlay">
+                            <span class="overlay-text">Aguardando conexão WebSocket...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Legenda de cores -->
+                <div class="color-legend">
+                    <span class="legend-label">Negativo (frio)</span>
+                    <div class="legend-gradient"></div>
+                    <span class="legend-label">Positivo (quente)</span>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+# Usamos a imagem oficial de desenvolvimento da AMD ROCm (Ubuntu 24.04)
+FROM rocm/dev-ubuntu-24.04:6.3
+
+# Evita perguntas interativas
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Dependências de sistema recomendadas pela AMD + Necessárias para Rust Bindgen
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    clang \
+    libclang-dev \
+    llvm-dev \
+    pkg-config \
+    libssl-dev \
+    libstdc++-12-dev \
+    pciutils \
+    kmod \
+    rocm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instala o Rust estável
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Configuração de ambiente ROCm/AMD para Rust
+ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
+ENV ROCM_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
+# Variável CRÍTICA para o Rust Bindgen encontrar os headers da AMD
+ENV BINDGEN_EXTRA_CLANG_ARGS="-I/opt/rocm/include"
+
+WORKDIR /app
+COPY iara-engine/Cargo.toml ./iara-engine/
+COPY . .
+
+WORKDIR /app/iara-engine
+# Pre-build das dependências para agilizar
+RUN cargo fetch
+
+EXPOSE 8080
+
+# Executa em modo Release para performance máxima
+CMD ["cargo", "run", "--release", "--", "--model-dir", "/models"]

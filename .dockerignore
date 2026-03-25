@@ -1,0 +1,14 @@
+# Ignorar modelos pesados durante o build (eles entram via Volume)
+*.safetensors
+*.bin
+*.json
+!config.json
+!model.safetensors.index.json
+!tokenizer.json
+
+# Ignorar artefatos de compilação locais
+iara-engine/target
+trusting-noyce/target
+node_modules
+.git
+.claude
