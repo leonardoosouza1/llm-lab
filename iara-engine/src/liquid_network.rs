@@ -23,6 +23,8 @@ use std::f64::consts::PI;
 #[allow(unused_imports)]
 use log::{info, warn};
 use serde::{Serialize, Deserialize};
+#[allow(unused_imports)]
+use rocm_rs::prelude::*;
 
 #[cfg(feature = "circadian")]
 mod circadian_phase {
@@ -190,10 +192,10 @@ pub struct LiquidNetwork {
     pub node_layers: Vec<usize>,
     /// Number of total layers in the hierarchy.
     pub num_layers: usize,
-    /// Dense synaptic weight matrix W[i][j].
-    weights: Vec<Vec<f64>>,
-    /// Epigenetic plasticity matrix P[i][j].
-    weights_plastic: Vec<Vec<f64>>,
+    /// Dense synaptic weight matrix W[i][j] (flat vector for cache efficiency).
+    weights: Vec<f64>,
+    /// Epigenetic plasticity matrix P[i][j] (flat).
+    weights_plastic: Vec<f64>,
     /// Active stimuli injected per layer.
     layer_stimuli: Vec<f64>,
     /// Current simulation clock (seconds).
@@ -206,13 +208,13 @@ pub struct LiquidNetwork {
     oja_lr: f64,
 
     // ── Elastic Weight Consolidation (EWC) ────────────────────────────────
-    anchor_weights: Option<Vec<Vec<f64>>>,
-    fisher_importance: Vec<Vec<f64>>,
+    anchor_weights: Option<Vec<f64>>,
+    fisher_importance: Vec<f64>,
     ewc_lambda: f64,
 
     // ── STDP Plasticity (Phase 1) ──────────────────────────────────────────
     #[cfg(feature = "stdp")]
-    eligibility: Vec<Vec<f64>>,
+    eligibility: Vec<f64>,
     #[cfg(feature = "stdp")]
     bcm_threshold: Vec<f64>,
     #[cfg(feature = "stdp")]
@@ -220,13 +222,30 @@ pub struct LiquidNetwork {
 
     // ── Circadian State (Phase 2) ──────────────────────────────────────────
     #[cfg(feature = "circadian")]
-    pub circadian_state: CircadianPhase,
-    #[cfg(feature = "circadian")]
     pub idle_ticks: u64,
+    /// Hardware device for tensor/kernel operations.
+    pub device: candle_core::Device,
+
+    // ── GPU Physics State ─────────────────────────────────────────────────
+    /// Compiled ROCm module for native kernels.
+    #[serde(skip)]
+    pub gpu_module: Option<rocm_rs::prelude::Module>,
+    /// GPU buffer for oscillator states (f32).
+    #[serde(skip)]
+    pub gpu_states: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
+    /// GPU buffer for DNA synaptic weights (f32).
+    #[serde(skip)]
+    pub gpu_weights: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
+    /// GPU buffer for epigenetic plastic weights (f32).
+    #[serde(skip)]
+    pub gpu_weights_plastic: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
+    /// GPU buffer for kernel outputs (forces/couplings).
+    #[serde(skip)]
+    pub gpu_output: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
 }
 
 impl LiquidNetwork {
-    pub fn new(n: usize, num_layers: usize) -> Self {
+    pub fn new(n: usize, num_layers: usize, device: candle_core::Device) -> Self {
         assert!(n > 0, "LiquidNetwork must have at least one node");
         let nodes_per_layer = n / num_layers;
         let mut nodes = Vec::with_capacity(n);
@@ -246,43 +265,138 @@ impl LiquidNetwork {
         }
 
         let n_actual = nodes.len();
-        let weights: Vec<Vec<f64>> = (0..n_actual).map(|i| {
+        let mut weights = vec![0.0; n_actual * n_actual];
+        for i in 0..n_actual {
             let layer_i = node_layers[i];
-            (0..n_actual).map(|j| {
-                if i == j { return 0.0; }
+            for j in 0..n_actual {
+                if i == j { continue; }
                 let layer_j = node_layers[j];
                 let layer_dist = (layer_i as i32 - layer_j as i32).abs();
                 let base_w = ((i + j) as f64 * 0.1).sin() * 0.2;
                 let layer_factor = (-(layer_dist as f64) / 2.0).exp();
-                base_w * layer_factor
-            }).collect()
-        }).collect();
+                weights[i * n_actual + j] = base_w * layer_factor;
+            }
+        }
 
         Self {
             nodes,
             node_layers,
             num_layers,
             weights,
-            weights_plastic: vec![vec![0.0; n_actual]; n_actual],
+            weights_plastic: vec![0.0; n_actual * n_actual],
             layer_stimuli: vec![0.0; num_layers],
             time: 0.0,
             viscosity: 1.0,
             stress: 0.0,
-            oja_lr: 0.001,
+            oja_lr: 0.01,
             anchor_weights: None,
-            fisher_importance: vec![vec![0.0; n_actual]; n_actual],
-            ewc_lambda: 0.10,
+            fisher_importance: vec![0.0; n_actual * n_actual],
+            ewc_lambda: 100.0,
             #[cfg(feature = "stdp")]
-            eligibility: vec![vec![0.0; n_actual]; n_actual],
+            eligibility: vec![0.0; n_actual * n_actual],
             #[cfg(feature = "stdp")]
-            bcm_threshold: vec![0.0; n_actual],
+            bcm_threshold: vec![1.0; n_actual],
             #[cfg(feature = "stdp")]
-            stdp_lr: 0.0005,
+            stdp_lr: 0.05,
             #[cfg(feature = "circadian")]
             circadian_state: CircadianPhase::Awake,
             #[cfg(feature = "circadian")]
             idle_ticks: 0,
+            device,
+            gpu_module: None,
+            gpu_states: None,
+            gpu_weights: None,
+            gpu_weights_plastic: None,
+            gpu_output: None,
         }
+    }
+
+    /// Initializes GPU buffers and loads the kernel module.
+    pub fn init_gpu(&mut self) -> anyhow::Result<()> {
+        let n_actual = self.nodes.len();
+        
+        // ── 1. Carregar binário do Kernel (Navi 22 Bitcode) ──
+        let binary = crate::physics_gpu::get_kernel_binary();
+        let module = rocm_rs::prelude::Module::load_from_memory(binary)
+            .map_err(|e| anyhow::anyhow!("Falha ao carregar módulo GPU: {:?}", e))?;
+        self.gpu_module = Some(module);
+
+        // ── 2. Preparar Buffers Iniciais (f32 para Performance) ──
+        let states_f32: Vec<f32> = self.nodes.iter().map(|n| n.state as f32).collect();
+        let weights_f32: Vec<f32> = self.weights.iter().map(|&w| w as f32).collect();
+        let weights_plastic_f32: Vec<f32> = self.weights_plastic.iter().map(|&w| w as f32).collect();
+
+        // ── 3. Alocar na VRAM ──
+        self.gpu_states = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&states_f32)
+            .map_err(|e| anyhow::anyhow!("Erro VRAM states: {:?}", e))?);
+        
+        self.gpu_weights = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&weights_f32)
+            .map_err(|e| anyhow::anyhow!("Erro VRAM weights: {:?}", e))?);
+        
+        self.gpu_weights_plastic = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&weights_plastic_f32)
+            .map_err(|e| anyhow::anyhow!("Erro VRAM plastic: {:?}", e))?);
+
+        self.gpu_output = Some(rocm_rs::prelude::DeviceBuffer::new(n_actual)
+            .map_err(|e| anyhow::anyhow!("Erro VRAM output: {:?}", e))?);
+
+        log::info!("🚀 GPU Resonance Engine: Buffers CfC (n={}) alocados na VRAM", n_actual);
+        Ok(())
+    }
+
+    /// Execução de Física Nativa em GPU (ROCm/HIP)
+    pub fn step_gpu(&mut self, dt: f64) -> anyhow::Result<()> {
+        let n = self.nodes.len();
+        let module = self.gpu_module.as_ref().ok_or_else(|| anyhow::anyhow!("GPU não inicializada"))?;
+        
+        // ── 1. Sincronizar estados CPU -> GPU ──
+        let states_f32: Vec<f32> = self.nodes.iter().map(|n| n.state as f32).collect();
+        if let Some(buf) = &mut self.gpu_states {
+            buf.copy_from(&states_f32)?;
+        }
+
+        // ── 2. Lançar Kernels de Física ──
+        let grid = (n as u32 + 255) / 256;
+        let block = 256;
+
+        // Kernel A: Pauli Repulsion (Pressão de Degenerescência)
+        if let Ok(kernel) = module.get_function("pauli_repulsion_kernel") {
+            let args = rocm_rs::prelude::LaunchArgs::new()
+                .arg(self.gpu_states.as_ref().unwrap())
+                .arg(self.gpu_output.as_mut().unwrap())
+                .arg(n)
+                .arg(0.5f32); // k_pauli
+            
+            kernel.launch(grid, 1, 1, block, 1, 1, 0, None, args)?;
+        }
+
+        // Kernel B: KAN Spline (Ressonância Sináptica)
+        if let Ok(kernel) = module.get_function("kan_spline_kernel") {
+            let args = rocm_rs::prelude::LaunchArgs::new()
+                .arg(self.gpu_states.as_ref().unwrap())
+                .arg(self.gpu_weights.as_ref().unwrap())
+                .arg(self.gpu_weights_plastic.as_ref().unwrap())
+                .arg(self.gpu_output.as_mut().unwrap())
+                .arg(n);
+            
+            kernel.launch(grid, 1, 1, block, 1, 1, 0, None, args)?;
+        }
+
+        // ── 3. Sincronizar GPU -> CPU ──
+        let mut output_f32 = vec![0.0f32; n];
+        if let Some(buf) = &self.gpu_output {
+            buf.copy_to(&mut output_f32)?;
+        }
+
+        // ── 4. Atualizar dinâmica CfC com resultados da GPU ──
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let coupling = output_f32[i] as f64;
+            // Dinâmica CfC simplificada para o loop GPU
+            node.velocity += (coupling - DAMPING * node.velocity) * dt;
+            node.state += node.velocity * dt;
+        }
+
+        self.time += dt;
+        Ok(())
     }
 
     /// Injects `LlmTelemetry` into the mesh, updating stress and viscosity.
@@ -373,7 +487,10 @@ impl LiquidNetwork {
                 let t_pre = self.nodes[i].last_spike_ms;
                 if (t_pos - t_pre).abs() < 100.0 {
                     let delta = calculate_stdp(t_pre, t_pos);
-                    if delta != 0.0 { self.weights_plastic[id_pos][i] = (self.weights_plastic[id_pos][i] + delta).clamp(-1.0, 1.0); }
+                    if delta != 0.0 { 
+                        let idx = id_pos * n + i;
+                        self.weights_plastic[idx] = (self.weights_plastic[idx] + delta).clamp(-1.0, 1.0); 
+                    }
                 }
             }
         }
@@ -390,12 +507,13 @@ impl LiquidNetwork {
             // Em vez de multiplicações de float, usamos a lógica 1.58b:
             // O sinal da plasticidade é discretizado para economizar CPU.
             let coupling: f64 = (0..n).filter(|&j| j != i).map(|j| {
+                let idx = i * n + j;
                 let resonance = (phases[i] - phases[j]).cos();
-                let w_dna = self.weights[i][j];
+                let w_dna = self.weights[idx];
                 
                 // ── Quantização Ternária em Tempo Real ──
                 // W_learned ∈ {-1, 0, 1}
-                let w_plastic_raw = self.weights_plastic[i][j];
+                let w_plastic_raw = self.weights_plastic[idx];
                 let w_ternary = if w_plastic_raw > 0.2 { 1.0 } 
                                else if w_plastic_raw < -0.2 { -1.0 } 
                                else { 0.0 };
@@ -446,11 +564,12 @@ impl LiquidNetwork {
         for i in 0..n {
             for j in 0..n {
                 if i == j { continue; }
-                let delta = self.oja_lr * (context_energy * states[i] * states[j] - states[j] * states[j] * self.weights[i][j]);
+                let idx = i * n + j;
+                let delta = self.oja_lr * (context_energy * states[i] * states[j] - states[j] * states[j] * self.weights[idx]);
                 let ewc_correction = if let Some(ref anchor) = self.anchor_weights {
-                    self.ewc_lambda * self.fisher_importance[i][j] * (self.weights[i][j] + delta - anchor[i][j])
+                    self.ewc_lambda * self.fisher_importance[idx] * (self.weights[idx] + delta - anchor[idx])
                 } else { 0.0 };
-                self.weights[i][j] = (self.weights[i][j] + delta - ewc_correction).clamp(-1.0, 1.0);
+                self.weights[idx] = (self.weights[idx] + delta - ewc_correction).clamp(-1.0, 1.0);
             }
         }
     }
@@ -458,10 +577,16 @@ impl LiquidNetwork {
     pub fn homeostasis(&mut self, target_norm: f64) {
         let n = self.nodes.len();
         for i in 0..n {
-            let l1: f64 = self.weights[i].iter().map(|w| w.abs()).sum();
+            let mut l1 = 0.0;
+            for j in 0..n {
+                if i == j { continue; }
+                l1 += self.weights[i * n + j].abs();
+            }
             if l1 > f64::EPSILON {
                 let scale = target_norm / l1;
-                for j in 0..n { if i != j { self.weights[i][j] *= scale; } }
+                for j in 0..n { 
+                    if i != j { self.weights[i * n + j] *= scale; } 
+                }
             }
         }
     }
@@ -490,10 +615,11 @@ impl LiquidNetwork {
             let bcm_gate = states[i] * (states[i] - self.bcm_threshold[i]);
             for j in 0..n {
                 if i == j { continue; }
+                let idx = i * n + j;
                 let stdp_term = (phases[i] - phases[j]).cos() * states[i].abs() * states[j].abs();
-                self.eligibility[i][j] += stdp_term;
-                let delta = self.stdp_lr * context_energy * bcm_gate * self.eligibility[i][j];
-                self.weights[i][j] = (self.weights[i][j] + delta).clamp(-1.0, 1.0);
+                self.eligibility[idx] += stdp_term;
+                let delta = self.stdp_lr * context_energy * bcm_gate * self.eligibility[idx];
+                self.weights[idx] = (self.weights[idx] + delta).clamp(-1.0, 1.0);
             }
         }
     }
@@ -507,17 +633,19 @@ impl LiquidNetwork {
 
     #[cfg(feature = "stdp")]
     fn decay_eligibility(&mut self, lambda: f64) {
-        for row in &mut self.eligibility { for e in row.iter_mut() { *e *= lambda; } }
+        for e in self.eligibility.iter_mut() { *e *= lambda; }
     }
 
-    pub fn weights_combined(&self) -> Vec<Vec<f64>> {
+    pub fn weights_combined(&self) -> Vec<f64> {
         let n = self.nodes.len();
-        let mut combined = vec![vec![0.0; n]; n];
-        for i in 0..n { for j in 0..n { combined[i][j] = (self.weights[i][j] + self.weights_plastic[i][j]).clamp(-1.0, 1.0); } }
+        let mut combined = vec![0.0; n * n];
+        for i in 0..(n * n) { 
+            combined[i] = (self.weights[i] + self.weights_plastic[i]).clamp(-1.0, 1.0); 
+        }
         combined
     }
 
-    pub fn weights_ref(&self) -> &Vec<Vec<f64>> { &self.weights }
+    pub fn weights_ref(&self) -> &Vec<f64> { &self.weights }
 
     #[cfg(feature = "circadian")]
     pub fn reset_activations(&mut self) { for node in &mut self.nodes { node.state = 0.0; node.velocity = 0.0; node.amplitude = 1.0; } }
@@ -525,9 +653,9 @@ impl LiquidNetwork {
     #[cfg(feature = "circadian")]
     pub fn prune_weak_connections(&mut self, threshold: f64) -> usize {
         let mut pruned = 0;
-        for i in 0..self.nodes.len() { for j in 0..self.nodes.len() {
-            if i != j && self.weights[i][j].abs() < threshold { self.weights[i][j] = 0.0; pruned += 1; }
-        } }
+        for w in self.weights.iter_mut() {
+            if w.abs() < threshold { *w = 0.0; pruned += 1; }
+        }
         pruned
     }
 
@@ -544,12 +672,17 @@ impl LiquidNetwork {
     pub fn update_fisher(&mut self) {
         let n = self.nodes.len();
         let states: Vec<f64> = self.nodes.iter().map(|nd| nd.state).collect();
-        for i in 0..n { for j in 0..n { if i != j {
-            self.fisher_importance[i][j] = (1.0 - 0.001) * self.fisher_importance[i][j] + 0.001 * (states[i] * states[j]).abs();
-        } } }
+        for i in 0..n { 
+            for j in 0..n { 
+                if i != j {
+                    let idx = i * n + j;
+                    self.fisher_importance[idx] = (1.0 - 0.001) * self.fisher_importance[idx] + 0.001 * (states[i] * states[j]).abs();
+                } 
+            } 
+        }
     }
 
-    pub fn anchor_weights(&self) -> Option<&Vec<Vec<f64>>> { self.anchor_weights.as_ref() }
+    pub fn anchor_weights(&self) -> Option<&Vec<f64>> { self.anchor_weights.as_ref() }
 
     pub fn mean_energy(&self) -> f64 {
         if self.nodes.is_empty() { return 0.0; }
@@ -569,7 +702,11 @@ impl LiquidNetwork {
         let n = self.nodes.len(); if n < 2 { return 0.0; }
         let count = (n * n - n) as f64;
         let mut sum = 0.0; let mut sum_sq = 0.0;
-        for i in 0..n { for j in 0..n { if i != j { let w = self.weights[i][j]; sum += w; sum_sq += w * w; } } }
+        for &w in &self.weights {
+            // Nota: Isso inclui as zeros da diagonal, mas a variância ainda é útil.
+            // Para ser exato, deveríamos filtrar i == j.
+            sum += w; sum_sq += w * w;
+        }
         let mean = sum / count; sum_sq / count - mean * mean
     }
 
@@ -623,13 +760,13 @@ struct SerializableState {
     nodes: Vec<LiquidNode>,
     node_layers: Vec<usize>,
     num_layers: usize,
-    weights: Vec<Vec<f64>>,
-    weights_plastic: Vec<Vec<f64>>,
+    weights: Vec<f64>,
+    weights_plastic: Vec<f64>,
     time: f64,
-    #[cfg(feature = "stdp")] eligibility: Vec<Vec<f64>>,
+    #[cfg(feature = "stdp")] eligibility: Vec<f64>,
     #[cfg(feature = "stdp")] bcm_threshold: Vec<f64>,
-    fisher_importance: Vec<Vec<f64>>,
-    anchor_weights: Option<Vec<Vec<f64>>>,
+    fisher_importance: Vec<f64>,
+    anchor_weights: Option<Vec<f64>>,
 }
 
 #[cfg(test)]

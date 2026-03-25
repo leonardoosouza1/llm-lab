@@ -394,10 +394,12 @@ impl Actuator for FocusActuator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
     use crate::liquid_network::{LiquidNetwork, LlmTelemetry};
+    use std::sync::{Arc, Mutex};
 
     fn make_net() -> Arc<Mutex<LiquidNetwork>> {
-        Arc::new(Mutex::new(LiquidNetwork::new(12)))
+        Arc::new(Mutex::new(LiquidNetwork::new(12, 2, Device::Cpu)))
     }
 
     #[test]

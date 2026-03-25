@@ -5,6 +5,7 @@ edition = "2021"
 description = "Motor de Ressonância IARA — Liquid Neural Network Physics Engine"
 
 [features]
+# Features padrão: lógica de simulação ativada por padrão
 default  = ["stdp", "circadian", "actuator"]
 stdp     = []
 circadian = []
@@ -33,9 +34,8 @@ rayon = "1.10"
 candle-core = { version = "0.8" }
 candle-nn = { version = "0.8" }
 
-# Native AMD ROCm Support (Direct Point)
-# Esta dependência exige o container ROCm para compilar (headers .h)
-rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", features = ["rocm_smi"] }
+# Native ROCm Kernels
+rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", branch = "master", features = ["macros"] }
 
 # Float conversion (BF16 → F32)
 half = { version = "2", features = ["serde"] }

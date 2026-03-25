@@ -7,6 +7,7 @@
 
 use crate::physics::NeuronioCfC;
 use rayon::prelude::*;
+use candle_core::Device;
 
 /// Estado da simulação: array de neurônios CfC + metadata
 pub struct Simulation {
@@ -14,11 +15,27 @@ pub struct Simulation {
     pub layer_name: String,
     pub tick_count: u64,
     pub grid_size: usize,
+    pub device: Device,
 }
 
 impl Simulation {
+    /// Instancia uma nova simulação com n neurônios padrão
+    pub fn new(n: usize, device: Device) -> Self {
+        let nodes: Vec<NeuronioCfC> = (0..n)
+            .map(|_| NeuronioCfC::from_weight(0.1))
+            .collect();
+
+        Simulation {
+            nodes,
+            layer_name: "default".to_string(),
+            tick_count: 0,
+            grid_size: 128,
+            device,
+        }
+    }
+
     /// Instancia neurônios CfC a partir de um array de pesos f32
-    pub fn from_weights(weights: &[f32], layer_name: &str) -> Self {
+    pub fn from_weights(weights: &[f32], layer_name: &str, device: Device) -> Self {
         log::info!(
             "🧪 Instanciando {} neurônios CfC (LTC) para '{}'",
             weights.len(),
@@ -37,6 +54,7 @@ impl Simulation {
             layer_name: layer_name.to_string(),
             tick_count: 0,
             grid_size: 128,
+            device,
         }
     }
 
@@ -60,6 +78,17 @@ impl Simulation {
 
     /// Atualiza todos os neurônios e processa propagação de sinal CfC + Kuramoto (GABA)
     pub fn tick(&mut self, dt: f32) {
+        // ── Escolha de Backend: GPU vs CPU ──
+        if let Device::Cuda(_) = self.device {
+            // No primeiro run, usamos CPU para garantir estabilidade, 
+            // mas o motor já sabe que a GPU está lá.
+            self.tick_cpu(dt);
+        } else {
+            self.tick_cpu(dt);
+        }
+    }
+
+    fn tick_cpu(&mut self, dt: f32) {
         // 1. Atualizar dinâmica interna (Closed-form) em paralelo
         self.nodes.par_iter_mut().for_each(|node| {
             node.tick(0.0, dt);

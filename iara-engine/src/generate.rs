@@ -42,7 +42,7 @@ pub async fn generate_response(
         let input_tensor = Tensor::new(input_ids, &device)?.unsqueeze(0)?;
 
         // 3. Forward Pass com consciência de posição
-        let mut logits = model.forward(&input_tensor, tokens.len() - input_ids.len())?;
+        let logits = model.forward(&input_tensor, tokens.len() - input_ids.len())?;
         
         // ── Interceptação de Logits (Filtro de Intuição) ──
         // Aqui o Rust atua "entre o tensor e a resposta".

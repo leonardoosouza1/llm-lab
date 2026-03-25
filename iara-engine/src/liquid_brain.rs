@@ -233,7 +233,7 @@ fn top_synapses(net: &LiquidNetwork, _nodes: &[NodeViz], top_n: usize) -> Vec<Sy
     for i in 0..n {
         for j in 0..n {
             if i == j { continue; }
-            let w = weights[i][j] as f32;
+            let w = weights[i * n + j] as f32;
             let aw = w.abs();
             if aw < 0.05 { continue; } // ignorar conexões fracas
 

@@ -19,6 +19,7 @@ mod liquid_network;
 mod model;
 mod nlm_orchestrator;
 mod physics;
+mod physics_gpu;
 mod pipeline;
 mod proprioception;
 mod prompt;
@@ -59,21 +60,26 @@ struct EngineConfig {
     device: Device,
 }
 
-impl Default for EngineConfig {
-    fn default() -> Self {
+impl EngineConfig {
+    fn new() -> Self {
         // ── Override de GPU AMD (ROCm) ──
+        // Para GPUs Navi 2x (RX 6000), o ROCm as vezes precisa de um override 
+        // para funcionar corretamente no Linux se o driver for genérico.
         if std::env::var("HSA_OVERRIDE_GFX_VERSION").is_err() {
             std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
         }
 
         // Tentar usar GPU (Candle tentará carregar HIP/ROCm em runtime)
-        // O override HSA acima garante que a Navi 22 seja detectada.
-        let device = Device::new_cuda(0).unwrap_or_else(|_| {
-            log::warn!("⚠️ GPU não detectada via Candle. Verifique drivers ROCm.");
-            Device::Cpu
-        });
-
-        log::info!("🎯 Hardware Selecionado: {:?}", device);
+        let device = match Device::new_cuda(0) {
+            Ok(d) => {
+                log::info!("🎯 Hardware Selecionado: GPU/HIP ({:?})", d);
+                d
+            }
+            Err(e) => {
+                log::warn!("⚠️ GPU não detectada ou erro no driver: {:?}. Usando CPU.", e);
+                Device::Cpu
+            }
+        };
 
         EngineConfig {
             model_dir: PathBuf::from("."),
@@ -89,9 +95,15 @@ impl Default for EngineConfig {
     }
 }
 
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn parse_args() -> EngineConfig {
     let args: Vec<String> = std::env::args().collect();
-    let mut config = EngineConfig::default();
+    let mut config = EngineConfig::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -159,11 +171,24 @@ fn parse_args() -> EngineConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── PASSO 0: Override de Hardware (CRÍTICO) ──
+    // Deve ser a primeira linha do binário.
+    std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
+
     // Inicializar logging
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_millis()
         .init();
+
+    log::info!("🚀 IARA Engine Iniciando...");
+
+    // Validar se o driver ROCm está vendo a RX 6750 XT
+    if candle_core::utils::cuda_is_available() {
+        log::info!("🔥 GPU HEARTBEAT: AMD ROCm/HIP detectado e pronto para o Direct Point!");
+    } else {
+        log::warn!("⚠️ GPU HEARTBEAT: Placa AMD não detectada. Verifique o container ROCm.");
+    }
 
     let config = parse_args();
     let mut config = config; // Torna mutável para injetar ModelConfig
@@ -238,13 +263,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── 4. Instanciar simulação ──
-    let mut sim = Simulation::from_weights(&weights, &initial_layer);
+    let mut sim = Simulation::from_weights(&weights, &initial_layer, config.device.clone());
     sim.grid_size = config.grid_size;
 
     // ── 4b. LiquidNetwork neuromórfica (STDP + EWC + Homeostase) ──
     let num_layers = config.model_config.as_ref().map(|c| c.num_hidden_layers).unwrap_or(32);
     // Usamos 256 osciladores distribuídos pelas camadas.
-    let liquid_net = Arc::new(StdMutex::new(LiquidNetwork::new(256, num_layers)));
+    let liquid_net = Arc::new(StdMutex::new(LiquidNetwork::new(256, num_layers, config.device.clone())));
+    
+    // ── 4c. Inicializar GPU Physics se disponível ──
+    if !config.device.is_cpu() {
+        if let Err(e) = liquid_net.lock().unwrap().init_gpu() {
+            log::warn!("⚠️ Falha ao inicializar kernels GPU (usando path CPU): {}", e);
+        }
+    }
 
     // Restaurar estado consolidado da sessão anterior
     {
@@ -309,7 +341,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(tel) = lnn_rx.try_recv() {
                     net.inject_telemetry(&tel);
                 }
-                let _ = net.step();
+                if net.device.is_cpu() {
+                    let _ = net.step();
+                } else if net.gpu_module.is_some() {
+                    let _ = net.step_gpu(0.01);
+                } else {
+                    let _ = net.step(); // Fallback CPU
+                }
                 slow_tick += 1;
                 if slow_tick % 100 == 0 {
                     let energy = net.mean_energy();
@@ -453,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut model = model_arc.lock().await;
                         
                         match crate::generate::generate_response(&text, &mut model, &ftx, 100).await {
-                            Ok(full_response) => {
+                            Ok(_full_response) => {
                                 log::info!("✅ Resposta completa gerada");
                                 let _ = ftx.send(serde_json::json!({
                                     "type": "status",
@@ -487,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 tensor_data.data
                             };
-                            *sim_lock = Simulation::from_weights(&w, &name);
+                            *sim_lock = Simulation::from_weights(&w, &name, config.device.clone());
                             sim_lock.grid_size = config.grid_size;
 
                             let status = serde_json::json!({

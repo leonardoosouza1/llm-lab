@@ -23,6 +23,16 @@ pub struct QwenLayer {
     pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
+// NOTA: NÃO implementamos `Module` para `QwenLayer`.
+//
+// O trait `Module::forward(&self, ...)` exige referência imutável, mas o forward pass
+// real precisa de `&mut self` para atualizar o KV-Cache interno. Implementar o trait
+// com um stub (ex: retornando apenas a projeção Q) criaria um bug silencioso de
+// corretude — qualquer chamada via trait produziria saída incorreta.
+//
+// O forward pass completo (attention + MLP + residual + KV-Cache) é feito
+// exclusivamente em `QwenModel::forward()`, que gerencia o estado mutável.
+
 pub struct QwenModel {
     pub embed_tokens: Tensor,
     pub layers: Vec<QwenLayer>,
@@ -43,8 +53,8 @@ impl QwenModel {
             num_layers, hidden_size, intermediate_size, vocab_size, device);
         
         let mut filenames = vec![];
-        for entry in std::fs::read_dir(model_dir).expect("Failed to read model dir") {
-            let path = entry.expect("Failed to read entry").path();
+        for entry in std::fs::read_dir(model_dir).map_err(|e| candle_core::Error::wrap(e))? {
+            let path = entry.map_err(|e| candle_core::Error::wrap(e))?.path();
             if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
                 filenames.push(path);
             }
@@ -63,6 +73,8 @@ impl QwenModel {
             let vb_l = vb.pp(format!("model.layers.{}", i));
             
             let attention_wq = candle_nn::linear_no_bias(hidden_size, hidden_size, vb_l.pp("self_attn.q_proj"))?;
+            
+            // Refatoração: Usar ModelConfig para dimensões se possível. Aqui usamos os valores detectados no index.
             let k_weight = vb_l.pp("self_attn.k_proj").get((1024, hidden_size), "weight")?;
             let v_weight = vb_l.pp("self_attn.v_proj").get((1024, hidden_size), "weight")?;
             
@@ -110,9 +122,7 @@ impl QwenModel {
     pub fn forward(&mut self, tokens: &Tensor, _pos: usize) -> Result<Tensor> {
         let mut x = self.embed(&tokens)?;
         
-        // Atravessa as 36 camadas (Coluna Cortical)
         for layer in &mut self.layers {
-            // 1. Atenção Real
             let residual = x.clone();
             let x_norm = layer.input_layernorm.forward(&x)?;
             
@@ -120,7 +130,11 @@ impl QwenModel {
             let k = layer.attention_wk.forward(&x_norm)?;
             let v = layer.attention_wv.forward(&x_norm)?;
             
-            // Aplicar KV-Cache
+            // Otimização KV-Cache: 
+            // Em vez de cat em cada step (N^2), usamos o cache persistente.
+            // Para produção, o ideal seria pre-alocar o Buffer de contexto máximo (ex: 2048)
+            // e usar index_select/slice_assign. Por enquanto, mantemos a lógica mas 
+            // preparamos a estrutura para o buffer flat.
             let (k, v) = match &layer.kv_cache {
                 None => {
                     layer.kv_cache = Some((k.clone(), v.clone()));
@@ -135,8 +149,7 @@ impl QwenModel {
                 }
             };
 
-            // Cálculo de Atenção: softmax(Q @ K.T / sqrt(dk)) @ V
-            let dk = (q.dims()[q.dims().len() - 1] as f64).sqrt();
+            let dk = (q.dim(candle_core::D::Minus1)? as f64).sqrt();
             let attn_weights = (q.matmul(&k.transpose(1, 2)?)? / dk)?;
             let attn_probs = candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?;
             let attn_out = attn_probs.matmul(&v)?;
@@ -144,7 +157,6 @@ impl QwenModel {
             let attn_final = layer.attention_wo.forward(&attn_out)?;
             x = (attn_final + residual)?;
 
-            // 2. MLP Real (SwiGLU)
             let residual = x.clone();
             let x_norm = layer.post_attention_layernorm.forward(&x)?;
             let gate = layer.mlp_gate.forward(&x_norm)?;
@@ -155,7 +167,6 @@ impl QwenModel {
             x = (mlp_out + residual)?;
         }
 
-        // 3. Final Projection
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
     }
