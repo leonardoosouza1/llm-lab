@@ -7,3 +7,5 @@ tokenizer_config.json
 tokenizer.json
 vocab.json
 Cargo.lock
+models/*
+target/*

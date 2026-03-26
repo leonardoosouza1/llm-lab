@@ -1,9 +1,9 @@
 // ============================================================================
-// api/handlers.rs — HTTP Handlers for IARA Ollama API
+// api/handlers.rs — HTTP Handlers for IARA API
 // ============================================================================
-// POST /api/generate — Main generation endpoint (streaming + non-streaming)
-// GET /api/debug/last-trace — Retrieve last brain trace analysis
-// GET /health — Health check
+// POST /api/generate — generation endpoint (non-streaming)
+// GET /api/debug/last-trace — retrieve last brain trace
+// GET /health — health check
 // ============================================================================
 
 use axum::{
@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::debug::BrainTrace;
-use crate::qwen::GenerationStep;
+use crate::debug::brain::BrainTrace;
+use crate::model::QwenModel;
+use crate::qwen::forward_traced;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Request/Response Types
@@ -49,19 +50,6 @@ pub struct GenerateResponse {
     pub prompt_eval_count: u32,
     pub eval_count: u32,
     pub eval_duration: u128,
-    // IARA-specific
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub layer_activations: Option<Vec<String>>, // JSON string for streaming
-}
-
-#[derive(Debug, Serialize)]
-pub struct StreamChunk {
-    pub model: String,
-    pub created_at: String,
-    pub response: String,
-    pub done: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub layer_activations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,19 +66,22 @@ pub struct HealthResponse {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub qwen_model: Arc<Mutex<crate::qwen::QwenModel>>,
-    pub tokenizer: Arc<crate::tokenizer::Tokenizer>,
-    pub iara: Arc<crate::iara::IARAContext>,
+    /// None enquanto o modelo ainda está carregando
+    pub qwen_model: Arc<Mutex<Option<QwenModel>>>,
     pub last_trace: Arc<Mutex<Option<BrainTrace>>>,
+    pub model_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn health_handler() -> Json<HealthResponse> {
+pub async fn health_handler(
+    State(state): State<AppState>,
+) -> Json<HealthResponse> {
+    let ready = state.model_ready.load(std::sync::atomic::Ordering::Relaxed);
     Json(HealthResponse {
-        status: "ok".to_string(),
+        status: if ready { "ok".to_string() } else { "loading".to_string() },
         model: "qwen3-8b".to_string(),
         version: "1.0.0".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -154,112 +145,72 @@ async fn generate_internal(
 ) -> Result<GenerateResponse, Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
 
+    // Check model is ready
+    if !state.model_ready.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Modelo ainda carregando, aguarde...".into());
+    }
+
     // 1. Tokenize input
-    let token_ids = state.tokenizer.encode(&req.prompt)?;
+    let tokens = crate::tokenizer::tokenize(&req.prompt);
+    let token_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
     let prompt_eval_count = token_ids.len() as u32;
     let mut current_tokens = token_ids.clone();
-    let mut generated_tokens = String::new();
+    let mut generated_text = String::new();
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
 
+    // Qwen3-8B EOS token id = 151645
+    const EOS_TOKEN: u32 = 151645;
+
     // 2. Generation loop
-    for step in 0..req.max_tokens {
+    for _ in 0..req.max_tokens {
         if current_tokens.is_empty() {
             break;
         }
 
-        let last_token = *current_tokens.last().unwrap();
+        let gen_step = {
+            let mut model_guard = state.qwen_model.lock().await;
+            let model = model_guard.as_mut().ok_or("Model not loaded")?;
+            forward_traced(model, &current_tokens)
+                .map_err(|e| format!("Forward pass error: {}", e))?
+        };
 
-        // Forward pass with tracing
-        let mut model = state.qwen_model.lock().await;
-        let gen_step = crate::qwen::forward_and_trace(
-            &*model,
-            last_token,
-            current_tokens.len(),
-        )
-        .await?;
-
-        drop(model);
-
-        // Sample next token
-        let next_token = sample_token(&gen_step.logits, req.temperature, req.top_k)?;
-
-        // Accumulate response
-        generated_tokens.push_str(&gen_step.token_str);
-        brain_trace.add_step(gen_step.clone());
-
-        // Trigger IARA simulation (async, non-blocking)
-        let iara = state.iara.clone();
-        let traces = gen_step.layer_traces.clone();
-        tokio::spawn(async move {
-            if let Ok(snapshot) = crate::iara::inject_and_simulate(&iara, &traces).await {
-                log::debug!(
-                    "🧠 IARA: {} active nodes, energy={:.2}",
-                    snapshot.nodes_active,
-                    snapshot.mean_energy
-                );
-            }
-        });
+        let next_token = gen_step.token_id;
+        generated_text.push_str(&gen_step.token_str);
+        brain_trace.add_step(gen_step);
 
         current_tokens.push(next_token);
         eval_count += 1;
 
-        // Check stopping condition
-        if next_token == state.tokenizer.eos_token() {
+        if next_token == EOS_TOKEN {
             break;
         }
     }
 
-    // 3. Save trace for debugging
+    // 3. Save trace
     brain_trace.finalize();
-    *state.last_trace.lock().await = Some(brain_trace.clone());
+    *state.last_trace.lock().await = Some(brain_trace);
 
     let total_duration = start_time.elapsed();
-    let eval_duration = start_time.elapsed(); // Simplified; could track precisely
 
     Ok(GenerateResponse {
         model: req.model.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
-        response: generated_tokens,
+        response: generated_text,
         done: true,
         context: Some(current_tokens),
         total_duration: total_duration.as_millis(),
         prompt_eval_count,
         eval_count,
-        eval_duration: eval_duration.as_millis(),
-        layer_activations: None,
+        eval_duration: total_duration.as_millis(),
     })
-}
-
-fn sample_token(
-    logits: &[f32],
-    temperature: f32,
-    top_k: u32,
-) -> Result<u32, Box<dyn std::error::Error>> {
-    // Simple greedy sampling (can be improved with top-k, top-p)
-    let idx = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(i, _)| i as u32)
-        .ok_or("Empty logits")?;
-
-    Ok(idx)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default Values
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn default_temperature() -> f32 {
-    0.7
-}
-
-fn default_top_k() -> u32 {
-    40
-}
-
-fn default_max_tokens() -> usize {
-    100
-}
+fn default_temperature() -> f32 { 0.7 }
+fn default_top_k() -> u32 { 40 }
+fn default_max_tokens() -> usize { 100 }

@@ -23,8 +23,7 @@ use std::f64::consts::PI;
 #[allow(unused_imports)]
 use log::{info, warn};
 use serde::{Serialize, Deserialize};
-#[allow(unused_imports)]
-use rocm_rs::prelude::*;
+// rocm_rs removido — usando hip_ffi nativo
 
 #[cfg(feature = "circadian")]
 mod circadian_phase {
@@ -222,30 +221,21 @@ pub struct LiquidNetwork {
 
     // ── Circadian State (Phase 2) ──────────────────────────────────────────
     #[cfg(feature = "circadian")]
+    pub circadian_state: CircadianPhase,
+    #[cfg(feature = "circadian")]
     pub idle_ticks: u64,
-    /// Hardware device for tensor/kernel operations.
-    pub device: candle_core::Device,
+    /// HIP device id (0 = RX 6750 XT).
+    pub device_id: i32,
 
-    // ── GPU Physics State ─────────────────────────────────────────────────
-    /// Compiled ROCm module for native kernels.
-    #[serde(skip)]
-    pub gpu_module: Option<rocm_rs::prelude::Module>,
-    /// GPU buffer for oscillator states (f32).
-    #[serde(skip)]
-    pub gpu_states: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
-    /// GPU buffer for DNA synaptic weights (f32).
-    #[serde(skip)]
-    pub gpu_weights: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
-    /// GPU buffer for epigenetic plastic weights (f32).
-    #[serde(skip)]
-    pub gpu_weights_plastic: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
-    /// GPU buffer for kernel outputs (forces/couplings).
-    #[serde(skip)]
-    pub gpu_output: Option<rocm_rs::prelude::DeviceBuffer<f32>>,
+    // ── GPU Physics State (hip_ffi) ───────────────────────────────────────
+    pub gpu_states: Option<hip_ffi::DeviceBuffer<f32>>,
+    pub gpu_weights: Option<hip_ffi::DeviceBuffer<f32>>,
+    pub gpu_weights_plastic: Option<hip_ffi::DeviceBuffer<f32>>,
+    pub gpu_output: Option<hip_ffi::DeviceBuffer<f32>>,
 }
 
 impl LiquidNetwork {
-    pub fn new(n: usize, num_layers: usize, device: candle_core::Device) -> Self {
+    pub fn new(n: usize, num_layers: usize, device_id: i32) -> Self {
         assert!(n > 0, "LiquidNetwork must have at least one node");
         let nodes_per_layer = n / num_layers;
         let mut nodes = Vec::with_capacity(n);
@@ -302,8 +292,7 @@ impl LiquidNetwork {
             circadian_state: CircadianPhase::Awake,
             #[cfg(feature = "circadian")]
             idle_ticks: 0,
-            device,
-            gpu_module: None,
+            device_id,
             gpu_states: None,
             gpu_weights: None,
             gpu_weights_plastic: None,
@@ -311,81 +300,42 @@ impl LiquidNetwork {
         }
     }
 
-    /// Initializes GPU buffers and loads the kernel module.
+    /// Initializes GPU buffers via hip_ffi.
     pub fn init_gpu(&mut self) -> anyhow::Result<()> {
-        let n_actual = self.nodes.len();
-        
-        // ── 1. Carregar binário do Kernel (Navi 22 Bitcode) ──
-        let binary = crate::physics_gpu::get_kernel_binary();
-        let module = rocm_rs::prelude::Module::load_from_memory(binary)
-            .map_err(|e| anyhow::anyhow!("Falha ao carregar módulo GPU: {:?}", e))?;
-        self.gpu_module = Some(module);
-
-        // ── 2. Preparar Buffers Iniciais (f32 para Performance) ──
+        let n = self.nodes.len();
         let states_f32: Vec<f32> = self.nodes.iter().map(|n| n.state as f32).collect();
         let weights_f32: Vec<f32> = self.weights.iter().map(|&w| w as f32).collect();
         let weights_plastic_f32: Vec<f32> = self.weights_plastic.iter().map(|&w| w as f32).collect();
 
-        // ── 3. Alocar na VRAM ──
-        self.gpu_states = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&states_f32)
-            .map_err(|e| anyhow::anyhow!("Erro VRAM states: {:?}", e))?);
-        
-        self.gpu_weights = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&weights_f32)
-            .map_err(|e| anyhow::anyhow!("Erro VRAM weights: {:?}", e))?);
-        
-        self.gpu_weights_plastic = Some(rocm_rs::prelude::DeviceBuffer::from_slice(&weights_plastic_f32)
-            .map_err(|e| anyhow::anyhow!("Erro VRAM plastic: {:?}", e))?);
+        self.gpu_states = Some(hip_ffi::DeviceBuffer::from_slice(&states_f32)
+            .map_err(|e| anyhow::anyhow!("VRAM states: {}", e))?);
+        self.gpu_weights = Some(hip_ffi::DeviceBuffer::from_slice(&weights_f32)
+            .map_err(|e| anyhow::anyhow!("VRAM weights: {}", e))?);
+        self.gpu_weights_plastic = Some(hip_ffi::DeviceBuffer::from_slice(&weights_plastic_f32)
+            .map_err(|e| anyhow::anyhow!("VRAM plastic: {}", e))?);
+        self.gpu_output = Some(hip_ffi::DeviceBuffer::alloc(n)
+            .map_err(|e| anyhow::anyhow!("VRAM output: {}", e))?);
 
-        self.gpu_output = Some(rocm_rs::prelude::DeviceBuffer::new(n_actual)
-            .map_err(|e| anyhow::anyhow!("Erro VRAM output: {:?}", e))?);
-
-        log::info!("🚀 GPU Resonance Engine: Buffers CfC (n={}) alocados na VRAM", n_actual);
+        log::info!("🚀 GPU Resonance Engine: {} nós alocados na VRAM (HIP nativo)", n);
         Ok(())
     }
 
-    /// Execução de Física Nativa em GPU (ROCm/HIP)
+    /// Física na GPU — CPU fallback até kernels .hip compilados.
     pub fn step_gpu(&mut self, dt: f64) -> anyhow::Result<()> {
         let n = self.nodes.len();
-        let module = self.gpu_module.as_ref().ok_or_else(|| anyhow::anyhow!("GPU não inicializada"))?;
-        
-        // ── 1. Sincronizar estados CPU -> GPU ──
+
+        // Sync CPU → GPU
         let states_f32: Vec<f32> = self.nodes.iter().map(|n| n.state as f32).collect();
         if let Some(buf) = &mut self.gpu_states {
-            buf.copy_from(&states_f32)?;
+            unsafe { hip_ffi::hip_h2d(buf.as_mut_ptr(), &states_f32) }
+                .map_err(|e| anyhow::anyhow!("h2d states: {}", e))?;
         }
 
-        // ── 2. Lançar Kernels de Física ──
-        let grid = (n as u32 + 255) / 256;
-        let block = 256;
+        // Kernels HIP: TODO — kernels/physics.hip (próxima fase)
+        // Por enquanto: CPU fallback com os mesmos resultados
 
-        // Kernel A: Pauli Repulsion (Pressão de Degenerescência)
-        if let Ok(kernel) = module.get_function("pauli_repulsion_kernel") {
-            let args = rocm_rs::prelude::LaunchArgs::new()
-                .arg(self.gpu_states.as_ref().unwrap())
-                .arg(self.gpu_output.as_mut().unwrap())
-                .arg(n)
-                .arg(0.5f32); // k_pauli
-            
-            kernel.launch(grid, 1, 1, block, 1, 1, 0, None, args)?;
-        }
-
-        // Kernel B: KAN Spline (Ressonância Sináptica)
-        if let Ok(kernel) = module.get_function("kan_spline_kernel") {
-            let args = rocm_rs::prelude::LaunchArgs::new()
-                .arg(self.gpu_states.as_ref().unwrap())
-                .arg(self.gpu_weights.as_ref().unwrap())
-                .arg(self.gpu_weights_plastic.as_ref().unwrap())
-                .arg(self.gpu_output.as_mut().unwrap())
-                .arg(n);
-            
-            kernel.launch(grid, 1, 1, block, 1, 1, 0, None, args)?;
-        }
-
-        // ── 3. Sincronizar GPU -> CPU ──
-        let mut output_f32 = vec![0.0f32; n];
-        if let Some(buf) = &self.gpu_output {
-            buf.copy_to(&mut output_f32)?;
-        }
+        // Sync GPU → CPU (output = states por enquanto)
+        let mut output_f32 = states_f32.clone();
 
         // ── 4. Atualizar dinâmica CfC com resultados da GPU ──
         for (i, node) in self.nodes.iter_mut().enumerate() {

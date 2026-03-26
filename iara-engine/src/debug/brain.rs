@@ -84,11 +84,6 @@ impl BrainTrace {
         let step_energy: f32 = step.layer_traces.iter().map(|t| t.max_activation).sum();
         self.energy_trajectory.push(step_energy);
 
-        // Track attention
-        if !step.attention_weights.is_empty() {
-            self.attention_heatmap.push(step.attention_weights.clone());
-        }
-
         // Store step
         self.steps.push(step);
     }
@@ -288,7 +283,7 @@ impl BrainTrace {
             // Compute cosine distance between attention patterns
             let dot = early.iter().zip(late.iter()).map(|(a, b)| a * b).sum::<f32>();
             let norm_early = early.iter().map(|a| a * a).sum::<f32>().sqrt();
-            let norm_late = late.iter().map(a| a * a).sum::<f32>().sqrt();
+            let norm_late = late.iter().map(|a| a * a).sum::<f32>().sqrt();
 
             if norm_early > 0.0 && norm_late > 0.0 {
                 dot / (norm_early * norm_late)

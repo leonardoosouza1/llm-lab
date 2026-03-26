@@ -1,157 +1,650 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="IARA Resonance Engine — Painel de Observabilidade para Liquid Neural Networks">
-    <title>🧬 IARA — Motor de Ressonância</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="IARA LLM Observability Dashboard — Neural Lab Interface">
+  <title>IARA — LLM Observability</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="app">
-        <!-- ── Header ── -->
-        <header class="header">
-            <div class="header-brand">
-                <span class="header-icon">🧬</span>
-                <div>
-                    <h1 class="header-title">IARA</h1>
-                    <p class="header-subtitle">Motor de Ressonância — Liquid Neural Network</p>
-                </div>
-            </div>
-            <div class="header-status">
-                <div id="connectionIndicator" class="status-dot disconnected"></div>
-                <span id="connectionText" class="status-text">Desconectado</span>
-            </div>
-        </header>
 
-        <!-- ── Main Layout ── -->
-        <main class="main">
-            <!-- ── Sidebar ── -->
-            <aside class="sidebar">
-                <!-- Estímulo -->
-                <section class="panel">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">💬</span> Estímulo
-                    </h2>
-                    <div class="input-group">
-                        <input type="text" id="promptInput" class="input-text"
-                               placeholder="Ex: carro, universo, amor..."
-                               autocomplete="off">
-                        <button id="btnSend" class="btn btn-secondary" title="Enviar estímulo rápido">Enviar</button>
-                    </div>
-                    <button id="btnResonate" class="btn btn-primary btn-full">🧬 Ressonar (Pipeline Completo)</button>
-                    <button id="btnReset" class="btn btn-secondary">🔄 Resetar</button>
-                </section>
+<div id="app">
 
-                <!-- Pipeline Progress -->
-                <section class="panel" id="pipelinePanel" style="display:none">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">⚡</span> Pipeline
-                    </h2>
-                    <div id="pipelinePhase" class="pipeline-phase">—</div>
-                    <div class="progress-bar-track">
-                        <div id="pipelineProgress" class="progress-bar-fill" style="width:0%"></div>
-                    </div>
-                </section>
+  <!-- ═══════════════════════════════════════════════════
+       TOP BAR
+  ════════════════════════════════════════════════════ -->
+  <header id="topbar" role="banner">
 
-                <!-- Resposta do Modelo -->
-                <section class="panel" id="responsePanel" style="display:none">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">🎯</span> Resposta (Top Tokens)
-                    </h2>
-                    <div id="responseTime" class="response-time"></div>
-                    <div id="responseTokens" class="response-tokens"></div>
-                </section>
-
-                <!-- Métricas -->
-                <section class="panel">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">📊</span> Telemetria
-                    </h2>
-                    <div class="metrics-grid">
-                        <div class="metric">
-                            <span class="metric-label">Tick</span>
-                            <span id="metricTick" class="metric-value">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">FPS</span>
-                            <span id="metricFps" class="metric-value">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Energia</span>
-                            <span id="metricEnergy" class="metric-value">0.0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Nós Ativos</span>
-                            <span id="metricActive" class="metric-value">0</span>
-                        </div>
-                        <div class="metric metric-wide">
-                            <span class="metric-label">Total de Nós</span>
-                            <span id="metricTotal" class="metric-value">0</span>
-                        </div>
-                        <div class="metric metric-wide">
-                            <span class="metric-label">Grid</span>
-                            <span id="metricGrid" class="metric-value">-</span>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- Seletor de Camada -->
-                <section class="panel">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">🧩</span> Camada Ativa
-                    </h2>
-                    <div id="currentLayer" class="current-layer">—</div>
-                    <button id="btnListLayers" class="btn btn-secondary">📋 Listar Tensores</button>
-                    <div id="layerList" class="layer-list hidden"></div>
-                </section>
-
-                <!-- Log -->
-                <section class="panel">
-                    <h2 class="panel-title">
-                        <span class="panel-icon">📝</span> Log
-                    </h2>
-                    <div id="logContainer" class="log-container"></div>
-                </section>
-            </aside>
-
-            <!-- ── Visualização ── -->
-            <div class="visualization">
-                <div class="canvas-container">
-                    <!-- Mapa Cerebral (CfC LNN) -->
-                    <div class="canvas-wrapper brain-wrapper">
-                        <h3 class="canvas-label">🧠 Cérebro Líquido (CfC LNN)</h3>
-                        <canvas id="brainCanvas"></canvas>
-                        <div class="brain-stats">
-                            <div class="b-stat focus"><span>Focus</span><div id="barFocus" class="b-bar"></div></div>
-                            <div class="b-stat novelty"><span>Novelty</span><div id="barNovelty" class="b-bar"></div></div>
-                            <div class="b-stat drive"><span>Drive</span><div id="barDrive" class="b-bar"></div></div>
-                        </div>
-                    </div>
-
-                    <!-- Heatmap de Ativação -->
-                    <div class="canvas-wrapper heatmap-wrapper">
-                        <h3 class="canvas-label">🕸️ Ativação do Tensor</h3>
-                        <canvas id="heatmapCanvas"></canvas>
-                        <div class="canvas-overlay" id="canvasOverlay">
-                            <span class="overlay-text">Aguardando conexão WebSocket...</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Legenda de cores -->
-                <div class="color-legend">
-                    <span class="legend-label">Negativo (frio)</span>
-                    <div class="legend-gradient"></div>
-                    <span class="legend-label">Positivo (quente)</span>
-                </div>
-            </div>
-        </main>
+    <div class="logo" aria-label="IARA Neural Engine">
+      🧬 IARA
     </div>
 
-    <script src="app.js"></script>
+    <nav id="tab-nav" role="tablist" aria-label="Dashboard panels">
+      <button
+        class="tab-btn tab-btn--active"
+        role="tab"
+        data-tab="live"
+        aria-selected="true"
+        aria-controls="panel-live"
+        id="tab-btn-live"
+      >
+        <span class="tab-icon">⚡</span>
+        <span class="tab-label">Live</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="layers"
+        aria-selected="false"
+        aria-controls="panel-layers"
+        id="tab-btn-layers"
+      >
+        <span class="tab-icon">🧩</span>
+        <span class="tab-label">Layers</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="graph"
+        aria-selected="false"
+        aria-controls="panel-graph"
+        id="tab-btn-graph"
+      >
+        <span class="tab-icon">🕸️</span>
+        <span class="tab-label">Graph</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="trace"
+        aria-selected="false"
+        aria-controls="panel-trace"
+        id="tab-btn-trace"
+      >
+        <span class="tab-icon">📡</span>
+        <span class="tab-label">Trace</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="console"
+        aria-selected="false"
+        aria-controls="panel-console"
+        id="tab-btn-console"
+      >
+        <span class="tab-icon">🖥️</span>
+        <span class="tab-label">Console</span>
+      </button>
+    </nav>
+
+    <div id="status-area" role="status" aria-live="polite" aria-label="Connection and system status">
+      <div class="status-item" title="WebSocket connection">
+        <span id="ws-status" class="ws-status" aria-label="WebSocket status">
+          <span class="ws-dot" aria-hidden="true"></span>
+          <span class="ws-label">WS</span>
+        </span>
+      </div>
+      <div class="status-item" title="HTTP API status">
+        <span id="http-status" class="http-status" aria-label="HTTP API status">
+          <span class="http-dot" aria-hidden="true"></span>
+          <span class="http-label">HTTP</span>
+        </span>
+      </div>
+      <div class="status-item" title="Anomalies detected">
+        <span class="status-label">ANOM</span>
+        <span id="anomaly-count" class="anomaly-badge" aria-label="Anomaly count">0</span>
+      </div>
+      <div class="status-item" title="Tokens per second">
+        <span class="status-label">TPS</span>
+        <span id="topbar-tps" class="status-value" aria-label="Tokens per second">—</span>
+      </div>
+    </div>
+
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════
+       MAIN CONTENT
+  ════════════════════════════════════════════════════ -->
+  <main id="main-content" role="main">
+
+    <!-- ─────────────────────────────────────────────
+         TAB: LIVE
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-live"
+      class="tab-panel"
+      role="tabpanel"
+      aria-labelledby="tab-btn-live"
+      tabindex="0"
+    >
+      <div class="panel-grid-live">
+
+        <!-- Prompt Input Box -->
+        <div class="glass-panel prompt-box" id="prompt-box" aria-label="Prompt input">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">💬</span>
+              Prompt
+            </h2>
+          </div>
+          <div class="prompt-body">
+            <textarea
+              id="prompt-input"
+              class="prompt-textarea"
+              placeholder="Enter your prompt…"
+              rows="6"
+              aria-label="User prompt text"
+              spellcheck="false"
+            ></textarea>
+            <div class="prompt-controls">
+              <div class="prompt-select-group">
+                <label for="model-select" class="control-label">Model</label>
+                <select
+                  id="model-select"
+                  class="control-select"
+                  aria-label="Select model"
+                >
+                  <option value="qwen3-8b" selected>qwen3-8b</option>
+                  <option value="qwen3-4b">qwen3-4b</option>
+                  <option value="qwen3-14b">qwen3-14b</option>
+                  <option value="llama3-8b">llama3-8b</option>
+                  <option value="mistral-7b">mistral-7b</option>
+                </select>
+              </div>
+              <div class="prompt-select-group">
+                <label for="max-tokens-input" class="control-label">Max Tokens</label>
+                <input
+                  type="number"
+                  id="max-tokens-input"
+                  class="control-input"
+                  value="256"
+                  min="1"
+                  max="4096"
+                  step="1"
+                  aria-label="Maximum tokens to generate"
+                >
+              </div>
+              <button
+                id="send-btn"
+                class="send-btn"
+                type="button"
+                aria-label="Generate response"
+              >
+                <span aria-hidden="true">▶</span>
+                Generate
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Response Box -->
+        <div class="glass-panel response-box" id="response-box" aria-label="Model response">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🎯</span>
+              Response
+            </h2>
+            <span id="eval-stats" class="eval-stats" aria-live="polite" aria-label="Evaluation statistics">—</span>
+          </div>
+          <div
+            id="response-text"
+            class="response-text"
+            role="log"
+            aria-live="polite"
+            aria-label="Generated text output"
+          >
+            <span class="response-placeholder">Response will appear here…</span>
+          </div>
+        </div>
+
+        <!-- Layer Heatmap Row -->
+        <div class="glass-panel layer-heatmap-box" id="layer-heatmap-box" aria-label="Layer attention heatmap">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🌡️</span>
+              Attention per Layer
+            </h2>
+            <span class="heatmap-legend">
+              <span class="legend-chip legend-low" aria-hidden="true"></span>
+              <span class="legend-text">Low</span>
+              <span class="legend-chip legend-high" aria-hidden="true"></span>
+              <span class="legend-text">High</span>
+            </span>
+          </div>
+          <div
+            id="layer-heatmap"
+            class="layer-heatmap-cells"
+            role="img"
+            aria-label="36-cell attention heatmap across transformer layers"
+          >
+            <!-- 36 heatmap cells, JS will update background colors -->
+            <div class="heatmap-cell" data-layer="0" title="Layer 0" aria-label="Layer 0 attention"></div>
+            <div class="heatmap-cell" data-layer="1" title="Layer 1" aria-label="Layer 1 attention"></div>
+            <div class="heatmap-cell" data-layer="2" title="Layer 2" aria-label="Layer 2 attention"></div>
+            <div class="heatmap-cell" data-layer="3" title="Layer 3" aria-label="Layer 3 attention"></div>
+            <div class="heatmap-cell" data-layer="4" title="Layer 4" aria-label="Layer 4 attention"></div>
+            <div class="heatmap-cell" data-layer="5" title="Layer 5" aria-label="Layer 5 attention"></div>
+            <div class="heatmap-cell" data-layer="6" title="Layer 6" aria-label="Layer 6 attention"></div>
+            <div class="heatmap-cell" data-layer="7" title="Layer 7" aria-label="Layer 7 attention"></div>
+            <div class="heatmap-cell" data-layer="8" title="Layer 8" aria-label="Layer 8 attention"></div>
+            <div class="heatmap-cell" data-layer="9" title="Layer 9" aria-label="Layer 9 attention"></div>
+            <div class="heatmap-cell" data-layer="10" title="Layer 10" aria-label="Layer 10 attention"></div>
+            <div class="heatmap-cell" data-layer="11" title="Layer 11" aria-label="Layer 11 attention"></div>
+            <div class="heatmap-cell" data-layer="12" title="Layer 12" aria-label="Layer 12 attention"></div>
+            <div class="heatmap-cell" data-layer="13" title="Layer 13" aria-label="Layer 13 attention"></div>
+            <div class="heatmap-cell" data-layer="14" title="Layer 14" aria-label="Layer 14 attention"></div>
+            <div class="heatmap-cell" data-layer="15" title="Layer 15" aria-label="Layer 15 attention"></div>
+            <div class="heatmap-cell" data-layer="16" title="Layer 16" aria-label="Layer 16 attention"></div>
+            <div class="heatmap-cell" data-layer="17" title="Layer 17" aria-label="Layer 17 attention"></div>
+            <div class="heatmap-cell" data-layer="18" title="Layer 18" aria-label="Layer 18 attention"></div>
+            <div class="heatmap-cell" data-layer="19" title="Layer 19" aria-label="Layer 19 attention"></div>
+            <div class="heatmap-cell" data-layer="20" title="Layer 20" aria-label="Layer 20 attention"></div>
+            <div class="heatmap-cell" data-layer="21" title="Layer 21" aria-label="Layer 21 attention"></div>
+            <div class="heatmap-cell" data-layer="22" title="Layer 22" aria-label="Layer 22 attention"></div>
+            <div class="heatmap-cell" data-layer="23" title="Layer 23" aria-label="Layer 23 attention"></div>
+            <div class="heatmap-cell" data-layer="24" title="Layer 24" aria-label="Layer 24 attention"></div>
+            <div class="heatmap-cell" data-layer="25" title="Layer 25" aria-label="Layer 25 attention"></div>
+            <div class="heatmap-cell" data-layer="26" title="Layer 26" aria-label="Layer 26 attention"></div>
+            <div class="heatmap-cell" data-layer="27" title="Layer 27" aria-label="Layer 27 attention"></div>
+            <div class="heatmap-cell" data-layer="28" title="Layer 28" aria-label="Layer 28 attention"></div>
+            <div class="heatmap-cell" data-layer="29" title="Layer 29" aria-label="Layer 29 attention"></div>
+            <div class="heatmap-cell" data-layer="30" title="Layer 30" aria-label="Layer 30 attention"></div>
+            <div class="heatmap-cell" data-layer="31" title="Layer 31" aria-label="Layer 31 attention"></div>
+            <div class="heatmap-cell" data-layer="32" title="Layer 32" aria-label="Layer 32 attention"></div>
+            <div class="heatmap-cell" data-layer="33" title="Layer 33" aria-label="Layer 33 attention"></div>
+            <div class="heatmap-cell" data-layer="34" title="Layer 34" aria-label="Layer 34 attention"></div>
+            <div class="heatmap-cell" data-layer="35" title="Layer 35" aria-label="Layer 35 attention"></div>
+          </div>
+        </div>
+
+        <!-- Frame Activation Heatmap (D3) -->
+        <div class="glass-panel frame-heatmap-box" id="frame-heatmap-box" aria-label="Real-time activation heatmap">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔬</span>
+              Activation Map
+            </h2>
+            <span class="panel-badge" aria-label="D3 powered">D3</span>
+          </div>
+          <div class="canvas-wrapper">
+            <canvas
+              id="frame-canvas"
+              width="600"
+              height="400"
+              aria-label="Real-time neuron activation heatmap rendered by D3"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- Logits Bar Chart (ChartJS) -->
+        <div class="glass-panel logits-box" id="logits-box" aria-label="Top logits distribution">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">📊</span>
+              Top Logits
+            </h2>
+            <span class="panel-badge" aria-label="Chart.js powered">Chart</span>
+          </div>
+          <div class="canvas-wrapper">
+            <canvas
+              id="logits-canvas"
+              width="400"
+              height="300"
+              aria-label="Top 40 token logit probability bars"
+            ></canvas>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: LAYERS
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-layers"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-layers"
+      tabindex="0"
+    >
+      <div class="layers-controls glass-panel" aria-label="Layer filter and sort controls">
+        <div class="layers-controls-inner">
+          <span class="control-label">Sort by:</span>
+          <button class="ctrl-btn ctrl-btn--active" data-sort="index" type="button" aria-pressed="true">Index</button>
+          <button class="ctrl-btn" data-sort="attention" type="button" aria-pressed="false">Attention</button>
+          <button class="ctrl-btn" data-sort="mlp" type="button" aria-pressed="false">MLP</button>
+          <button class="ctrl-btn" data-sort="hot" type="button" aria-pressed="false">Hot Neurons</button>
+          <span class="layers-divider" aria-hidden="true"></span>
+          <span class="control-label">Filter:</span>
+          <button class="ctrl-btn" data-filter="all" type="button" aria-pressed="true">All</button>
+          <button class="ctrl-btn" data-filter="hot" type="button" aria-pressed="false">Hot only</button>
+          <button class="ctrl-btn" data-filter="anomaly" type="button" aria-pressed="false">Anomalies</button>
+          <span class="layers-divider" aria-hidden="true"></span>
+          <label for="layer-search" class="control-label">Search:</label>
+          <input
+            type="search"
+            id="layer-search"
+            class="control-input control-input--search"
+            placeholder="Layer 12…"
+            aria-label="Search layers"
+          >
+        </div>
+      </div>
+
+      <div
+        id="layer-grid-container"
+        class="layer-grid-container"
+        role="list"
+        aria-label="Transformer layer metrics grid, 36 layers"
+      >
+        <!-- 36 layer rows — populated by JavaScript -->
+        <!-- Each row follows the .layer-row structure:
+             index badge | attention bar | mlp bar | residual bar | values | hot neurons -->
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: GRAPH
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-graph"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-graph"
+      tabindex="0"
+    >
+      <div class="graph-controls glass-panel" aria-label="Force graph controls">
+        <div class="layers-controls-inner">
+          <span class="control-label">Forces:</span>
+          <button class="ctrl-btn ctrl-btn--active" data-force="charge" type="button" aria-pressed="true">Charge</button>
+          <button class="ctrl-btn ctrl-btn--active" data-force="links" type="button" aria-pressed="true">Links</button>
+          <button class="ctrl-btn ctrl-btn--active" data-force="center" type="button" aria-pressed="true">Center</button>
+          <button class="ctrl-btn" data-force="collision" type="button" aria-pressed="false">Collision</button>
+          <span class="layers-divider" aria-hidden="true"></span>
+          <span class="control-label">Node color:</span>
+          <button class="ctrl-btn ctrl-btn--active" data-color="attention" type="button" aria-pressed="true">Attention</button>
+          <button class="ctrl-btn" data-color="layer" type="button" aria-pressed="false">Layer</button>
+          <button class="ctrl-btn" data-color="activation" type="button" aria-pressed="false">Activation</button>
+          <span class="layers-divider" aria-hidden="true"></span>
+          <button class="ctrl-btn" id="graph-reset-btn" type="button">Reset View</button>
+          <button class="ctrl-btn" id="graph-freeze-btn" type="button" aria-pressed="false">Freeze</button>
+        </div>
+      </div>
+
+      <div class="graph-svg-container glass-panel">
+        <svg
+          id="force-graph-svg"
+          width="100%"
+          height="100%"
+          role="img"
+          aria-label="D3 force-directed graph of transformer attention heads and layers"
+        >
+          <defs>
+            <filter id="glow-filter" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+              <feMerge>
+                <feMergeNode in="coloredBlur"/>
+                <feMergeNode in="SourceGraphic"/>
+              </feMerge>
+            </filter>
+          </defs>
+          <g id="graph-links-group"></g>
+          <g id="graph-nodes-group"></g>
+          <g id="graph-labels-group"></g>
+        </svg>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: TRACE
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-trace"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-trace"
+      tabindex="0"
+    >
+      <div class="trace-grid">
+
+        <!-- Resonance Score -->
+        <div class="glass-panel resonance-score-box" id="resonance-score-box" aria-label="Resonance score panel">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔮</span>
+              Resonance Score
+            </h2>
+          </div>
+          <div class="resonance-body">
+            <div class="resonance-value" id="resonance-value" aria-label="Resonance score value">0.00</div>
+            <progress
+              id="resonance-score"
+              class="resonance-progress"
+              value="0"
+              max="100"
+              aria-label="Resonance score progress bar"
+              aria-valuenow="0"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            ></progress>
+            <div class="resonance-labels">
+              <span>Incoherent</span>
+              <span>Coherent</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Energy Chart -->
+        <div class="glass-panel energy-chart-box" id="energy-chart-box" aria-label="Energy over time chart">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">⚡</span>
+              Energy Timeline
+            </h2>
+            <div class="chart-controls">
+              <button class="ctrl-btn ctrl-btn--sm" data-window="50" type="button">50</button>
+              <button class="ctrl-btn ctrl-btn--sm ctrl-btn--active" data-window="100" type="button">100</button>
+              <button class="ctrl-btn ctrl-btn--sm" data-window="200" type="button">200</button>
+            </div>
+          </div>
+          <div class="canvas-wrapper canvas-wrapper--wide">
+            <canvas
+              id="energy-chart-canvas"
+              width="800"
+              height="200"
+              aria-label="Energy timeline line chart"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- Token Timeline -->
+        <div class="glass-panel token-timeline-box" id="token-timeline-box" aria-label="Token generation timeline">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔤</span>
+              Token Timeline
+            </h2>
+          </div>
+          <div class="table-scroll-wrapper">
+            <table class="timeline-table" aria-label="Token generation sequence with timing and logit data">
+              <thead>
+                <tr>
+                  <th scope="col">#</th>
+                  <th scope="col">Token</th>
+                  <th scope="col">ID</th>
+                  <th scope="col">Logit</th>
+                  <th scope="col">Prob</th>
+                  <th scope="col">ms</th>
+                  <th scope="col">Entropy</th>
+                  <th scope="col">Anomaly</th>
+                </tr>
+              </thead>
+              <tbody id="token-timeline-body" aria-live="polite">
+                <!-- Populated by JavaScript -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Anomalies -->
+        <div class="glass-panel anomalies-box" id="anomalies-box" aria-label="Detected anomalies">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🚨</span>
+              Anomalies
+            </h2>
+            <span class="anomaly-badge" id="anomaly-count-trace" aria-label="Number of anomalies">0</span>
+          </div>
+          <div
+            id="anomaly-list"
+            class="anomaly-list"
+            role="log"
+            aria-live="polite"
+            aria-label="List of detected anomalies"
+          >
+            <div class="anomaly-empty">No anomalies detected</div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: CONSOLE
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-console"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-console"
+      tabindex="0"
+    >
+      <div class="console-layout">
+
+        <!-- Filter Bar -->
+        <div class="glass-panel console-filter-bar" aria-label="Console log filters">
+          <div class="console-filter-inner">
+            <span class="control-label">Filter:</span>
+            <button class="filter-btn filter-btn--all filter-btn--active" data-filter="ALL" type="button" aria-pressed="true">ALL</button>
+            <button class="filter-btn filter-btn--ws" data-filter="WS" type="button" aria-pressed="false">WS</button>
+            <button class="filter-btn filter-btn--http" data-filter="HTTP" type="button" aria-pressed="false">HTTP</button>
+            <button class="filter-btn filter-btn--error" data-filter="ERROR" type="button" aria-pressed="false">ERROR</button>
+            <span class="console-divider" aria-hidden="true"></span>
+            <button class="ctrl-btn" id="console-clear-btn" type="button" aria-label="Clear console log">Clear</button>
+            <button class="ctrl-btn" id="console-pause-btn" type="button" aria-pressed="false" aria-label="Pause log scroll">Pause</button>
+            <span class="console-divider" aria-hidden="true"></span>
+            <label for="console-search" class="control-label">Search:</label>
+            <input
+              type="search"
+              id="console-search"
+              class="control-input control-input--search"
+              placeholder="Filter entries…"
+              aria-label="Search console log"
+            >
+          </div>
+        </div>
+
+        <div class="console-body">
+
+          <!-- Log List -->
+          <div class="glass-panel console-log-panel" aria-label="Console log entries">
+            <div
+              id="log-list"
+              class="log-list"
+              role="log"
+              aria-live="polite"
+              aria-label="Streaming console log"
+              aria-atomic="false"
+            >
+              <!-- Log entries populated by JavaScript -->
+            </div>
+          </div>
+
+          <!-- JSON Inspector -->
+          <div class="glass-panel console-inspector-panel" aria-label="Raw JSON inspector">
+            <div class="panel-header">
+              <h2 class="panel-title">
+                <span class="panel-title-icon" aria-hidden="true">{ }</span>
+                JSON Inspector
+              </h2>
+              <button class="ctrl-btn" id="inspector-copy-btn" type="button" aria-label="Copy JSON to clipboard">Copy</button>
+            </div>
+            <pre
+              id="json-inspector"
+              class="json-inspector"
+              role="region"
+              aria-label="Raw JSON payload inspector"
+              tabindex="0"
+            ><span class="json-placeholder">// Click a log entry to inspect</span></pre>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ═══════════════════════════════════════════════════
+       MODEL LOADING BANNER (hidden once model is ready)
+  ════════════════════════════════════════════════════ -->
+  <div id="model-loading-banner" role="status" aria-live="polite" style="
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: rgba(168,85,247,0.12);
+    border-top: 1px solid rgba(168,85,247,0.3);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: #a855f7;
+  ">
+    <span style="display:inline-block;width:14px;height:14px;border:2px solid #a855f7;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></span>
+    <span id="loading-msg">Aguardando servidor...</span>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════
+       BOTTOM STATUS BAR
+  ════════════════════════════════════════════════════ -->
+  <footer id="status-bar" role="contentinfo" aria-label="System status bar">
+    <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">TPS</span>
+      <span id="tokens-per-sec" class="statusbar-value" aria-label="Tokens per second">—</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">ms/layer</span>
+      <span id="ms-per-layer" class="statusbar-value" aria-label="Milliseconds per layer">—</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">Model</span>
+      <span id="active-model" class="statusbar-value statusbar-value--accent" aria-label="Active model name">qwen3-8b</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">Backend</span>
+      <span id="backend-url" class="statusbar-value" aria-label="Backend connection URL">ws://localhost:8080</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item statusbar-right">
+      <span class="statusbar-label" aria-hidden="true">IARA</span>
+      <span class="statusbar-version">v2.0</span>
+    </div>
+  </footer>
+
+</div>
+
+<!-- CDN Libraries (loaded after CSS, before app.js) -->
+<script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="app.js" defer></script>
+
 </body>
 </html>

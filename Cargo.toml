@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "iara-engine",
+    "hip-ffi",
+]
+resolver = "2"
+
+[workspace.env]
+ROCM_PATH = "/opt/rocm-6.4.4"

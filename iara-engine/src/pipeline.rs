@@ -73,7 +73,7 @@ pub async fn run_pipeline(
     frame_tx: &broadcast::Sender<String>,
     stimulus_tx: Option<&mpsc::Sender<(usize, Vec<f32>)>>,
     grid_size: usize,
-    _device: &candle_core::Device,
+    _device_id: i32,
 ) -> Result<PipelineResult, Box<dyn std::error::Error + Send + Sync>> {
     let start_time = std::time::Instant::now();
 

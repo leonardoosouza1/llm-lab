@@ -1,44 +1,61 @@
-# Usamos a imagem oficial de desenvolvimento da AMD ROCm (Ubuntu 24.04)
-FROM rocm/dev-ubuntu-24.04:6.3
+# ── STAGE 1: Builder ────────────────────────────────────────────────────────
+FROM rocm/dev-ubuntu-24.04:6.3 AS builder
 
-# Evita perguntas interativas
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Dependências de sistema recomendadas pela AMD + Necessárias para Rust Bindgen
-RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    clang \
-    libclang-dev \
-    llvm-dev \
-    pkg-config \
-    libssl-dev \
-    libstdc++-12-dev \
-    pciutils \
-    kmod \
-    rocm-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Instala o Rust estável
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Configuração de ambiente ROCm/AMD para Rust
-ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
-ENV ROCM_PATH=/opt/rocm
-ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
-# Variável CRÍTICA para o Rust Bindgen encontrar os headers da AMD
-ENV BINDGEN_EXTRA_CLANG_ARGS="-I/opt/rocm/include"
+# 1. Dependências de Build Completas + mold (Linker ultra-rápido)
+# rocm-rs precisa de todos os headers para bindgen e compilação de kernels.
+RUN apt-get update && apt-get install -y \
+    curl build-essential clang libclang-dev llvm-dev pkg-config libssl-dev \
+    libstdc++-12-dev pciutils kmod mold \
+    rocm-dev rocblas-dev rocsolver-dev rocsparse-dev rocrand-dev rocfft-dev \
+    miopen-hip-dev hipblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Instalar Rust + Toolchain para GPU
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    /root/.cargo/bin/rustup component add rust-src && \
+    /root/.cargo/bin/rustup target add amdgcn-amd-amdhsa
+
+# Configurações para bindgen encontrar os headers ROCm
+ENV BINDGEN_EXTRA_CLANG_ARGS="-I/opt/rocm/include -I/opt/rocm/include/hip"
+
+# 3. Cache de Dependências (O segredo da velocidade)
+WORKDIR /app
+COPY iara-engine/Cargo.toml iara-engine/Cargo.lock ./iara-engine/
+
+# Criar um projeto dummy para compilar apenas as dependências
+WORKDIR /app/iara-engine
+RUN mkdir src && echo "fn main() {println!(\"dummy\")}" > src/main.rs
+
+# Configurar mold como linker padrão para o build
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+RUN cargo build --release
+RUN rm -rf src
+
+# 4. Build Real
+COPY iara-engine/src ./src
+# Atualizar o timestamp para garantir que o cargo perceba a mudança no main.rs
+RUN touch src/main.rs && cargo build --release
+
+# ── STAGE 2: Runtime ────────────────────────────────────────────────────────
+# Usamos a mesma base dev por causa das libs ROCm, mas limpamos o resto.
+FROM rocm/dev-ubuntu-24.04:6.3 AS runtime
 
 WORKDIR /app
-COPY iara-engine/Cargo.toml ./iara-engine/
-COPY . .
+# Copiar apenas o binário compilado e os arquivos de sistema necessários
+COPY --from=builder /app/iara-engine/target/release/iara-engine /app/iara-engine
 
-WORKDIR /app/iara-engine
-# Pre-build das dependências para agilizar
-RUN cargo fetch
+# Configurações de Runtime GPU
+ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LD_LIBRARY_PATH}
 
 EXPOSE 8080
 
-# Executa em modo Release para performance máxima
-CMD ["cargo", "run", "--release", "--", "--model-dir", "/models"]
+# Execução direta do binário (sem overhead de compilação)
+# A telemetria de hardware agora usa rocm-smi via CLI.
+ENTRYPOINT ["/app/iara-engine"]
+CMD ["--model-dir", "/models"]

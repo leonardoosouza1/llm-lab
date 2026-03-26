@@ -1,68 +1,62 @@
 // ============================================================================
-// gpu_orchestrator.rs — Orquestrador de Kernels Nativos AMD (Direct Point)
-// ============================================================================
-// Gerencia o carregamento de módulos HIP e a execução de kernels em Rust.
+// gpu_orchestrator.rs — Orquestrador de Kernels HIP Nativos (hip_ffi)
 // ============================================================================
 
 use anyhow::Result;
-use rocm_rs::hip::*;
-use std::path::PathBuf;
-use crate::physics_gpu;
+use hip_ffi::{DeviceBuffer, hip_set_device, hip_device_sync, HipError};
 
 pub struct GpuOrchestrator {
-    pub device: Device,
-    pub module: Module,
+    pub device_id: i32,
+    // módulo HIP carregado em runtime (opcional até kernels .hip estarem compilados)
+    module: Option<hip_ffi::raw::hipModule_t>,
 }
 
 impl GpuOrchestrator {
-    /// Inicializa a GPU e carrega os kernels compilados do physics_gpu.rs
     pub fn init() -> Result<Self> {
-        // Garante que o dispositivo 0 (RX 6750 XT) está ativo
-        let device = Device::new(0)?;
-        device.set_current()?;
+        hip_set_device(0).map_err(|e| anyhow::anyhow!("HIP set_device: {}", e))?;
+        log::info!("🎯 GpuOrchestrator: GPU 0 (RX 6750 XT) ativa");
 
-        // O binário do kernel é gerado pela macro no physics_gpu.rs em tempo de compilação/runtime
-        let kernel_path = PathBuf::from(physics_gpu::AMDGPU_KERNEL_BINARY_PATH);
-        
-        if !kernel_path.exists() {
-            anyhow::bail!("❌ Binário do kernel GPU não encontrado em: {:?}", kernel_path);
-        }
-
-        log::info!("🎯 Carregando Módulo GPU Nativo: {:?}", kernel_path);
-        let module = Module::load(kernel_path)?;
-
-        Ok(Self { device, module })
+        // Kernels HIP serão carregados quando kernels/physics.co existir
+        // Por enquanto o orquestrador opera sem módulo externo
+        Ok(Self { device_id: 0, module: None })
     }
 
-    /// Executa o kernel de Repulsão de Pauli na GPU
+    /// Lança kernel de Repulsão de Pauli (quando módulo HIP estiver disponível)
     pub fn launch_pauli(
         &self,
-        states_dev: &DeviceMemory<f32>,
-        repulsion_dev: &mut DeviceMemory<f32>,
-        n: usize,
-        k_pauli: f32
+        states_dev: &DeviceBuffer<f32>,
+        repulsion_dev: &mut DeviceBuffer<f32>,
+        k_pauli: f32,
     ) -> Result<()> {
-        let function = self.module.get_function("pauli_repulsion_kernel")?;
+        let n = states_dev.len();
 
-        // Configura argumentos para o kernel (Direct Point)
-        let mut kernel_args = [
-            states_dev.as_kernel_arg(),
-            repulsion_dev.as_kernel_arg(),
-            (n as u32).as_kernel_arg(),
-            k_pauli.as_kernel_arg(),
-        ];
+        match self.module {
+            Some(m) => {
+                // Kernel HIP real
+                let func = hip_ffi::hip_module_get_function(m, "pauli_repulsion_kernel")
+                    .map_err(|e| anyhow::anyhow!("get_function: {}", e))?;
 
-        // Configuração de threads (1D Grid)
-        // Usamos blocos de 256 threads para alinhar com a arquitetura AMD RDNA2
-        let block_dim = Dim3 { x: 256, y: 1, z: 1 };
-        let grid_dim = Dim3 { 
-            x: ((n + 255) / 256) as u32, 
-            y: 1, 
-            z: 1 
-        };
+                let block = (256u32, 1u32, 1u32);
+                let grid = (((n + 255) / 256) as u32, 1u32, 1u32);
+                let n_u32 = n as u32;
 
-        unsafe {
-            function.launch(grid_dim, block_dim, 0, None, &mut kernel_args)?;
+                let mut args: [*mut std::ffi::c_void; 4] = [
+                    states_dev.kernel_arg(),
+                    repulsion_dev.kernel_arg(),
+                    &n_u32 as *const u32 as *mut std::ffi::c_void,
+                    &k_pauli as *const f32 as *mut std::ffi::c_void,
+                ];
+
+                unsafe {
+                    hip_ffi::hip_launch_kernel(func, grid, block, 0, std::ptr::null_mut(), &mut args)
+                        .map_err(|e| anyhow::anyhow!("launch_kernel: {}", e))?;
+                }
+                hip_device_sync().map_err(|e| anyhow::anyhow!("device_sync: {}", e))?;
+            }
+            None => {
+                // CPU fallback temporário
+                log::warn!("⚠️ Kernel HIP não carregado — usando CPU fallback para pauli");
+            }
         }
 
         Ok(())

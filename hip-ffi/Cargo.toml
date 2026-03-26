@@ -1,0 +1,15 @@
+[package]
+name = "hip-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal safe HIP FFI for AMD RDNA2 — host-side only, no kernel compilation"
+links = "amdhip64"
+
+[dependencies]
+thiserror = "1"
+
+[build-dependencies]
+bindgen = "0.70"
+
+[features]
+default = []

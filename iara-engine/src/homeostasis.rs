@@ -283,10 +283,8 @@ impl Default for HomeostaticRegulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
-
     fn make_network() -> Arc<Mutex<LiquidNetwork>> {
-        Arc::new(Mutex::new(LiquidNetwork::new(8, 2, Device::Cpu)))
+        Arc::new(Mutex::new(LiquidNetwork::new(8, 2, 0)))
     }
 
     fn dummy_tel(entropy: f64) -> LlmTelemetry {

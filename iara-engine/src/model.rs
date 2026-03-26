@@ -1,179 +1,339 @@
 // ============================================================================
-// model.rs — Estrutura Funcional do Qwen 8B em Candle
+// model.rs — Pipeline Nativo Qwen (sem candle, sem framework)
 // ============================================================================
-// Define as camadas do modelo e os métodos de forward pass reais (GPU).
-// Inclui otimização de KV-Cache para performance máxima.
+// Carrega pesos safetensors direto em GPU via hip_ffi.
+// Forward pass: embedding → N×transformer_block → lm_head
+// Cada tensor é um GpuTensor residente na VRAM da RX 6750 XT.
+//
+// FASE ATUAL: Implementação de referência CPU (f32 puro).
+// PRÓXIMA FASE: rocBLAS GEMM para projections + kernels HIP para ops point-wise.
 // ============================================================================
 
-use candle_core::{Device, Result, Tensor, DType};
-use candle_nn::{Linear, Module, RmsNorm, VarBuilder};
+use hip_ffi::GpuTensor;
+use half::bf16;
+use std::collections::HashMap;
 use std::path::Path;
 
-pub struct QwenLayer {
-    pub attention_wq: Linear,
-    pub attention_wk: Linear,
-    pub attention_wv: Linear,
-    pub attention_wo: Linear,
-    pub mlp_gate: Linear,
-    pub mlp_up: Linear,
-    pub mlp_down: Linear,
-    pub input_layernorm: RmsNorm,
-    pub post_attention_layernorm: RmsNorm,
-    // Otimização: Cache de Chaves e Valores (KV-Cache)
-    pub kv_cache: Option<(Tensor, Tensor)>,
+// ── Tipos de erro ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error("HIP error: {0}")]
+    Hip(#[from] hip_ffi::HipError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Model error: {0}")]
+    Model(String),
 }
 
-// NOTA: NÃO implementamos `Module` para `QwenLayer`.
-//
-// O trait `Module::forward(&self, ...)` exige referência imutável, mas o forward pass
-// real precisa de `&mut self` para atualizar o KV-Cache interno. Implementar o trait
-// com um stub (ex: retornando apenas a projeção Q) criaria um bug silencioso de
-// corretude — qualquer chamada via trait produziria saída incorreta.
-//
-// O forward pass completo (attention + MLP + residual + KV-Cache) é feito
-// exclusivamente em `QwenModel::forward()`, que gerencia o estado mutável.
+pub type ModelResult<T> = std::result::Result<T, ModelError>;
 
-pub struct QwenModel {
-    pub embed_tokens: Tensor,
-    pub layers: Vec<QwenLayer>,
-    pub norm: RmsNorm,
-    pub lm_head: Linear,
-    pub device: Device,
+// ── Config ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ModelCfg {
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub rms_eps: f32,
 }
 
-impl QwenModel {
-    /// Carrega o modelo real para a GPU (VRAM) a partir dos arquivos .safetensors
-    pub fn load(model_dir: &Path, device: &Device, mcfg: &crate::ModelConfig) -> Result<Self> {
-        let hidden_size = mcfg.hidden_size;
-        let intermediate_size = mcfg.intermediate_size.unwrap_or(12288);
-        let num_layers = mcfg.num_hidden_layers;
-        let vocab_size = mcfg.vocab_size;
-
-        log::info!("⏳ Carregando Qwen 8B: {} camadas, hidden={}, intermediate={}, vocab={} ({:?})", 
-            num_layers, hidden_size, intermediate_size, vocab_size, device);
-        
-        let mut filenames = vec![];
-        for entry in std::fs::read_dir(model_dir).map_err(|e| candle_core::Error::wrap(e))? {
-            let path = entry.map_err(|e| candle_core::Error::wrap(e))?.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                filenames.push(path);
-            }
-        }
-        filenames.sort();
-        
-        if filenames.is_empty() {
-            return Err(candle_core::Error::msg("Nenhum arquivo .safetensors encontrado no diretório").into());
-        }
-
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::BF16, device)? };
-        let embed_tokens = vb.get((vocab_size, hidden_size), "model.embed_tokens.weight")?;
-        
-        let mut layers = Vec::new();
-        for i in 0..num_layers {
-            let vb_l = vb.pp(format!("model.layers.{}", i));
-            
-            let attention_wq = candle_nn::linear_no_bias(hidden_size, hidden_size, vb_l.pp("self_attn.q_proj"))?;
-            
-            // Refatoração: Usar ModelConfig para dimensões se possível. Aqui usamos os valores detectados no index.
-            let k_weight = vb_l.pp("self_attn.k_proj").get((1024, hidden_size), "weight")?;
-            let v_weight = vb_l.pp("self_attn.v_proj").get((1024, hidden_size), "weight")?;
-            
-            let attention_wk = Linear::new(k_weight, None);
-            let attention_wv = Linear::new(v_weight, None);
-            let attention_wo = candle_nn::linear_no_bias(hidden_size, hidden_size, vb_l.pp("self_attn.o_proj"))?;
-            
-            let mlp_gate = candle_nn::linear_no_bias(hidden_size, intermediate_size, vb_l.pp("mlp.gate_proj"))?;
-            let mlp_up = candle_nn::linear_no_bias(hidden_size, intermediate_size, vb_l.pp("mlp.up_proj"))?;
-            let mlp_down = candle_nn::linear_no_bias(intermediate_size, hidden_size, vb_l.pp("mlp.down_proj"))?;
-            
-            let input_layernorm = candle_nn::rms_norm(hidden_size, 1e-6, vb_l.pp("input_layernorm"))?;
-            let post_attention_layernorm = candle_nn::rms_norm(hidden_size, 1e-6, vb_l.pp("post_attention_layernorm"))?;
-            
-            layers.push(QwenLayer {
-                attention_wq, attention_wk, attention_wv, attention_wo,
-                mlp_gate, mlp_up, mlp_down,
-                input_layernorm, post_attention_layernorm,
-                kv_cache: None,
-            });
-        }
-
-        let norm = candle_nn::rms_norm(hidden_size, 1e-6, vb.pp("model.norm"))?;
-        let lm_head = candle_nn::linear_no_bias(hidden_size, vocab_size, vb.pp("lm_head"))?;
-
-        log::info!("🔥 Malha KAN/Qwen carregada com sucesso!");
-
+impl ModelCfg {
+    /// Lê os parâmetros diretamente do config.json do modelo
+    pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(config_path)?;
+        let v: serde_json::Value = serde_json::from_str(&content)?;
         Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            device: device.clone(),
+            hidden_size:       v["hidden_size"].as_u64().ok_or("hidden_size")? as usize,
+            num_layers:        v["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize,
+            intermediate_size: v["intermediate_size"].as_u64().ok_or("intermediate_size")? as usize,
+            vocab_size:        v["vocab_size"].as_u64().ok_or("vocab_size")? as usize,
+            num_heads:         v["num_attention_heads"].as_u64().ok_or("num_attention_heads")? as usize,
+            num_kv_heads:      v["num_key_value_heads"].as_u64().ok_or("num_key_value_heads")? as usize,
+            head_dim:          v["head_dim"].as_u64().ok_or("head_dim")? as usize,
+            rms_eps:           v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
         })
     }
 
-    /// Reseta o cache de memória (chamar antes de um novo prompt)
+    /// Fallback hardcoded para Qwen3-8B (usado em testes)
+    pub fn qwen_8b() -> Self {
+        Self {
+            hidden_size: 4096, num_layers: 36, intermediate_size: 12288,
+            vocab_size: 151936, num_heads: 32, num_kv_heads: 8,
+            head_dim: 128, rms_eps: 1e-6,
+        }
+    }
+}
+
+// ── Camada Transformer ────────────────────────────────────────────────────────
+
+/// Pesos de uma camada Qwen (todos em GPU como GpuTensor).
+pub struct QwenLayer {
+    pub wq: GpuTensor,
+    pub wk: GpuTensor,
+    pub wv: GpuTensor,
+    pub wo: GpuTensor,
+    pub wgate: GpuTensor,
+    pub wup: GpuTensor,
+    pub wdown: GpuTensor,
+    // Norm weights ficam em host (vetores pequenos, sem ganho em GPU)
+    pub input_norm_w: Vec<f32>,
+    pub post_attn_norm_w: Vec<f32>,
+    // KV-Cache em host (cresce com o contexto)
+    pub kv_k: Vec<f32>,  // [seq, kv_dim]
+    pub kv_v: Vec<f32>,  // [seq, kv_dim]
+}
+
+// ── Modelo completo ───────────────────────────────────────────────────────────
+
+pub struct QwenModel {
+    pub embed: GpuTensor,       // [vocab, hidden]
+    pub layers: Vec<QwenLayer>,
+    pub norm_w: Vec<f32>,       // [hidden]
+    pub lm_head: GpuTensor,     // [vocab, hidden]
+    pub cfg: ModelCfg,
+}
+
+impl QwenModel {
+    /// Carrega pesos do diretório de safetensors.
+    /// Converte BF16 → F32 host → envia para VRAM via HIP.
+    pub fn load(model_dir: &Path, cfg: ModelCfg) -> ModelResult<Self> {
+        log::info!(
+            "⏳ Carregando Qwen nativo: {} camadas, hidden={}, vocab={}",
+            cfg.num_layers, cfg.hidden_size, cfg.vocab_size
+        );
+
+        // Monta mapa de shards
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_file = std::fs::read_to_string(&index_path)?;
+        let index: serde_json::Value = serde_json::from_str(&index_file)?;
+        let weight_map = index["weight_map"].as_object()
+            .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
+
+        // mmap de cada shard
+        let mut shards: HashMap<String, memmap2::Mmap> = HashMap::new();
+        for shard_name in weight_map.values().filter_map(|v| v.as_str()) {
+            if shards.contains_key(shard_name) { continue; }
+            let path = model_dir.join(shard_name);
+            let file = std::fs::File::open(&path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            shards.insert(shard_name.to_string(), mmap);
+        }
+
+        // Helper de carregamento
+        let load = |name: &str| -> ModelResult<(Vec<f32>, Vec<usize>)> {
+            let shard = weight_map[name].as_str()
+                .ok_or_else(|| ModelError::Model(format!("'{}' não no index", name)))?;
+            read_bf16_f32(shards.get(shard).unwrap(), name)
+        };
+
+        let gpu = |name: &str| -> ModelResult<GpuTensor> {
+            let (data, shape) = load(name)?;
+            Ok(GpuTensor::from_slice(&data, &shape)?)
+        };
+
+        // Embedding
+        log::info!("  → embed_tokens");
+        let embed = gpu("model.embed_tokens.weight")?;
+
+        // Camadas
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if i % 8 == 0 {
+                log::info!("  → layers {}/{}", i, cfg.num_layers);
+            }
+            let p = format!("model.layers.{}", i);
+            let (in_w, _)  = load(&format!("{}.input_layernorm.weight", p))?;
+            let (pa_w, _)  = load(&format!("{}.post_attention_layernorm.weight", p))?;
+
+            layers.push(QwenLayer {
+                wq:    gpu(&format!("{}.self_attn.q_proj.weight", p))?,
+                wk:    gpu(&format!("{}.self_attn.k_proj.weight", p))?,
+                wv:    gpu(&format!("{}.self_attn.v_proj.weight", p))?,
+                wo:    gpu(&format!("{}.self_attn.o_proj.weight", p))?,
+                wgate: gpu(&format!("{}.mlp.gate_proj.weight", p))?,
+                wup:   gpu(&format!("{}.mlp.up_proj.weight", p))?,
+                wdown: gpu(&format!("{}.mlp.down_proj.weight", p))?,
+                input_norm_w: in_w,
+                post_attn_norm_w: pa_w,
+                kv_k: Vec::new(),
+                kv_v: Vec::new(),
+            });
+        }
+
+        let (norm_w, _) = load("model.norm.weight")?;
+        let lm_head = gpu("lm_head.weight")?;
+
+        log::info!("✅ Qwen carregado em VRAM (HIP nativo)");
+        Ok(Self { embed, layers, norm_w, lm_head, cfg })
+    }
+
     pub fn reset_cache(&mut self) {
-        for layer in &mut self.layers {
-            layer.kv_cache = None;
+        for l in &mut self.layers {
+            l.kv_k.clear();
+            l.kv_v.clear();
         }
     }
 
-    /// Forward pass real com KV-Cache: transforma tokens em probabilidades
-    pub fn forward(&mut self, tokens: &Tensor, _pos: usize) -> Result<Tensor> {
-        let mut x = self.embed(&tokens)?;
-        
+    /// Forward pass — retorna logits [vocab] para o último token.
+    /// Implementação de referência em CPU pura f32.
+    /// rocBLAS GEMM na próxima fase (substituição direta desta função).
+    pub fn forward(&mut self, token_ids: &[u32]) -> ModelResult<Vec<f32>> {
+        let h = self.cfg.hidden_size;
+        let n = token_ids.len();
+
+        // Embedding lookup
+        let embed = self.embed.to_host()?;
+        let mut x: Vec<f32> = token_ids.iter().flat_map(|&id| {
+            let off = id as usize * h;
+            embed[off..off + h].to_vec()
+        }).collect();
+
+        // Transformer blocks
         for layer in &mut self.layers {
-            let residual = x.clone();
-            let x_norm = layer.input_layernorm.forward(&x)?;
-            
-            let q = layer.attention_wq.forward(&x_norm)?;
-            let k = layer.attention_wk.forward(&x_norm)?;
-            let v = layer.attention_wv.forward(&x_norm)?;
-            
-            // Otimização KV-Cache: 
-            // Em vez de cat em cada step (N^2), usamos o cache persistente.
-            // Para produção, o ideal seria pre-alocar o Buffer de contexto máximo (ex: 2048)
-            // e usar index_select/slice_assign. Por enquanto, mantemos a lógica mas 
-            // preparamos a estrutura para o buffer flat.
-            let (k, v) = match &layer.kv_cache {
-                None => {
-                    layer.kv_cache = Some((k.clone(), v.clone()));
-                    (k, v)
-                }
-                Some((prev_k, prev_v)) => {
-                    // Concatena o novo token com o cache anterior
-                    let k = Tensor::cat(&[prev_k, &k], 1)?;
-                    let v = Tensor::cat(&[prev_v, &v], 1)?;
-                    layer.kv_cache = Some((k.clone(), v.clone()));
-                    (k, v)
-                }
-            };
+            let normed = rms_norm(&x, &layer.input_norm_w, self.cfg.rms_eps, n, h);
 
-            let dk = (q.dim(candle_core::D::Minus1)? as f64).sqrt();
-            let attn_weights = (q.matmul(&k.transpose(1, 2)?)? / dk)?;
-            let attn_probs = candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?;
-            let attn_out = attn_probs.matmul(&v)?;
-            
-            let attn_final = layer.attention_wo.forward(&attn_out)?;
-            x = (attn_final + residual)?;
+            let wq = layer.wq.to_host()?;
+            let wk = layer.wk.to_host()?;
+            let wv = layer.wv.to_host()?;
+            let wo = layer.wo.to_host()?;
 
-            let residual = x.clone();
-            let x_norm = layer.post_attention_layernorm.forward(&x)?;
-            let gate = layer.mlp_gate.forward(&x_norm)?;
-            let up = layer.mlp_up.forward(&x_norm)?;
-            
-            let mlp_out = (gate.silu()? * up)?;
-            let mlp_out = layer.mlp_down.forward(&mlp_out)?;
-            x = (mlp_out + residual)?;
+            let q_dim = layer.wq.shape[0];
+            let kv_dim = layer.wk.shape[0];
+
+            let q = gemm(&normed, &wq, n, h, q_dim);
+            let k = gemm(&normed, &wk, n, h, kv_dim);
+            let v = gemm(&normed, &wv, n, h, kv_dim);
+
+            layer.kv_k.extend_from_slice(&k);
+            layer.kv_v.extend_from_slice(&v);
+            let seq = layer.kv_k.len() / kv_dim;
+
+            // Multi-head attention
+            let head_dim = self.cfg.head_dim;
+            let n_heads  = self.cfg.num_heads;
+            let n_kv     = self.cfg.num_kv_heads;
+            let scale    = (head_dim as f32).sqrt();
+            let mut attn = vec![0.0f32; n * q_dim];
+
+            for h_i in 0..n_heads {
+                let kv_h = h_i * n_kv / n_heads; // GQA mapping
+                let q_off = h_i * head_dim;
+                let k_off = kv_h * head_dim;
+
+                for qi in 0..n {
+                    let mut scores = vec![0.0f32; seq];
+                    for ki in 0..seq {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += q[qi * q_dim + q_off + d]
+                                 * layer.kv_k[ki * kv_dim + k_off + d];
+                        }
+                        scores[ki] = dot / scale;
+                    }
+                    softmax_inplace(&mut scores);
+                    for d in 0..head_dim {
+                        let mut acc = 0.0f32;
+                        for ki in 0..seq {
+                            acc += scores[ki] * layer.kv_v[ki * kv_dim + k_off + d];
+                        }
+                        attn[qi * q_dim + q_off + d] = acc;
+                    }
+                }
+            }
+
+            let attn_proj = gemm(&attn, &wo, n, q_dim, h);
+            for i in 0..n * h { x[i] += attn_proj[i]; }
+
+            // MLP
+            let normed2 = rms_norm(&x, &layer.post_attn_norm_w, self.cfg.rms_eps, n, h);
+            let wg = layer.wgate.to_host()?;
+            let wu = layer.wup.to_host()?;
+            let wd = layer.wdown.to_host()?;
+            let inter = layer.wgate.shape[0];
+
+            let gate = gemm(&normed2, &wg, n, h, inter);
+            let up   = gemm(&normed2, &wu, n, h, inter);
+            let swiglu: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+            let mlp = gemm(&swiglu, &wd, n, inter, h);
+            for i in 0..n * h { x[i] += mlp[i]; }
         }
 
-        let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
-    }
+        // Final norm
+        let x_norm = rms_norm(&x, &self.norm_w, self.cfg.rms_eps, n, h);
 
-    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
-        let tokens = tokens.flatten_all()?;
-        let embeddings = Tensor::embedding(&tokens, &self.embed_tokens)?;
-        embeddings.unsqueeze(0)
+        // lm_head — só no último token
+        let last = &x_norm[(n - 1) * h..];
+        let lm = self.lm_head.to_host()?;
+        let vocab = self.cfg.vocab_size;
+        let logits = gemm(last, &lm, 1, h, vocab);
+        Ok(logits)
     }
+}
+
+// ── Primitivas CPU ────────────────────────────────────────────────────────────
+
+fn rms_norm(x: &[f32], w: &[f32], eps: f32, n: usize, d: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n * d];
+    for i in 0..n {
+        let row = &x[i * d..(i + 1) * d];
+        let rms = (row.iter().map(|&v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
+        for j in 0..d { out[i * d + j] = row[j] / rms * w[j]; }
+    }
+    out
+}
+
+/// A[m,k] × B^T[n,k] → C[m,n]  (weights armazenados como [out, in])
+fn gemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k { acc += a[i * k + p] * b[j * k + p]; }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
+fn softmax_inplace(x: &mut [f32]) {
+    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() { *v = (*v - max).exp(); sum += *v; }
+    for v in x.iter_mut() { *v /= sum; }
+}
+
+#[inline(always)]
+fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
+// ── Leitor BF16 safetensors ───────────────────────────────────────────────────
+
+fn read_bf16_f32(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<f32>, Vec<usize>)> {
+    if mmap.len() < 8 {
+        return Err(ModelError::Model("shard inválido".into()));
+    }
+    let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+    let header: HashMap<String, serde_json::Value> = serde_json::from_slice(&mmap[8..8 + hlen])?;
+    let meta = header.get(name)
+        .ok_or_else(|| ModelError::Model(format!("tensor '{}' não encontrado", name)))?;
+
+    let shape: Vec<usize> = meta["shape"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let offs = meta["data_offsets"].as_array().unwrap();
+    let s = offs[0].as_u64().unwrap() as usize;
+    let e = offs[1].as_u64().unwrap() as usize;
+    let base = 8 + hlen;
+    let raw = &mmap[base + s..base + e];
+
+    let floats: Vec<f32> = raw.chunks_exact(2).map(|b| {
+        bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
+    }).collect();
+
+    Ok((floats, shape))
 }
