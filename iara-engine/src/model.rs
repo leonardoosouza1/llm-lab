@@ -46,26 +46,58 @@ pub struct ModelCfg {
 
 impl ModelCfg {
     /// Lê os parâmetros diretamente do config.json do modelo.
-    /// Aceita valores inteiros ou float (serde_json trata ambos como Number).
+    /// Suporta configs planas (Qwen3, Llama) e configs aninhadas em `text_config` (VLMs).
+    /// Retorna erro claro se a arquitetura não for um causal LM suportado.
     pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(config_path)?;
         let v: serde_json::Value = serde_json::from_str(&content)?;
 
+        // Verifica arquitetura suportada
+        let arch = v["architectures"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+
+        let supported = ["Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM",
+                         "MistralForCausalLM", "Qwen2_5ForCausalLM"];
+        if !supported.iter().any(|s| arch.contains(s.trim_end_matches("ForCausalLM"))
+                                  || *s == arch) {
+            return Err(format!(
+                "Arquitetura '{}' não é suportada. O engine suporta apenas modelos \
+                 causal LM (Qwen3, Llama, Mistral). Modelos multimodais (VLM) como \
+                 Qwen3_5ForConditionalGeneration não são compatíveis.",
+                arch
+            ).into());
+        }
+
+        // Alguns configs têm parâmetros no nível raiz; VLMs os colocam em text_config.
+        // Usamos o nível raiz se hidden_size existir lá, senão tentamos text_config.
+        let params = if v["hidden_size"].is_number() {
+            &v
+        } else if v["text_config"]["hidden_size"].is_number() {
+            &v["text_config"]
+        } else {
+            return Err(format!(
+                "config.json de '{}' não contém 'hidden_size' nem 'text_config.hidden_size'",
+                config_path.display()
+            ).into());
+        };
+
         // Helper: extrai usize de inteiro ou float JSON
         let uint = |key: &str| -> Result<usize, Box<dyn std::error::Error>> {
-            let val = &v[key];
+            let val = &params[key];
             val.as_u64()
                 .or_else(|| val.as_f64().map(|f| f as u64))
                 .map(|n| n as usize)
-                .ok_or_else(|| format!("campo '{}' ausente ou inválido em config.json (valor: {})", key, val).into())
+                .ok_or_else(|| format!("campo '{}' ausente ou inválido em config.json", key).into())
         };
 
         let hidden_size = uint("hidden_size")?;
         let num_heads   = uint("num_attention_heads")?;
 
         // head_dim pode não existir em configs antigos → calcula como hidden/heads
-        let head_dim = v["head_dim"].as_u64()
-            .or_else(|| v["head_dim"].as_f64().map(|f| f as u64))
+        let head_dim = params["head_dim"].as_u64()
+            .or_else(|| params["head_dim"].as_f64().map(|f| f as u64))
             .map(|n| n as usize)
             .unwrap_or(hidden_size / num_heads);
 
@@ -77,7 +109,7 @@ impl ModelCfg {
             intermediate_size: uint("intermediate_size")?,
             vocab_size:        uint("vocab_size")?,
             num_kv_heads:      uint("num_key_value_heads")?,
-            rms_eps:           v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
+            rms_eps:           params["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
         })
     }
 

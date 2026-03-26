@@ -106,6 +106,9 @@ window.store = (function () {
     loadingMsg: 'Aguardando servidor...',
     availableModels: [],     // [{name, hidden_size, num_layers, ...}]
     selectedModelName: '',   // currently selected in dropdown (not yet loaded)
+    modelKind: 'unknown',    // 'causal_lm' | 'vlm' | 'unknown'
+    hasVision: false,
+    selectedImageBase64: null,
 
     // UI
     activeTab: 'live',
@@ -394,6 +397,14 @@ window.wsManager = {
           store.modelLoading = false;
           store.modelName = msg.name || store.selectedModelName;
           store.loadingMsg = msg.message || `✅ ${store.modelName} pronto!`;
+          
+          const loadedModel = store.availableModels.find(function(m) { return m.name === msg.name; });
+          if (loadedModel) {
+            store.modelKind = loadedModel.model_kind || 'unknown';
+            store.hasVision = loadedModel.has_vision || false;
+          }
+          if (typeof updateImageUploadArea === 'function') updateImageUploadArea();
+
           updateModelUI();
           updateModelLoadingBanner();
           // Enable prompt input
@@ -451,6 +462,9 @@ window.api = {
       max_tokens: maxTokens,
       temperature,
     };
+    if (store.selectedImageBase64) {
+      body.image_base64 = store.selectedImageBase64;
+    }
 
     addLog('http', body, `POST /api/generate — prompt: "${prompt}"`);
 
@@ -1737,7 +1751,10 @@ function populateModelSelect() {
     const layers = m.num_layers ? `${m.num_layers}L` : '';
     const hidden = m.hidden_size ? `${m.hidden_size}h` : '';
     const dtype  = m.torch_dtype ? ` (${m.torch_dtype})` : '';
-    opt.textContent = `${m.name}  ${layers} ${hidden}${dtype}`.trim();
+    const badge  = m.model_kind === 'vlm' ? ' 🖼 VLM' :
+                   m.model_kind === 'causal_lm' ? ' 📝 LLM' : '';
+    opt.textContent = `${m.name}${badge}  ${layers} ${hidden}${dtype}`.trim();
+    if (m.model_kind === 'vlm') opt.style.color = '#00d4ff';
     sel.appendChild(opt);
   });
 
@@ -1776,6 +1793,8 @@ function updateModelUI() {
       if (m) {
         infoRow.style.display = 'flex';
         infoRow.innerHTML = [
+          m.model_kind === 'vlm' ? `<span class="model-info-chip model-chip-vlm">VLM 🖼</span>` : '',
+          m.has_vision           ? `<span class="model-info-chip model-chip-vision">vision</span>` : '',
           m.num_layers        ? `<span class="model-info-chip"><strong>${m.num_layers}</strong> layers</span>` : '',
           m.hidden_size       ? `<span class="model-info-chip">hidden <strong>${m.hidden_size}</strong></span>` : '',
           m.intermediate_size ? `<span class="model-info-chip">ffn <strong>${m.intermediate_size}</strong></span>` : '',
@@ -1836,6 +1855,13 @@ document.addEventListener('click', function(e) {
   if (btn) switchActiveTab(btn.dataset.tab);
 });
 
+function updateImageUploadArea() {
+  const area = el('image-upload-area');
+  if (!area) return;
+  const show = store.modelKind === 'vlm' || store.hasVision;
+  area.style.display = show ? 'flex' : 'none';
+}
+
 function bindNewLayoutEvents() {
 
   // ── Prompt input ────────────────────────────────────────────────────────
@@ -1868,13 +1894,52 @@ function bindNewLayoutEvents() {
   const loadModelBtn = el('load-model-btn');
   const modelSelectEl = el('model-select');
 
+  // ── Image upload (VLM) ────────────────────────────────────────────────────
+  const imageFileInput = el('image-file-input');
+  const imageClearBtn  = el('image-clear-btn');
+  const imagePreview   = el('image-preview');
+  const imagePreviewContainer = el('image-preview-container');
+
+  if (imageFileInput) {
+    imageFileInput.addEventListener('change', function() {
+      const file = imageFileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const dataUrl = e.target.result;
+        store.selectedImageBase64 = dataUrl.split(',')[1] || null;
+        if (imagePreview) {
+          imagePreview.src = dataUrl;
+        }
+        if (imagePreviewContainer) imagePreviewContainer.style.display = 'block';
+        if (imageClearBtn) imageClearBtn.style.display = 'inline-flex';
+        addLog('http', null, `Imagem selecionada: ${file.name} (${(file.size/1024).toFixed(1)}KB)`);
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  if (imageClearBtn) {
+    imageClearBtn.addEventListener('click', function() {
+      store.selectedImageBase64 = null;
+      if (imageFileInput) imageFileInput.value = '';
+      if (imagePreview) imagePreview.src = '';
+      if (imagePreviewContainer) imagePreviewContainer.style.display = 'none';
+      imageClearBtn.style.display = 'none';
+    });
+  }
+
   if (modelSelectEl) {
     modelSelectEl.addEventListener('change', function() {
       store.selectedModelName = modelSelectEl.value;
+      const m = store.availableModels.find(function(x) { return x.name === modelSelectEl.value; });
+      store.modelKind = m ? (m.model_kind || 'unknown') : 'unknown';
+      store.hasVision = m ? (m.has_vision || false) : false;
+      updateImageUploadArea();
+
       // Show info chips for selected (not yet loaded) model
       const infoRow = el('model-info-row');
       if (infoRow && !store.modelLoading) {
-        const m = store.availableModels.find(function(x) { return x.name === modelSelectEl.value; });
         if (m) {
           infoRow.style.display = 'flex';
           infoRow.innerHTML = [

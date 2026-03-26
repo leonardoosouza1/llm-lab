@@ -87,6 +87,8 @@ pub struct ModelInfo {
     pub intermediate_size: Option<u64>,
     pub architecture: Option<String>,
     pub torch_dtype: Option<String>,
+    pub model_kind: String,   // "causal_lm" | "vlm" | "unknown"
+    pub has_vision: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,21 +163,52 @@ pub async fn models_handler(
         let info = match std::fs::read_to_string(&config_path) {
             Ok(content) => {
                 let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+
+                // Params may be at root (causal LM) or nested in text_config (VLM)
+                let p = if v["hidden_size"].is_number() { &v }
+                        else if v["text_config"]["hidden_size"].is_number() { &v["text_config"] }
+                        else { &v };
+
+                let uint_field = |key: &str| -> Option<u64> {
+                    p[key].as_u64().or_else(|| p[key].as_f64().map(|f| f as u64))
+                };
+
+                let arch = v["architectures"].as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+
+                let model_kind = match arch.as_deref().unwrap_or("") {
+                    a if a.ends_with("ForCausalLM") => "causal_lm".to_string(),
+                    a if a.ends_with("ForConditionalGeneration") => "vlm".to_string(),
+                    _ => "unknown".to_string(),
+                };
+                let has_vision = v["vision_config"].is_object();
+
+                let display_arch = arch.as_deref().map(|a| {
+                    if model_kind == "causal_lm" { a.to_string() }
+                    else if model_kind == "vlm" { format!("{} [VLM — suporte parcial]", a) }
+                    else { format!("{} ⚠ não suportado", a) }
+                });
+
+                let dtype = v["torch_dtype"].as_str()
+                    .or_else(|| p["dtype"].as_str())
+                    .map(|s| s.to_string());
+
                 ModelInfo {
                     name: name.clone(),
                     path: path.to_string_lossy().to_string(),
-                    hidden_size:       v["hidden_size"].as_u64(),
-                    num_layers:        v["num_hidden_layers"].as_u64(),
-                    vocab_size:        v["vocab_size"].as_u64(),
-                    num_heads:         v["num_attention_heads"].as_u64(),
-                    num_kv_heads:      v["num_key_value_heads"].as_u64(),
-                    head_dim:          v["head_dim"].as_u64(),
-                    intermediate_size: v["intermediate_size"].as_u64(),
-                    architecture:      v["architectures"].as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string()),
-                    torch_dtype:       v["torch_dtype"].as_str().map(|s| s.to_string()),
+                    hidden_size:       uint_field("hidden_size"),
+                    num_layers:        uint_field("num_hidden_layers"),
+                    vocab_size:        uint_field("vocab_size"),
+                    num_heads:         uint_field("num_attention_heads"),
+                    num_kv_heads:      uint_field("num_key_value_heads"),
+                    head_dim:          uint_field("head_dim"),
+                    intermediate_size: uint_field("intermediate_size"),
+                    architecture:      display_arch,
+                    torch_dtype:       dtype,
+                    model_kind,
+                    has_vision,
                 }
             }
             Err(_) => ModelInfo {
@@ -184,6 +217,8 @@ pub async fn models_handler(
                 hidden_size: None, num_layers: None, vocab_size: None,
                 num_heads: None, num_kv_heads: None, head_dim: None,
                 intermediate_size: None, architecture: None, torch_dtype: None,
+                model_kind: "unknown".to_string(),
+                has_vision: false,
             },
         };
         models.push(info);
@@ -212,6 +247,27 @@ pub async fn load_model_handler(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado", req.name) })),
         ).into_response();
+    }
+
+    // Detect VLM before spawning load
+    let arch_check = std::fs::read_to_string(model_path.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v["architectures"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()));
+
+    let is_vlm = arch_check.as_deref()
+        .map(|a| a.ends_with("ForConditionalGeneration"))
+        .unwrap_or(false);
+
+    if is_vlm {
+        log::warn!("⚠️  Modelo VLM '{}' — apenas o decoder de texto será carregado (vision encoder na Fase 2)", req.name);
+        let _ = state.frame_tx.send(serde_json::json!({
+            "type": "status",
+            "message": format!("⚠️ VLM '{}': carregando apenas decoder de texto (vision = Fase 2)", req.name)
+        }).to_string());
     }
 
     // Mark as loading

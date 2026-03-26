@@ -1,0 +1,75 @@
+[2026-03-25 22:32:40] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 22:32:40] 🔄 Processando tarefa: test_task_001.json
+[2026-03-25 22:32:40] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 22:35:25] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 22:35:25] 🔄 Processando tarefa: test_task_001.json
+[2026-03-25 22:35:25] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 22:36:59] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 22:47:35] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 22:47:35] 🔄 Processando tarefa: task_002_uuid123.json (Agent: @frontend-specialist)
+[2026-03-25 22:47:35] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 22:58:04] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 22:58:04] 🔄 Processando tarefa: task_002_uuid123.json (Agent: @frontend-specialist)
+[2026-03-25 22:58:04] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 23:19:07] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:19:07] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-25 23:19:07] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 23:19:09] ❌ Erro processando test.json: Gemini CLI falhou: Failed to save project registry to /home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/projects.json: Error: ENOENT: no such file or directory, rename '/home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/projects.json.tmp' -> '/home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/projects.json'
+    at async Object.rename (node:internal/fs/promises:778:10)
+    at async ProjectRegistry.save (file:///home/leonardo/.nvm/versions/node/v22.16.0/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/config/projectRegistry.js:73:13)
+    at async ProjectRegistry.getShortId (file:///home/leonardo/.nvm/versions/node/v22.16.0/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/config/projectRegistry.js:95:13)
+    at async file:///home/leonardo/.nvm/versions/node/v22.16.0/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/config/storage.js:176:38
+    at async cleanupCheckpoints (file:///home/leonardo/.nvm/versions/node/v22.16.0/lib/node_modules/@google/gemini-cli/dist/src/utils/cleanup.js:142:5)
+    at async Promise.all (index 0)
+    at async main (file:///home/leonardo/.nvm/versions/node/v22.16.0/lib/node_modules/@google/gemini-cli/dist/src/gemini.js:124:5) {
+  errno: -2,
+  code: 'ENOENT',
+  syscall: 'rename',
+  path: '/home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/projects.json.tmp',
+  dest: '/home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/projects.json'
+}
+{
+  "session_id": "cb00b552-773c-4479-8abe-86062da1db3d",
+  "error": {
+    "type": "Error",
+    "message": "Please set an Auth method in your /home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA",
+    "code": 41
+  }
+}
+[2026-03-25 23:19:43] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:20:14] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:21:07] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:21:07] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-25 23:21:07] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 23:21:09] ❌ Erro processando test.json: Gemini CLI falhou: {
+  "session_id": "c9fa3331-99de-43f6-96e9-25f96fd5b2b3",
+  "error": {
+    "type": "Error",
+    "message": "Please set an Auth method in your /home/leonardo/projects/LLM/llm-lab/.agent/events/fake_home/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA",
+    "code": 41
+  }
+}
+[2026-03-25 23:22:46] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:22:46] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-25 23:22:46] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 23:24:29] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:28:18] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:28:18] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-25 23:28:18] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-25 23:41:14] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-25 23:41:14] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-25 23:41:14] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-26 00:03:51] 👁️  MCP Orchestrator Watcher iniciado. Aguardando tarefas na INBOX...
+[2026-03-26 00:03:51] 🔄 Processando tarefa: test.json (Agent: @frontend-specialist)
+[2026-03-26 00:03:51] 🚀 Iniciando subprocesso Gemini CLI -> Agent: @frontend-specialist
+[2026-03-26 00:04:10] ✅ Tarefa concluída com sucesso: test.json
+[2026-03-26 09:34:36] ============================================================
+[2026-03-26 09:34:36] 👁️  IARA Event Loop iniciado
+[2026-03-26 09:34:36]    Project: /home/leonardo/projects/LLM/llm-lab
+[2026-03-26 09:34:36]    Gemini: /home/leonardo/.nvm/versions/node/v22.16.0/bin/gemini
+[2026-03-26 09:34:36]    Poll: 2s | Timeout: 300s
+[2026-03-26 09:34:36]    Models: gemini-2.5-flash → gemini-2.5-flash-lite
+[2026-03-26 09:34:36] ============================================================
+[2026-03-26 09:35:14] 🔄 Processando tarefa: task_af934e92.json (Agent: @frontend-specialist)
+[2026-03-26 09:35:14]   🚀 Executando Gemini CLI → Agent: @frontend-specialist
+[2026-03-26 09:35:14]   🚀 Tentando @frontend-specialist com modelo: gemini-2.5-flash
