@@ -6,6 +6,27 @@
 // Quando o cache está cheio, o token mais antigo é descartado via copy_within.
 // ============================================================================
 
+/// Cache de K ou V em GPU — pré-alocado, nunca desce para CPU durante geração.
+pub struct GpuKvCache {
+    /// Buffer GPU: [max_seq_len, kv_dim] f32.
+    pub data: hip_ffi::safe::DeviceBuffer<f32>,
+    pub max_seq_len: usize,
+    pub kv_dim: usize,
+    /// Linhas válidas (tokens já escritos no cache).
+    pub current_len: usize,
+}
+
+impl GpuKvCache {
+    pub fn new(max_seq_len: usize, kv_dim: usize) -> Result<Self, hip_ffi::HipError> {
+        let data = hip_ffi::safe::DeviceBuffer::<f32>::alloc(max_seq_len * kv_dim)?;
+        Ok(Self { data, max_seq_len, kv_dim, current_len: 0 })
+    }
+
+    pub fn seq_len(&self) -> usize { self.current_len }
+
+    pub fn reset(&mut self) { self.current_len = 0; }
+}
+
 /// Cache de K ou V para uma camada, com capacidade fixa.
 ///
 /// Layout: buffer plano row-major `[seq, kv_dim]`.

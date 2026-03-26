@@ -89,4 +89,68 @@ fn main() {
     bindings
         .write_to_file(out.join("hip_bindings.rs"))
         .expect("Falha ao escrever hip_bindings.rs");
+
+    // ── hipBLAS bindings ──────────────────────────────────────────────────────
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    println!("cargo:rustc-link-lib=dylib=hipblas");
+    println!("cargo:rerun-if-changed=hipblas_wrapper.h");
+
+    let hipblas_bindings = bindgen::Builder::default()
+        .header(format!("{}/hipblas_wrapper.h", manifest_dir))
+        .clang_arg(format!("-I{}/include", rocm))
+        .clang_arg("-D__HIP_PLATFORM_AMD__")
+        .clang_arg("-DHIPBLAS_V2")
+        .clang_arg(format!("-resource-dir={}/lib/llvm/lib/clang/19", rocm))
+        .clang_arg("-x")
+        .clang_arg("c++")
+        .clang_arg("-std=c++17")
+        // Functions
+        .allowlist_function("hipblasCreate")
+        .allowlist_function("hipblasDestroy")
+        .allowlist_function("hipblasGemmEx_v2")
+        // Types
+        .allowlist_type("hipblasStatus_t")
+        .allowlist_type("hipblasOperation_t")
+        .allowlist_type("hipblasGemmAlgo_t")
+        .allowlist_type("hipblasComputeType_t")
+        // Vars / constants
+        .allowlist_var("HIPBLAS_STATUS.*")
+        .allowlist_var("HIPBLAS_OP.*")
+        .allowlist_var("HIPBLAS_GEMM.*")
+        .allowlist_var("HIPBLAS_COMPUTE.*")
+        .allowlist_var("HIP_R.*")
+        .layout_tests(false)
+        .blocklist_item("FP_.*")
+        .blocklist_item("FP_INT_.*")
+        .blocklist_item("_GLIBCXX_.*")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("hipblas bindgen failed");
+
+    hipblas_bindings
+        .write_to_file(out.join("hipblas_bindings.rs"))
+        .expect("Failed to write hipblas_bindings.rs");
+
+    // ── Compile HIP kernels to .hsaco ─────────────────────────────────────────
+    let hipcc = format!("{}/bin/hipcc", rocm);
+    let kernel_src = format!("{}/kernels/llm_kernels.hip", manifest_dir);
+    let kernel_out = out.join("llm_kernels.hsaco");
+
+    println!("cargo:rerun-if-changed=kernels/llm_kernels.hip");
+
+    let status = std::process::Command::new(&hipcc)
+        .args(&[
+            "--offload-arch=gfx1032",
+            "-O3",
+            "--genco",
+            "-o", kernel_out.to_str().unwrap(),
+            &kernel_src,
+        ])
+        .status()
+        .expect("hipcc not found — ensure ROCM_PATH is set");
+
+    if !status.success() {
+        panic!("hipcc failed to compile llm_kernels.hip (exit: {})", status);
+    }
 }

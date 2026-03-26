@@ -1,6 +1,6 @@
 // frontend/src/components/model_loader.js
 
-import { el, addLog } from '../utils.js'; // addLog will be replaced by the store-bound version
+import { el } from '../utils.js';
 import { store } from '../store/index.js';
 
 /**

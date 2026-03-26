@@ -138,21 +138,35 @@ async fn run_engine_loop(
                 }).to_string());
 
                 let tokens = crate::tokenizer::tokenize(&text);
-                let mut current_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+                let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
 
-                if current_ids.is_empty() { continue; }
+                if prompt_ids.is_empty() { continue; }
+
+                // Reset KV cache before generation
+                {
+                    let mut guard = model.lock().await;
+                    if let Some(m) = guard.as_mut() { m.reset_cache(); }
+                }
 
                 let mut generated_text = String::new();
                 let sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
+                let mut last_token: u32 = 0;
 
                 for step in 0..MAX_STEPS {
+                    // Prefill on step 0, decode (single new token) on subsequent steps
+                    let tokens_slice: &[u32] = if step == 0 {
+                        &prompt_ids
+                    } else {
+                        std::slice::from_ref(&last_token)
+                    };
+
                     let gen_step = {
                         let mut guard = model.lock().await;
                         let m = match guard.as_mut() {
                             Some(m) => m,
                             None => break,
                         };
-                        match forward_traced(m, &current_ids, &sampling) {
+                        match forward_traced(m, tokens_slice, &sampling) {
                             Ok(s) => s,
                             Err(e) => { log::error!("Forward error: {}", e); break; }
                         }
@@ -198,9 +212,8 @@ async fn run_engine_loop(
                     });
                     let _ = frame_tx.send(result.to_string());
 
-                    let next = gen_step.token_id;
-                    current_ids.push(next);
-                    if next == EOS || next == 151643 { break; }
+                    last_token = gen_step.token_id;
+                    if last_token == EOS || last_token == 151643 { break; }
                 }
 
                 let _ = frame_tx.send(serde_json::json!({

@@ -133,4 +133,13 @@ impl GpuTensorBF16 {
         assert!(!self.shape.is_empty());
         self.shape[self.shape.len() - 1]
     }
+
+    /// Raw device pointer for use in hipBLAS FFI (BF16 bits as u16).
+    pub fn dev_ptr(&self) -> *const u16 {
+        self.buf.as_ptr()
+    }
+
+    pub fn dev_ptr_mut(&mut self) -> *mut u16 {
+        self.buf.as_mut_ptr()
+    }
 }

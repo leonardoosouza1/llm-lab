@@ -441,33 +441,47 @@ async fn generate_internal(
     };
 
     let tokens = crate::tokenizer::tokenize(&req.prompt);
-    let token_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
-    let prompt_eval_count = token_ids.len() as u32;
-    let mut current_tokens = token_ids;
+    let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+    let prompt_eval_count = prompt_ids.len() as u32;
     let mut generated_text = String::new();
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
+    let mut last_token: u32 = 0;
 
     const EOS_TOKEN: u32 = 151645;
 
-    for _ in 0..req.max_tokens {
-        if current_tokens.is_empty() { break; }
+    // Reset KV cache before generation — prevents stale state from previous calls.
+    {
+        let mut guard = state.qwen_model.lock().await;
+        let model = guard.as_mut().ok_or("Model not loaded")?;
+        model.reset_cache();
+    }
+
+    for step in 0..req.max_tokens {
+        // Prefill (step 0): forward on full prompt so KV cache is populated.
+        // Decode (step > 0): forward on only the latest token — KV cache holds history.
+        // This is O(prompt) + O(max_tokens) work instead of O(n²).
+        let tokens_to_forward: &[u32] = if step == 0 {
+            if prompt_ids.is_empty() { break; }
+            &prompt_ids
+        } else {
+            std::slice::from_ref(&last_token)
+        };
 
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, &current_tokens, &sampling)
+            forward_traced(model, tokens_to_forward, &sampling)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
-        let next_token = gen_step.token_id;
+        last_token = gen_step.token_id;
         generated_text.push_str(&gen_step.token_str);
         brain_trace.add_step(gen_step);
-        current_tokens.push(next_token);
         eval_count += 1;
 
-        if next_token == EOS_TOKEN { break; }
+        if last_token == EOS_TOKEN { break; }
     }
 
     brain_trace.finalize();
@@ -479,7 +493,7 @@ async fn generate_internal(
         created_at: chrono::Utc::now().to_rfc3339(),
         response: generated_text,
         done: true,
-        context: Some(current_tokens),
+        context: None,
         total_duration: total_duration.as_millis(),
         prompt_eval_count,
         eval_count,

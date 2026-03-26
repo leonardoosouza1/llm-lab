@@ -15,6 +15,29 @@ export const api = {
     wsManager.connect();
   },
 
+  async health() {
+    try {
+      const res = await fetch(`${HTTP_URL}/health`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      store.httpHealthy = true;
+      store.modelReady = data.status === 'ok';
+      store.modelLoading = data.model_loading || false;
+      if (data.model_loading) {
+        store.loadingMsg = 'Carregando modelo...';
+      } else if (data.status !== 'ok' && !store.modelReady) {
+        store.loadingMsg = 'Aguardando servidor...';
+      }
+      if (data.model && data.status === 'ok') {
+        store.modelName = data.model;
+      }
+      return data;
+    } catch (err) {
+      store.httpHealthy = false;
+      return null;
+    }
+  },
+
   async fetchModels() {
     try {
       const res = await fetch(`${HTTP_URL}/api/models`);
