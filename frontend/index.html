@@ -145,6 +145,20 @@
             <div id="model-info-row" class="model-info-row" style="display:none">
               <!-- populated by JS when a model is selected -->
             </div>
+            <!-- VRAM usage bar — visível após modelo carregado -->
+            <div id="vram-section" style="display:none; margin-top:10px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                <span style="font-size:11px; font-weight:600; color:#a78bfa; font-family:'JetBrains Mono',monospace; letter-spacing:.05em;">VRAM</span>
+                <span id="vram-label" style="font-size:11px; color:#c4b5fd; font-family:'JetBrains Mono',monospace;">—</span>
+              </div>
+              <div style="background:rgba(255,255,255,.07); border-radius:4px; height:8px; overflow:hidden;">
+                <div id="vram-bar-model" style="height:100%; width:0%; background:linear-gradient(90deg,#7c3aed,#a855f7); border-radius:4px; transition:width .4s;"></div>
+              </div>
+              <div style="display:flex; gap:12px; margin-top:5px;">
+                <span id="vram-model-chip" style="font-size:10px; color:#a78bfa; font-family:'JetBrains Mono',monospace;">pesos: —</span>
+                <span id="vram-free-chip"  style="font-size:10px; color:#6ee7b7; font-family:'JetBrains Mono',monospace;">livre: —</span>
+              </div>
+            </div>
             <div id="model-load-progress" class="model-load-progress" style="display:none">
               <span style="display:inline-block;width:12px;height:12px;border:2px solid #a855f7;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></span>
               <span id="model-load-msg">Carregando...</span>

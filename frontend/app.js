@@ -5,90 +5,7 @@
 // NO ES module imports — all globals
 // ============================================================================
 
-// ── Utility: safe element getter ──
-function el(id) { return document.getElementById(id); }
-
-// ── Utility: thermal color mapping ──
-// Maps 0→#1a1a2e, 0.5→#a855f7, 1→#00ffc8
-function thermalColor(value) {
-  const v = Math.max(0, Math.min(1, value));
-  if (v < 0.5) {
-    // #1a1a2e → #a855f7
-    const t = v * 2;
-    const r = Math.round(0x1a + (0xa8 - 0x1a) * t);
-    const g = Math.round(0x1a + (0x55 - 0x1a) * t);
-    const b = Math.round(0x2e + (0xf7 - 0x2e) * t);
-    return `rgb(${r},${g},${b})`;
-  } else {
-    // #a855f7 → #00ffc8
-    const t = (v - 0.5) * 2;
-    const r = Math.round(0xa8 + (0x00 - 0xa8) * t);
-    const g = Math.round(0x55 + (0xff - 0x55) * t);
-    const b = Math.round(0xf7 + (0xc8 - 0xf7) * t);
-    return `rgb(${r},${g},${b})`;
-  }
-}
-
-// ── Utility: thermal color as [r,g,b] array ──
-function thermalColorRGB(value) {
-  const v = Math.max(0, Math.min(1, value));
-  if (v < 0.5) {
-    const t = v * 2;
-    return [
-      Math.round(0x1a + (0xa8 - 0x1a) * t),
-      Math.round(0x1a + (0x55 - 0x1a) * t),
-      Math.round(0x2e + (0xf7 - 0x2e) * t),
-    ];
-  } else {
-    const t = (v - 0.5) * 2;
-    return [
-      Math.round(0xa8 + (0x00 - 0xa8) * t),
-      Math.round(0x55 + (0xff - 0x55) * t),
-      Math.round(0xf7 + (0xc8 - 0xf7) * t),
-    ];
-  }
-}
-
-// ── Utility: timestamp HH:MM:SS.mmm ──
-function timestamp() {
-  const d = new Date();
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  const ms = String(d.getMilliseconds()).padStart(3, '0');
-  return `${hh}:${mm}:${ss}.${ms}`;
-}
-
-// ── Utility: HTML escape ──
-function escapeHtml(text) {
-  const d = document.createElement('div');
-  d.textContent = String(text);
-  return d.innerHTML;
-}
-
-// ── Utility: JSON syntax highlight ──
-function syntaxHighlight(json) {
-  const str = typeof json === 'string' ? json : JSON.stringify(json, null, 2);
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function(match) {
-      if (/^"/.test(match)) {
-        if (/:$/.test(match)) {
-          return `<span style="color:#00d4ff">${match}</span>`;
-        }
-        return `<span style="color:#00ff88">${match}</span>`;
-      }
-      if (/true|false/.test(match)) {
-        return `<span style="color:#a855f7">${match}</span>`;
-      }
-      if (/null/.test(match)) {
-        return `<span style="color:#ff4466">${match}</span>`;
-      }
-      return `<span style="color:#ffb347">${match}</span>`;
-    });
-}
+import { el, escapeHtml, syntaxHighlight } from './src/utils/dom.js';
 
 // ============================================================================
 // Reactive Store
@@ -425,6 +342,40 @@ window.wsManager = {
 
 // ============================================================================
 // HTTP API
+// ── VRAM bar ──────────────────────────────────────────────────────────────────
+function updateVramBar(health) {
+  const section   = document.getElementById('vram-section');
+  const barModel  = document.getElementById('vram-bar-model');
+  const label     = document.getElementById('vram-label');
+  const chipModel = document.getElementById('vram-model-chip');
+  const chipFree  = document.getElementById('vram-free-chip');
+  if (!section) return;
+
+  const modelGb = health.model_vram_gb || 0;
+  const totalGb = health.vram_total_gb || 0;
+  const freeGb  = health.vram_free_gb  || 0;
+  const usedGb  = totalGb - freeGb;
+
+  if (modelGb === 0 && totalGb === 0) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+
+  // Barra mostra pesos do modelo como % do total
+  const pct = totalGb > 0 ? Math.min(100, (modelGb / totalGb) * 100) : 0;
+  barModel.style.width = pct.toFixed(1) + '%';
+
+  // Cor da barra: verde < 70%, amarelo < 90%, vermelho >= 90%
+  const usedPct = totalGb > 0 ? (usedGb / totalGb) * 100 : 0;
+  if (usedPct >= 90)      barModel.style.background = 'linear-gradient(90deg,#dc2626,#ef4444)';
+  else if (usedPct >= 70) barModel.style.background = 'linear-gradient(90deg,#d97706,#f59e0b)';
+  else                    barModel.style.background = 'linear-gradient(90deg,#7c3aed,#a855f7)';
+
+  label.textContent = totalGb > 0
+    ? `${usedGb.toFixed(1)} / ${totalGb.toFixed(1)} GB`
+    : `${modelGb.toFixed(2)} GB`;
+  chipModel.textContent = `pesos: ${modelGb.toFixed(2)} GB`;
+  chipFree.textContent  = freeGb > 0 ? `livre: ${freeGb.toFixed(1)} GB` : 'livre: —';
+}
+
 // ============================================================================
 window.api = {
   async health() {
@@ -440,6 +391,7 @@ window.api = {
       }
       updateModelLoadingBanner();
       updateModelUI();
+      updateVramBar(data);
       addLog('http', data, `Health: ${data.status} — model: ${data.model}`);
       return data;
     } catch (e) {

@@ -17,7 +17,7 @@
   --border-active: rgba(0, 255, 200, 0.3);
 
   /* Neon palette */
-  --neon-cyan:   #00ffc8;
+  --neon-cyan:   #2dd4bf;
   --neon-blue:   #0088ff;
   --neon-purple: #a855f7;
   --neon-orange: #ff8c00;
@@ -60,7 +60,12 @@
 html,
 body {
   height: 100%;
-  background: var(--bg-primary);
+  background-image: var(--bg-black-hole);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  background-color: var(--bg-primary); /* Fallback and black overlay */
+  background-blend-mode: multiply; /* Blends the image with the background-color */
   color: var(--text-primary);
   font-family: var(--font-ui);
   overflow: hidden;
@@ -152,7 +157,7 @@ textarea {
   color: var(--bg-primary);
   background: var(--neon-cyan);
   border-color: var(--neon-cyan);
-  box-shadow: 0 0 12px rgba(0, 255, 200, 0.5), 0 0 24px rgba(0, 255, 200, 0.2);
+  box-shadow: 0 0 12px var(--neon-cyan), 0 0 24px var(--neon-cyan);
   font-weight: 600;
 }
 
@@ -330,9 +335,9 @@ textarea {
 }
 
 .glass-panel--active {
-  border-color: var(--border-active);
+  border-color: var(--neon-cyan);
   box-shadow:
-    0 0 20px rgba(0, 255, 200, 0.15),
+    0 0 20px var(--neon-cyan),
     0 4px 24px rgba(0, 0, 0, 0.4),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
@@ -594,7 +599,7 @@ textarea {
   align-items: center;
   gap: 6px;
   padding: 8px 18px;
-  background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-blue) 100%);
+  background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-purple) 100%);
   border: none;
   border-radius: 8px;
   color: #000;
@@ -610,7 +615,7 @@ textarea {
 .send-btn:hover {
   opacity: 0.9;
   transform: translateY(-1px);
-  box-shadow: 0 4px 16px rgba(0, 136, 255, 0.4), 0 0 24px rgba(0, 255, 200, 0.2);
+  box-shadow: 0 4px 16px var(--neon-cyan), 0 0 24px var(--neon-cyan);
 }
 
 .send-btn:active {
@@ -1851,4 +1856,9 @@ textarea:focus-visible,
   background: rgba(168,85,247,0.1);
   border-color: rgba(168,85,247,0.25);
   color: var(--neon-purple);
+}
+68,85,247,0.25);
+  color: var(--neon-purple);
+}
+neon-purple);
 }

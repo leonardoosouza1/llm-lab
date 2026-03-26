@@ -21,8 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::debug::brain::BrainTrace;
 use crate::model::{QwenModel, ModelCfg};
-use crate::qwen::forward_traced;
-use crate::qwen::sampling::SamplingParams;
+use hip_ffi;
+use crate::inference::forward_traced;
+use crate::inference::SamplingParams;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App State
@@ -101,6 +102,12 @@ pub struct HealthResponse {
     pub version: String,
     pub timestamp: String,
     pub model_loading: bool,
+    /// Pesos do modelo carregados em VRAM (GB, F32). 0.0 se nenhum modelo ativo.
+    pub model_vram_gb: f64,
+    /// VRAM disponível no momento da consulta (GB). None se HIP indisponível.
+    pub vram_free_gb: Option<f64>,
+    /// VRAM total da GPU (GB). None se HIP indisponível.
+    pub vram_total_gb: Option<f64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,15 +121,21 @@ pub async fn health_handler(
     let loading = state.model_loading.load(std::sync::atomic::Ordering::Relaxed);
     let status  = if ready { "ok" } else if loading { "loading" } else { "idle" };
 
-    // Read current model name from model dir
-    let model_name = {
+    let (model_name, model_vram_gb) = {
         let guard = state.qwen_model.lock().await;
-        if guard.is_some() {
-            guard.as_ref().map(|m| format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size))
-                .unwrap_or_else(|| "unknown".to_string())
-        } else {
-            "none".to_string()
+        match guard.as_ref() {
+            Some(m) => (
+                format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size),
+                m.vram_bytes as f64 / 1e9,
+            ),
+            None => ("none".to_string(), 0.0),
         }
+    };
+
+    // VRAM livre/total via HIP (falha silenciosa — GPU pode estar ocupada)
+    let (vram_free_gb, vram_total_gb) = match hip_ffi::hip_mem_info() {
+        Ok((free, total)) => (Some(free as f64 / 1e9), Some(total as f64 / 1e9)),
+        Err(_) => (None, None),
     };
 
     Json(HealthResponse {
@@ -131,6 +144,9 @@ pub async fn health_handler(
         version: "2.0.0".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         model_loading: loading,
+        model_vram_gb,
+        vram_free_gb,
+        vram_total_gb,
     })
 }
 

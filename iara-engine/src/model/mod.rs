@@ -158,6 +158,9 @@ pub struct QwenModel {
     pub norm_w: Vec<f32>,       // [hidden]
     pub lm_head: GpuTensor,     // [vocab, hidden]
     pub cfg: ModelCfg,
+    /// Bytes totais ocupados em VRAM pelos GpuTensors (pesos F32).
+    /// Calculado uma vez no load(). Não inclui KV-cache (host) nem ativações.
+    pub vram_bytes: usize,
 }
 
 impl QwenModel {
@@ -233,8 +236,19 @@ impl QwenModel {
         let (norm_w, _) = load("model.norm.weight")?;
         let lm_head = gpu("lm_head.weight")?;
 
-        log::info!("✅ Qwen carregado em VRAM (HIP nativo)");
-        Ok(Self { embed, layers, norm_w, lm_head, cfg })
+        // Calcula total de bytes em VRAM (todos os GpuTensors, F32 = 4 bytes/elemento)
+        let tensor_bytes = |t: &GpuTensor| -> usize {
+            t.shape.iter().product::<usize>() * 4
+        };
+        let mut vram_bytes = tensor_bytes(&embed) + tensor_bytes(&lm_head);
+        for l in &layers {
+            vram_bytes += tensor_bytes(&l.wq) + tensor_bytes(&l.wk) + tensor_bytes(&l.wv)
+                        + tensor_bytes(&l.wo) + tensor_bytes(&l.wgate)
+                        + tensor_bytes(&l.wup) + tensor_bytes(&l.wdown);
+        }
+
+        log::info!("✅ Qwen carregado — pesos em VRAM: {:.2} GB", vram_bytes as f64 / 1e9);
+        Ok(Self { embed, layers, norm_w, lm_head, cfg, vram_bytes })
     }
 
     pub fn reset_cache(&mut self) {
