@@ -124,6 +124,34 @@
     >
       <div class="panel-grid-live">
 
+        <!-- Model Loader -->
+        <div class="glass-panel model-loader-box" id="model-loader-box" aria-label="Model selection">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🤖</span>
+              Model
+            </h2>
+            <span id="model-status-badge" class="model-status-badge model-status--idle">idle</span>
+          </div>
+          <div class="model-loader-body">
+            <div class="model-loader-row">
+              <select id="model-select" class="control-select model-select" aria-label="Select model">
+                <option value="" disabled selected>— selecione um modelo —</option>
+              </select>
+              <button id="load-model-btn" class="load-model-btn" type="button" aria-label="Load selected model">
+                Carregar
+              </button>
+            </div>
+            <div id="model-info-row" class="model-info-row" style="display:none">
+              <!-- populated by JS when a model is selected -->
+            </div>
+            <div id="model-load-progress" class="model-load-progress" style="display:none">
+              <span style="display:inline-block;width:12px;height:12px;border:2px solid #a855f7;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></span>
+              <span id="model-load-msg">Carregando...</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Prompt Input Box -->
         <div class="glass-panel prompt-box" id="prompt-box" aria-label="Prompt input">
           <div class="panel-header">
@@ -136,26 +164,13 @@
             <textarea
               id="prompt-input"
               class="prompt-textarea"
-              placeholder="Enter your prompt…"
-              rows="6"
+              placeholder="Selecione e carregue um modelo para começar…"
+              rows="5"
               aria-label="User prompt text"
               spellcheck="false"
+              disabled
             ></textarea>
             <div class="prompt-controls">
-              <div class="prompt-select-group">
-                <label for="model-select" class="control-label">Model</label>
-                <select
-                  id="model-select"
-                  class="control-select"
-                  aria-label="Select model"
-                >
-                  <option value="qwen3-8b" selected>qwen3-8b</option>
-                  <option value="qwen3-4b">qwen3-4b</option>
-                  <option value="qwen3-14b">qwen3-14b</option>
-                  <option value="llama3-8b">llama3-8b</option>
-                  <option value="mistral-7b">mistral-7b</option>
-                </select>
-              </div>
               <div class="prompt-select-group">
                 <label for="max-tokens-input" class="control-label">Max Tokens</label>
                 <input
@@ -174,6 +189,7 @@
                 class="send-btn"
                 type="button"
                 aria-label="Generate response"
+                disabled
               >
                 <span aria-hidden="true">▶</span>
                 Generate

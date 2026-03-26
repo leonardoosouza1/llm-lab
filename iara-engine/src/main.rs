@@ -26,9 +26,10 @@ mod api;
 mod debug;
 mod qwen;
 
-use crate::api::handlers::{AppState, generate_handler, health_handler, debug_trace_handler};
+use crate::api::handlers::{AppState, generate_handler, health_handler, debug_trace_handler,
+                            models_handler, load_model_handler};
 use crate::hardware::HardwareManager;
-use crate::model::{QwenModel, ModelCfg};
+use crate::model::QwenModel;
 use crate::websocket::{start_ws_server, EngineCommand};
 use crate::qwen::forward_traced;
 use std::path::PathBuf;
@@ -46,30 +47,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hw = HardwareManager::new()?;
     log::info!("Hardware: {}", hw.gpu_name);
 
-    // 2. Model path
-    let model_dir = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/qwen3-8b")
+    // 2. Models directory (default: workspace_root/models)
+    let models_dir = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models")
     });
-    log::info!("Modelo: {:?}", model_dir.canonicalize().unwrap_or(model_dir.clone()));
 
-    if !model_dir.join("config.json").exists() {
-        return Err(format!("config.json nao encontrado em {:?}", model_dir).into());
+    if !models_dir.exists() {
+        log::warn!("⚠️  models_dir não existe: {:?}", models_dir);
+    } else {
+        log::info!("📂 models_dir: {:?}", models_dir.canonicalize().unwrap_or(models_dir.clone()));
     }
 
-    // 3. Load tokenizer (fast, synchronous)
-    tokenizer::load_tokenizer(&model_dir)?;
-    log::info!("Tokenizer carregado");
+    // 3. Shared state — no model loaded at startup
+    let qwen_model:    Arc<Mutex<Option<QwenModel>>> = Arc::new(Mutex::new(None));
+    let model_ready    = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let model_loading  = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let last_trace     = Arc::new(Mutex::new(None));
 
-    // 4. Shared state — model starts as None, loads in background
-    let qwen_model: Arc<Mutex<Option<QwenModel>>> = Arc::new(Mutex::new(None));
-    let model_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let last_trace = Arc::new(Mutex::new(None));
-
-    // 5. WS channels
+    // 4. WS channels
     let (frame_tx, _) = broadcast::channel::<String>(512);
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(64);
 
-    // 6. Start WebSocket server (port 8080)
+    // 5. Start WebSocket server (port 8080)
     let ws_addr: std::net::SocketAddr = "127.0.0.1:8080".parse()?;
     let frame_tx_ws = frame_tx.clone();
     tokio::spawn(async move {
@@ -77,16 +76,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     log::info!("WebSocket em ws://127.0.0.1:8080");
 
-    // 7. Engine command processor (bridges WS commands -> model)
-    let engine_model = qwen_model.clone();
+    // 6. Engine command processor (bridges WS commands -> model)
+    let engine_model    = qwen_model.clone();
     let engine_frame_tx = frame_tx.clone();
     tokio::spawn(run_engine_loop(engine_model, cmd_rx, engine_frame_tx));
 
-    // 8. Axum HTTP server (port 3000) — starts BEFORE model loads
+    // 7. Axum HTTP server (port 3000) — starts immediately, no model loaded yet
     let app_state = AppState {
-        qwen_model: qwen_model.clone(),
-        last_trace: last_trace.clone(),
-        model_ready: model_ready.clone(),
+        qwen_model:    qwen_model.clone(),
+        last_trace:    last_trace.clone(),
+        model_ready:   model_ready.clone(),
+        model_loading: model_loading.clone(),
+        models_dir:    Arc::new(models_dir),
+        frame_tx:      frame_tx.clone(),
     };
 
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
@@ -96,52 +98,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/api/generate", post(generate_handler))
-        .route("/api/debug/last-trace", get(debug_trace_handler))
+        .route("/health",                 get(health_handler))
+        .route("/api/models",             get(models_handler))
+        .route("/api/load-model",         post(load_model_handler))
+        .route("/api/generate",           post(generate_handler))
+        .route("/api/debug/last-trace",   get(debug_trace_handler))
         .fallback_service(ServeDir::new(&frontend_dir))
         .layer(cors)
         .with_state(app_state);
 
     let http_addr: std::net::SocketAddr = "0.0.0.0:3000".parse()?;
-    log::info!("HTTP em http://localhost:3000 (frontend disponível imediatamente)");
-
-    // 9. Load model in background — server is already running
-    let model_arc_bg = qwen_model.clone();
-    let model_ready_bg = model_ready.clone();
-    let frame_tx_bg = frame_tx.clone();
-    let model_dir_bg = model_dir.clone();
-    tokio::spawn(async move {
-        log::info!("⏳ Carregando Qwen3-8B em background (pode demorar 30-120s dependendo do disco)...");
-
-        // Progress ticker: log elapsed time every 5s while loading
-        let model_ready_tick = model_ready_bg.clone();
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if model_ready_tick.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                log::info!("⏳ Carregando modelo... {}s decorridos", start.elapsed().as_secs());
-            }
-        });
-
-        match QwenModel::load(&model_dir_bg, ModelCfg::qwen_8b()) {
-            Ok(model) => {
-                *model_arc_bg.lock().await = Some(model);
-                model_ready_bg.store(true, std::sync::atomic::Ordering::Relaxed);
-                log::info!("✅ Modelo Qwen3-8B carregado e pronto!");
-                let _ = frame_tx_bg.send(r#"{"type":"status","message":"✅ Modelo Qwen3-8B carregado e pronto!"}"#.to_string());
-            }
-            Err(e) => {
-                log::error!("❌ Falha ao carregar modelo: {}", e);
-                let msg = serde_json::json!({
-                    "type": "status",
-                    "message": format!("ERRO ao carregar modelo: {}", e)
-                }).to_string();
-                let _ = frame_tx_bg.send(msg);
-            }
-        }
-    });
+    log::info!("🌐 HTTP em http://localhost:3000");
+    log::info!("📦 Nenhum modelo carregado. Selecione um no painel do frontend.");
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
     axum::serve(listener, app).await?;
@@ -167,24 +135,20 @@ async fn run_engine_loop(
                 {
                     let guard = model.lock().await;
                     if guard.is_none() {
-                        let _ = frame_tx.send(r#"{"type":"status","message":"Modelo ainda carregando, aguarde..."}"#.to_string());
+                        let _ = frame_tx.send(r#"{"type":"status","message":"Nenhum modelo carregado. Selecione um no painel."}"#.to_string());
                         continue;
                     }
                 }
 
-                // Broadcast loading status
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
                     "message": format!("Processando: '{}'", &text[..text.len().min(30)])
                 }).to_string());
 
-                // Tokenize
                 let tokens = crate::tokenizer::tokenize(&text);
                 let mut current_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
 
-                if current_ids.is_empty() {
-                    continue;
-                }
+                if current_ids.is_empty() { continue; }
 
                 let mut generated_text = String::new();
 
@@ -197,14 +161,10 @@ async fn run_engine_loop(
                         };
                         match forward_traced(m, &current_ids) {
                             Ok(s) => s,
-                            Err(e) => {
-                                log::error!("Forward error: {}", e);
-                                break;
-                            }
+                            Err(e) => { log::error!("Forward error: {}", e); break; }
                         }
                     };
 
-                    // Broadcast per-layer telemetry
                     for trace in &gen_step.layer_traces {
                         let msg = serde_json::json!({
                             "type": "pipeline_layer",
@@ -222,7 +182,6 @@ async fn run_engine_loop(
                         let _ = frame_tx.send(msg.to_string());
                     }
 
-                    // Top-40 tokens for result
                     let top_tokens: Vec<_> = gen_step.top_logits.iter().take(40).map(|(id, score)| {
                         serde_json::json!({
                             "token_id": id,
@@ -233,7 +192,6 @@ async fn run_engine_loop(
 
                     generated_text.push_str(&gen_step.token_str);
 
-                    // Broadcast pipeline_result for this step
                     let result = serde_json::json!({
                         "type": "pipeline_result",
                         "step": step,
@@ -249,22 +207,22 @@ async fn run_engine_loop(
 
                     let next = gen_step.token_id;
                     current_ids.push(next);
-
-                    if next == EOS || next == 151643 {
-                        break;
-                    }
+                    if next == EOS || next == 151643 { break; }
                 }
 
-                // Final done message
-                let done = serde_json::json!({
+                let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
-                    "message": format!("Geracao completa: {} tokens", generated_text.split_whitespace().count())
-                });
-                let _ = frame_tx.send(done.to_string());
+                    "message": format!("Geração completa: {} tokens", generated_text.split_whitespace().count())
+                }).to_string());
             }
 
             EngineCommand::ListLayers => {
-                let names: Vec<String> = (0..36).flat_map(|i: usize| {
+                // Model may not be loaded; return empty if so
+                let guard = model.lock().await;
+                let num_layers = guard.as_ref().map(|m| m.cfg.num_layers).unwrap_or(0);
+                drop(guard);
+
+                let names: Vec<String> = (0..num_layers).flat_map(|i: usize| {
                     vec![
                         format!("layers.{}.attention.wq", i),
                         format!("layers.{}.attention.wk", i),
@@ -275,10 +233,7 @@ async fn run_engine_loop(
                         format!("layers.{}.mlp.w_down", i),
                     ]
                 }).collect();
-                let _ = frame_tx.send(serde_json::json!({
-                    "type": "layers",
-                    "names": names
-                }).to_string());
+                let _ = frame_tx.send(serde_json::json!({ "type": "layers", "names": names }).to_string());
             }
 
             EngineCommand::SelectLayer(name) => {

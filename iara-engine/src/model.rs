@@ -45,18 +45,38 @@ pub struct ModelCfg {
 }
 
 impl ModelCfg {
-    /// Lê os parâmetros diretamente do config.json do modelo
+    /// Lê os parâmetros diretamente do config.json do modelo.
+    /// Aceita valores inteiros ou float (serde_json trata ambos como Number).
     pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(config_path)?;
         let v: serde_json::Value = serde_json::from_str(&content)?;
+
+        // Helper: extrai usize de inteiro ou float JSON
+        let uint = |key: &str| -> Result<usize, Box<dyn std::error::Error>> {
+            let val = &v[key];
+            val.as_u64()
+                .or_else(|| val.as_f64().map(|f| f as u64))
+                .map(|n| n as usize)
+                .ok_or_else(|| format!("campo '{}' ausente ou inválido em config.json (valor: {})", key, val).into())
+        };
+
+        let hidden_size = uint("hidden_size")?;
+        let num_heads   = uint("num_attention_heads")?;
+
+        // head_dim pode não existir em configs antigos → calcula como hidden/heads
+        let head_dim = v["head_dim"].as_u64()
+            .or_else(|| v["head_dim"].as_f64().map(|f| f as u64))
+            .map(|n| n as usize)
+            .unwrap_or(hidden_size / num_heads);
+
         Ok(Self {
-            hidden_size:       v["hidden_size"].as_u64().ok_or("hidden_size")? as usize,
-            num_layers:        v["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize,
-            intermediate_size: v["intermediate_size"].as_u64().ok_or("intermediate_size")? as usize,
-            vocab_size:        v["vocab_size"].as_u64().ok_or("vocab_size")? as usize,
-            num_heads:         v["num_attention_heads"].as_u64().ok_or("num_attention_heads")? as usize,
-            num_kv_heads:      v["num_key_value_heads"].as_u64().ok_or("num_key_value_heads")? as usize,
-            head_dim:          v["head_dim"].as_u64().ok_or("head_dim")? as usize,
+            hidden_size,
+            num_heads,
+            head_dim,
+            num_layers:        uint("num_hidden_layers")?,
+            intermediate_size: uint("intermediate_size")?,
+            vocab_size:        uint("vocab_size")?,
+            num_kv_heads:      uint("num_key_value_heads")?,
             rms_eps:           v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
         })
     }

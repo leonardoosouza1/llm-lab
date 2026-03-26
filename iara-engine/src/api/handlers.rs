@@ -1,9 +1,11 @@
 // ============================================================================
 // api/handlers.rs — HTTP Handlers for IARA API
 // ============================================================================
-// POST /api/generate — generation endpoint (non-streaming)
-// GET /api/debug/last-trace — retrieve last brain trace
-// GET /health — health check
+// GET  /api/models            — lista modelos disponíveis em models_dir
+// POST /api/load-model        — carrega um modelo selecionado
+// POST /api/generate          — geração (não-streaming)
+// GET  /api/debug/last-trace  — último brain trace
+// GET  /health                — health check
 // ============================================================================
 
 use axum::{
@@ -13,15 +15,30 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::debug::brain::BrainTrace;
-use crate::model::QwenModel;
+use crate::model::{QwenModel, ModelCfg};
 use crate::qwen::forward_traced;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Request/Response Types
+// App State
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct AppState {
+    pub qwen_model:    Arc<Mutex<Option<QwenModel>>>,
+    pub last_trace:    Arc<Mutex<Option<BrainTrace>>>,
+    pub model_ready:   Arc<std::sync::atomic::AtomicBool>,
+    pub model_loading: Arc<std::sync::atomic::AtomicBool>,
+    pub models_dir:    Arc<PathBuf>,
+    pub frame_tx:      tokio::sync::broadcast::Sender<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request / Response types
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -52,24 +69,33 @@ pub struct GenerateResponse {
     pub eval_duration: u128,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LoadModelRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    pub name: String,
+    pub path: String,
+    pub hidden_size: Option<u64>,
+    pub num_layers: Option<u64>,
+    pub vocab_size: Option<u64>,
+    pub num_heads: Option<u64>,
+    pub num_kv_heads: Option<u64>,
+    pub head_dim: Option<u64>,
+    pub intermediate_size: Option<u64>,
+    pub architecture: Option<String>,
+    pub torch_dtype: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub model: String,
     pub version: String,
     pub timestamp: String,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// App State
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct AppState {
-    /// None enquanto o modelo ainda está carregando
-    pub qwen_model: Arc<Mutex<Option<QwenModel>>>,
-    pub last_trace: Arc<Mutex<Option<BrainTrace>>>,
-    pub model_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub model_loading: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,20 +105,216 @@ pub struct AppState {
 pub async fn health_handler(
     State(state): State<AppState>,
 ) -> Json<HealthResponse> {
-    let ready = state.model_ready.load(std::sync::atomic::Ordering::Relaxed);
+    let ready   = state.model_ready.load(std::sync::atomic::Ordering::Relaxed);
+    let loading = state.model_loading.load(std::sync::atomic::Ordering::Relaxed);
+    let status  = if ready { "ok" } else if loading { "loading" } else { "idle" };
+
+    // Read current model name from model dir
+    let model_name = {
+        let guard = state.qwen_model.lock().await;
+        if guard.is_some() {
+            guard.as_ref().map(|m| format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size))
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "none".to_string()
+        }
+    };
+
     Json(HealthResponse {
-        status: if ready { "ok".to_string() } else { "loading".to_string() },
-        model: "qwen3-8b".to_string(),
-        version: "1.0.0".to_string(),
+        status: status.to_string(),
+        model: model_name,
+        version: "2.0.0".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
+        model_loading: loading,
     })
+}
+
+/// GET /api/models — scan models_dir and return info for each
+pub async fn models_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let models_dir = state.models_dir.as_ref();
+    let mut models: Vec<ModelInfo> = Vec::new();
+
+    let entries = match std::fs::read_dir(models_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Não foi possível ler models_dir: {}", e) })),
+            ).into_response();
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+
+        let config_path = path.join("config.json");
+        if !config_path.exists() { continue; }
+
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let info = match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+                ModelInfo {
+                    name: name.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    hidden_size:       v["hidden_size"].as_u64(),
+                    num_layers:        v["num_hidden_layers"].as_u64(),
+                    vocab_size:        v["vocab_size"].as_u64(),
+                    num_heads:         v["num_attention_heads"].as_u64(),
+                    num_kv_heads:      v["num_key_value_heads"].as_u64(),
+                    head_dim:          v["head_dim"].as_u64(),
+                    intermediate_size: v["intermediate_size"].as_u64(),
+                    architecture:      v["architectures"].as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                    torch_dtype:       v["torch_dtype"].as_str().map(|s| s.to_string()),
+                }
+            }
+            Err(_) => ModelInfo {
+                name: name.clone(),
+                path: path.to_string_lossy().to_string(),
+                hidden_size: None, num_layers: None, vocab_size: None,
+                num_heads: None, num_kv_heads: None, head_dim: None,
+                intermediate_size: None, architecture: None, torch_dtype: None,
+            },
+        };
+        models.push(info);
+    }
+
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    (StatusCode::OK, Json(serde_json::json!({ "models": models }))).into_response()
+}
+
+/// POST /api/load-model — carrega o modelo selecionado em background
+pub async fn load_model_handler(
+    State(state): State<AppState>,
+    Json(req): Json<LoadModelRequest>,
+) -> impl IntoResponse {
+    // Prevent double-loading
+    if state.model_loading.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "Já existe um modelo sendo carregado" })),
+        ).into_response();
+    }
+
+    let model_path = state.models_dir.join(&req.name);
+    if !model_path.join("config.json").exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado", req.name) })),
+        ).into_response();
+    }
+
+    // Mark as loading
+    state.model_loading.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.model_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Unload current model immediately
+    *state.qwen_model.lock().await = None;
+
+    // Broadcast loading started
+    let _ = state.frame_tx.send(serde_json::json!({
+        "type": "status",
+        "message": format!("Carregando modelo '{}'...", req.name)
+    }).to_string());
+
+    // Spawn background load
+    let model_arc    = state.qwen_model.clone();
+    let model_ready  = state.model_ready.clone();
+    let model_loading = state.model_loading.clone();
+    let frame_tx     = state.frame_tx.clone();
+    let model_name   = req.name.clone();
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        // Progress ticker
+        let loading_tick = model_loading.clone();
+        let tx_tick = frame_tx.clone();
+        let name_tick = model_name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !loading_tick.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let elapsed = start.elapsed().as_secs();
+                log::info!("⏳ Carregando '{}'... {}s", name_tick, elapsed);
+                let _ = tx_tick.send(serde_json::json!({
+                    "type": "status",
+                    "message": format!("Carregando '{}'... {}s decorridos", name_tick, elapsed)
+                }).to_string());
+            }
+        });
+
+        // Load tokenizer
+        log::info!("🔤 Carregando tokenizer de '{}'...", model_name);
+        if let Err(e) = crate::tokenizer::load_tokenizer(&model_path) {
+            log::error!("❌ Falha no tokenizer: {}", e);
+            let _ = frame_tx.send(serde_json::json!({
+                "type": "status",
+                "message": format!("ERRO tokenizer '{}': {}", model_name, e)
+            }).to_string());
+            model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+
+        // Load model weights
+        log::info!("⏳ Carregando pesos de '{}'...", model_name);
+        let cfg = match ModelCfg::from_config_json(&model_path.join("config.json")) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("❌ Falha ao ler config.json: {}", e);
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "status",
+                    "message": format!("ERRO config '{}': {}", model_name, e)
+                }).to_string());
+                model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        match QwenModel::load(&model_path, cfg) {
+            Ok(model) => {
+                *model_arc.lock().await = Some(model);
+                model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                log::info!("✅ Modelo '{}' carregado em {:.1}s", model_name, start.elapsed().as_secs_f32());
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "model_loaded",
+                    "name": model_name,
+                    "message": format!("✅ '{}' pronto! ({:.1}s)", model_name, start.elapsed().as_secs_f32())
+                }).to_string());
+            }
+            Err(e) => {
+                log::error!("❌ Falha ao carregar '{}': {}", model_name, e);
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "status",
+                    "message": format!("ERRO ao carregar '{}': {}", model_name, e)
+                }).to_string());
+                model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "status": "loading",
+        "model": req.name
+    }))).into_response()
 }
 
 pub async fn generate_handler(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> impl IntoResponse {
-    log::info!("📝 Generate request: prompt={}, stream={}",
+    log::info!("📝 Generate: prompt={}, stream={}",
         &req.prompt[..req.prompt.len().min(50)],
         req.stream);
 
@@ -100,17 +322,12 @@ pub async fn generate_handler(
 
     match generate_internal(&state, &req).await {
         Ok(response) => {
-            let duration = start.elapsed();
-            log::info!("✅ Generation complete: {:.2}ms", duration.as_secs_f32() * 1000.0);
+            log::info!("✅ Geração: {:.2}ms", start.elapsed().as_secs_f32() * 1000.0);
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
-            log::error!("❌ Generation error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            log::error!("❌ Erro na geração: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
         }
     }
 }
@@ -119,24 +336,14 @@ pub async fn debug_trace_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let trace = state.last_trace.lock().await.clone();
-
     match trace {
-        Some(t) => {
-            let analysis = t.analyze();
-            (StatusCode::OK, Json(analysis)).into_response()
-        }
-        None => {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "No trace available yet" })),
-            )
-                .into_response()
-        }
+        Some(t) => (StatusCode::OK, Json(t.analyze())).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "No trace available yet" }))).into_response(),
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal Implementation
+// Internal
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn generate_internal(
@@ -145,29 +352,26 @@ async fn generate_internal(
 ) -> Result<GenerateResponse, Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
 
-    // Check model is ready
     if !state.model_ready.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("Modelo ainda carregando, aguarde...".into());
+        if state.model_loading.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Modelo ainda carregando, aguarde...".into());
+        }
+        return Err("Nenhum modelo carregado. Selecione um modelo no painel.".into());
     }
 
-    // 1. Tokenize input
     let tokens = crate::tokenizer::tokenize(&req.prompt);
     let token_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
     let prompt_eval_count = token_ids.len() as u32;
-    let mut current_tokens = token_ids.clone();
+    let mut current_tokens = token_ids;
     let mut generated_text = String::new();
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
 
-    // Qwen3-8B EOS token id = 151645
     const EOS_TOKEN: u32 = 151645;
 
-    // 2. Generation loop
     for _ in 0..req.max_tokens {
-        if current_tokens.is_empty() {
-            break;
-        }
+        if current_tokens.is_empty() { break; }
 
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
@@ -179,21 +383,16 @@ async fn generate_internal(
         let next_token = gen_step.token_id;
         generated_text.push_str(&gen_step.token_str);
         brain_trace.add_step(gen_step);
-
         current_tokens.push(next_token);
         eval_count += 1;
 
-        if next_token == EOS_TOKEN {
-            break;
-        }
+        if next_token == EOS_TOKEN { break; }
     }
 
-    // 3. Save trace
     brain_trace.finalize();
     *state.last_trace.lock().await = Some(brain_trace);
 
     let total_duration = start_time.elapsed();
-
     Ok(GenerateResponse {
         model: req.model.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -207,10 +406,6 @@ async fn generate_internal(
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Default Values
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn default_temperature() -> f32 { 0.7 }
-fn default_top_k() -> u32 { 40 }
+fn default_temperature() -> f32  { 0.7 }
+fn default_top_k() -> u32        { 40 }
 fn default_max_tokens() -> usize { 100 }

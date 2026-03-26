@@ -100,9 +100,12 @@ window.store = (function () {
     // Connection
     wsStatus: 'disconnected',
     httpHealthy: false,
-    modelName: 'qwen3-8b',
+    modelName: 'none',
     modelReady: false,
+    modelLoading: false,
     loadingMsg: 'Aguardando servidor...',
+    availableModels: [],     // [{name, hidden_size, num_layers, ...}]
+    selectedModelName: '',   // currently selected in dropdown (not yet loaded)
 
     // UI
     activeTab: 'live',
@@ -372,13 +375,33 @@ window.wsManager = {
         {
           const message = msg.message || '';
           store.loadingMsg = message;
-          // Detect when model is ready via WS status message
-          if (message.toLowerCase().includes('carregado') || message.toLowerCase().includes('pronto')) {
+          const msgLow = message.toLowerCase();
+          if (msgLow.includes('carregad') || msgLow.includes('pronto')) {
             store.modelReady = true;
-            updateModelLoadingBanner();
+            store.modelLoading = false;
+          } else if (msgLow.includes('carregando') || msgLow.includes('loading')) {
+            store.modelLoading = true;
           }
-          addLog('ws-in', msg, `Status: ${message}`);
           updateModelLoadingBanner();
+          updateModelUI();
+          addLog('ws-in', msg, `Status: ${message}`);
+        }
+        break;
+
+      case 'model_loaded':
+        {
+          store.modelReady = true;
+          store.modelLoading = false;
+          store.modelName = msg.name || store.selectedModelName;
+          store.loadingMsg = msg.message || `✅ ${store.modelName} pronto!`;
+          updateModelUI();
+          updateModelLoadingBanner();
+          // Enable prompt input
+          const promptEl = el('prompt-input');
+          const sendEl = el('send-btn');
+          if (promptEl) { promptEl.disabled = false; promptEl.placeholder = 'Digite seu prompt...'; }
+          if (sendEl) sendEl.disabled = false;
+          addLog('ws-in', msg, `Model loaded: ${msg.name}`);
         }
         break;
 
@@ -399,12 +422,13 @@ window.api = {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       store.httpHealthy = true;
-      store.modelName = data.model || store.modelName;
       store.modelReady = data.status === 'ok';
-      if (!store.modelReady) {
-        store.loadingMsg = 'Carregando modelo ' + (data.model || '') + '...';
+      store.modelLoading = data.model_loading || false;
+      if (data.status === 'loading') {
+        store.loadingMsg = 'Carregando modelo...';
       }
       updateModelLoadingBanner();
+      updateModelUI();
       addLog('http', data, `Health: ${data.status} — model: ${data.model}`);
       return data;
     } catch (e) {
@@ -474,6 +498,46 @@ window.api = {
       return data;
     } catch (e) {
       addLog('error', { error: e.message }, `Fetch trace failed: ${e.message}`);
+      return null;
+    }
+  },
+
+  async fetchModels() {
+    try {
+      const res = await fetch('http://localhost:3000/api/models');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      store.availableModels = data.models || [];
+      populateModelSelect();
+      addLog('http', data, `Models: ${store.availableModels.map(m => m.name).join(', ')}`);
+      return data.models;
+    } catch (e) {
+      addLog('error', { error: e.message }, `fetchModels failed: ${e.message}`);
+      return null;
+    }
+  },
+
+  async loadModel(name) {
+    if (!name) return;
+    try {
+      store.modelLoading = true;
+      store.modelReady = false;
+      store.loadingMsg = `Carregando '${name}'...`;
+      updateModelUI();
+      const res = await fetch('http://localhost:3000/api/load-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      addLog('http', data, `load-model accepted: ${name}`);
+      return data;
+    } catch (e) {
+      store.modelLoading = false;
+      store.loadingMsg = `Erro: ${e.message}`;
+      updateModelUI();
+      addLog('error', { error: e.message }, `loadModel failed: ${e.message}`);
       return null;
     }
   },
@@ -1658,6 +1722,77 @@ function updatePerfMetrics() {
 // New HTML Bridge — wires new-layout IDs to store/wsManager
 // ============================================================================
 
+// Populate the <select id="model-select"> from store.availableModels
+function populateModelSelect() {
+  const sel = el('model-select');
+  if (!sel) return;
+
+  // Keep current selection if still valid
+  const prev = sel.value;
+  sel.innerHTML = '<option value="" disabled>— selecione um modelo —</option>';
+
+  store.availableModels.forEach(function(m) {
+    const opt = document.createElement('option');
+    opt.value = m.name;
+    const layers = m.num_layers ? `${m.num_layers}L` : '';
+    const hidden = m.hidden_size ? `${m.hidden_size}h` : '';
+    const dtype  = m.torch_dtype ? ` (${m.torch_dtype})` : '';
+    opt.textContent = `${m.name}  ${layers} ${hidden}${dtype}`.trim();
+    sel.appendChild(opt);
+  });
+
+  if (prev && store.availableModels.some(m => m.name === prev)) {
+    sel.value = prev;
+  } else {
+    sel.value = '';
+  }
+}
+
+// Update model-related UI elements
+function updateModelUI() {
+  const badge    = el('model-status-badge');
+  const progress = el('model-load-progress');
+  const loadMsg  = el('model-load-msg');
+  const loadBtn  = el('load-model-btn');
+  const infoRow  = el('model-info-row');
+
+  if (store.modelLoading) {
+    if (badge)    { badge.className = 'model-status-badge model-status--loading'; badge.textContent = 'loading'; }
+    if (progress) progress.style.display = 'flex';
+    if (loadMsg)  loadMsg.textContent = store.loadingMsg;
+    if (loadBtn)  loadBtn.disabled = true;
+  } else if (store.modelReady) {
+    if (badge)    { badge.className = 'model-status-badge model-status--ready'; badge.textContent = 'ready'; }
+    if (progress) progress.style.display = 'none';
+    if (loadBtn)  loadBtn.disabled = false;
+    // Enable prompt + send
+    const promptEl = el('prompt-input');
+    const sendEl   = el('send-btn');
+    if (promptEl) { promptEl.disabled = false; promptEl.placeholder = 'Digite seu prompt...'; }
+    if (sendEl)   sendEl.disabled = false;
+    // Show model info chips
+    if (infoRow) {
+      const m = store.availableModels.find(function(x) { return x.name === store.modelName; });
+      if (m) {
+        infoRow.style.display = 'flex';
+        infoRow.innerHTML = [
+          m.num_layers        ? `<span class="model-info-chip"><strong>${m.num_layers}</strong> layers</span>` : '',
+          m.hidden_size       ? `<span class="model-info-chip">hidden <strong>${m.hidden_size}</strong></span>` : '',
+          m.intermediate_size ? `<span class="model-info-chip">ffn <strong>${m.intermediate_size}</strong></span>` : '',
+          m.num_heads         ? `<span class="model-info-chip"><strong>${m.num_heads}</strong> heads</span>` : '',
+          m.num_kv_heads      ? `<span class="model-info-chip"><strong>${m.num_kv_heads}</strong> kv</span>` : '',
+          m.vocab_size        ? `<span class="model-info-chip">vocab <strong>${m.vocab_size}</strong></span>` : '',
+          m.torch_dtype       ? `<span class="model-info-chip">${m.torch_dtype}</span>` : '',
+        ].join('');
+      }
+    }
+  } else {
+    if (badge)    { badge.className = 'model-status-badge model-status--idle'; badge.textContent = 'idle'; }
+    if (progress) progress.style.display = 'none';
+    if (loadBtn)  loadBtn.disabled = false;
+  }
+}
+
 function updateModelLoadingBanner() {
   const banner = el('model-loading-banner');
   if (!banner) return;
@@ -1726,6 +1861,42 @@ function bindNewLayoutEvents() {
       store.layerData = {};
       store.pipelineComplete = false;
       wsManager.resonate(text);
+    });
+  }
+
+  // ── Model loader ─────────────────────────────────────────────────────────
+  const loadModelBtn = el('load-model-btn');
+  const modelSelectEl = el('model-select');
+
+  if (modelSelectEl) {
+    modelSelectEl.addEventListener('change', function() {
+      store.selectedModelName = modelSelectEl.value;
+      // Show info chips for selected (not yet loaded) model
+      const infoRow = el('model-info-row');
+      if (infoRow && !store.modelLoading) {
+        const m = store.availableModels.find(function(x) { return x.name === modelSelectEl.value; });
+        if (m) {
+          infoRow.style.display = 'flex';
+          infoRow.innerHTML = [
+            m.num_layers        ? `<span class="model-info-chip"><strong>${m.num_layers}</strong> layers</span>` : '',
+            m.hidden_size       ? `<span class="model-info-chip">hidden <strong>${m.hidden_size}</strong></span>` : '',
+            m.intermediate_size ? `<span class="model-info-chip">ffn <strong>${m.intermediate_size}</strong></span>` : '',
+            m.num_heads         ? `<span class="model-info-chip"><strong>${m.num_heads}</strong> heads</span>` : '',
+            m.num_kv_heads      ? `<span class="model-info-chip"><strong>${m.num_kv_heads}</strong> kv</span>` : '',
+            m.vocab_size        ? `<span class="model-info-chip">vocab <strong>${m.vocab_size}</strong></span>` : '',
+            m.torch_dtype       ? `<span class="model-info-chip">${m.torch_dtype}</span>` : '',
+          ].join('');
+        }
+      }
+    });
+  }
+
+  if (loadModelBtn) {
+    loadModelBtn.addEventListener('click', function() {
+      const name = modelSelectEl ? modelSelectEl.value : store.selectedModelName;
+      if (!name) { addLog('error', null, 'Selecione um modelo primeiro'); return; }
+      store.selectedModelName = name;
+      api.loadModel(name);
     });
   }
 
@@ -1802,13 +1973,12 @@ document.addEventListener('DOMContentLoaded', function() {
   // Start WebSocket
   wsManager.connect();
 
-  // Health check — poll every 2s while model is loading, then every 10s
+  // Health check + model list
   api.health();
-  setInterval(function() {
-    api.health();
-  }, 2000);
-  // Slow down to 10s once model is ready (avoid spam)
-  // (2s timer keeps running but health() is fast and cheap)
+  api.fetchModels();
+  setInterval(function() { api.health(); }, 2000);
+  // Refresh model list every 30s (catches new models dropped in folder)
+  setInterval(function() { api.fetchModels(); }, 30000);
 
   // Perf metrics refresh
   setInterval(updatePerfMetrics, 2000);
