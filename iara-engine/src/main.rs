@@ -2,36 +2,28 @@
 // main.rs — IARA Server: HTTP (port 3000) + WebSocket (port 8080)
 // ============================================================================
 
-mod actuator;
-mod decoder;
-mod embedding;
-mod generate;
-mod homeostasis;
-mod hardware;
-mod inference;
-mod liquid_brain;
-mod liquid_network;
-mod model;
-mod nlm_orchestrator;
-mod physics;
-mod physics_gpu;
-mod pipeline;
-mod proprioception;
-mod prompt;
-mod safetensors_reader;
-mod simulation;
-mod tokenizer;
-mod websocket;
+// ── Core inference pipeline ───────────────────────────────────────────────────
 mod api;
 mod debug;
-mod qwen;
+mod generation;
+mod hardware;
+mod inference;
+mod model;
+mod storage;
+mod tokenizer;
+mod transport;
+
+// ── Módulos exploratórios (pesquisa, não integrados ao pipeline) ──────────────
+// Compilados apenas em modo experimental para não poluir build de produção.
+#[cfg(feature = "experimental")]
+mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, health_handler, debug_trace_handler,
                             models_handler, load_model_handler};
 use crate::hardware::HardwareManager;
 use crate::model::QwenModel;
-use crate::websocket::{start_ws_server, EngineCommand};
-use crate::qwen::forward_traced;
+use crate::inference::{forward_traced, SamplingParams};
+use crate::transport::{start_ws_server, EngineCommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -151,6 +143,7 @@ async fn run_engine_loop(
                 if current_ids.is_empty() { continue; }
 
                 let mut generated_text = String::new();
+                let sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
 
                 for step in 0..MAX_STEPS {
                     let gen_step = {
@@ -159,7 +152,7 @@ async fn run_engine_loop(
                             Some(m) => m,
                             None => break,
                         };
-                        match forward_traced(m, &current_ids) {
+                        match forward_traced(m, &current_ids, &sampling) {
                             Ok(s) => s,
                             Err(e) => { log::error!("Forward error: {}", e); break; }
                         }

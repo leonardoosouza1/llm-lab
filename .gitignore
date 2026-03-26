@@ -8,3 +8,4 @@ vocab.json
 Cargo.lock
 models/*
 target/*
+**/__pycache__

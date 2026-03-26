@@ -9,6 +9,7 @@
 // PRÓXIMA FASE: rocBLAS GEMM para projections + kernels HIP para ops point-wise.
 // ============================================================================
 
+use crate::kv_cache::BoundedKvCache;
 use hip_ffi::GpuTensor;
 use half::bf16;
 use std::collections::HashMap;
@@ -42,6 +43,8 @@ pub struct ModelCfg {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub rms_eps: f32,
+    pub rope_theta: f32,
+    pub max_seq_len: usize,
 }
 
 impl ModelCfg {
@@ -110,6 +113,8 @@ impl ModelCfg {
             vocab_size:        uint("vocab_size")?,
             num_kv_heads:      uint("num_key_value_heads")?,
             rms_eps:           params["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
+            rope_theta:        params["rope_theta"].as_f64().unwrap_or(1_000_000.0) as f32,
+            max_seq_len:       params["max_position_embeddings"].as_u64().map(|n| n as usize).unwrap_or(2048),
         })
     }
 
@@ -119,6 +124,8 @@ impl ModelCfg {
             hidden_size: 4096, num_layers: 36, intermediate_size: 12288,
             vocab_size: 151936, num_heads: 32, num_kv_heads: 8,
             head_dim: 128, rms_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_seq_len: 2048,
         }
     }
 }
@@ -137,9 +144,9 @@ pub struct QwenLayer {
     // Norm weights ficam em host (vetores pequenos, sem ganho em GPU)
     pub input_norm_w: Vec<f32>,
     pub post_attn_norm_w: Vec<f32>,
-    // KV-Cache em host (cresce com o contexto)
-    pub kv_k: Vec<f32>,  // [seq, kv_dim]
-    pub kv_v: Vec<f32>,  // [seq, kv_dim]
+    // KV-Cache em host (janela deslizante, tamanho fixo = max_seq_len)
+    pub kv_k: BoundedKvCache,  // [seq, kv_dim]
+    pub kv_v: BoundedKvCache,  // [seq, kv_dim]
 }
 
 // ── Modelo completo ───────────────────────────────────────────────────────────
@@ -195,6 +202,9 @@ impl QwenModel {
         let embed = gpu("model.embed_tokens.weight")?;
 
         // Camadas
+        let kv_dim   = cfg.num_kv_heads * cfg.head_dim;
+        let max_seq  = cfg.max_seq_len;
+
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             if i % 8 == 0 {
@@ -214,8 +224,8 @@ impl QwenModel {
                 wdown: gpu(&format!("{}.mlp.down_proj.weight", p))?,
                 input_norm_w: in_w,
                 post_attn_norm_w: pa_w,
-                kv_k: Vec::new(),
-                kv_v: Vec::new(),
+                kv_k: BoundedKvCache::new(max_seq, kv_dim),
+                kv_v: BoundedKvCache::new(max_seq, kv_dim),
             });
         }
 
@@ -228,8 +238,8 @@ impl QwenModel {
 
     pub fn reset_cache(&mut self) {
         for l in &mut self.layers {
-            l.kv_k.clear();
-            l.kv_v.clear();
+            l.kv_k.reset();
+            l.kv_v.reset();
         }
     }
 
@@ -259,13 +269,18 @@ impl QwenModel {
             let q_dim = layer.wq.shape[0];
             let kv_dim = layer.wk.shape[0];
 
-            let q = gemm(&normed, &wq, n, h, q_dim);
-            let k = gemm(&normed, &wk, n, h, kv_dim);
+            let mut q = gemm(&normed, &wq, n, h, q_dim);
+            let mut k = gemm(&normed, &wk, n, h, kv_dim);
             let v = gemm(&normed, &wv, n, h, kv_dim);
 
-            layer.kv_k.extend_from_slice(&k);
-            layer.kv_v.extend_from_slice(&v);
-            let seq = layer.kv_k.len() / kv_dim;
+            // RoPE: pos_start = tokens já em cache antes desta chamada
+            let pos_start = layer.kv_k.seq_len();
+            apply_rope(&mut q, n, self.cfg.num_heads,    self.cfg.head_dim, pos_start, self.cfg.rope_theta);
+            apply_rope(&mut k, n, self.cfg.num_kv_heads, self.cfg.head_dim, pos_start, self.cfg.rope_theta);
+
+            layer.kv_k.append(&k);
+            layer.kv_v.append(&v);
+            let seq = layer.kv_k.seq_len();
 
             // Multi-head attention
             let head_dim = self.cfg.head_dim;
@@ -273,6 +288,8 @@ impl QwenModel {
             let n_kv     = self.cfg.num_kv_heads;
             let scale    = (head_dim as f32).sqrt();
             let mut attn = vec![0.0f32; n * q_dim];
+            let kv_k_s = layer.kv_k.as_slice();
+            let kv_v_s = layer.kv_v.as_slice();
 
             for h_i in 0..n_heads {
                 let kv_h = h_i * n_kv / n_heads; // GQA mapping
@@ -285,7 +302,7 @@ impl QwenModel {
                         let mut dot = 0.0f32;
                         for d in 0..head_dim {
                             dot += q[qi * q_dim + q_off + d]
-                                 * layer.kv_k[ki * kv_dim + k_off + d];
+                                 * kv_k_s[ki * kv_dim + k_off + d];
                         }
                         scores[ki] = dot / scale;
                     }
@@ -293,7 +310,7 @@ impl QwenModel {
                     for d in 0..head_dim {
                         let mut acc = 0.0f32;
                         for ki in 0..seq {
-                            acc += scores[ki] * layer.kv_v[ki * kv_dim + k_off + d];
+                            acc += scores[ki] * kv_v_s[ki * kv_dim + k_off + d];
                         }
                         attn[qi * q_dim + q_off + d] = acc;
                     }
@@ -363,6 +380,42 @@ fn softmax_inplace(x: &mut [f32]) {
 
 #[inline(always)]
 fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
+/// Aplica RoPE (Rotary Position Embedding) in-place em Q ou K.
+///
+/// Layout esperado: buffer plano de shape [n_tokens, n_heads, head_dim].
+/// Usa a convenção "halves" do HuggingFace/Qwen: o par rotacionado é
+/// (x[i], x[i + head_dim/2]) para i in 0..half_dim.
+///
+/// `pos_start` é a posição absoluta do primeiro token no buffer —
+/// para decode com KV-cache, isso é o comprimento do cache antes do append.
+pub(crate) fn apply_rope(
+    x: &mut [f32],
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+    theta: f32,
+) {
+    let token_stride = n_heads * head_dim;
+    let half_dim = head_dim / 2;
+
+    for tok in 0..n_tokens {
+        let pos = (pos_start + tok) as f32;
+        for h in 0..n_heads {
+            let base = tok * token_stride + h * head_dim;
+            for i in 0..half_dim {
+                let freq = 1.0_f32 / theta.powf((2 * i) as f32 / head_dim as f32);
+                let angle = pos * freq;
+                let (sin_val, cos_val) = angle.sin_cos();
+                let x0 = x[base + i];
+                let x1 = x[base + half_dim + i];
+                x[base + i]            = x0 * cos_val - x1 * sin_val;
+                x[base + half_dim + i] = x0 * sin_val + x1 * cos_val;
+            }
+        }
+    }
+}
 
 // ── Leitor BF16 safetensors ───────────────────────────────────────────────────
 

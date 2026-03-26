@@ -12,29 +12,32 @@ Este workflow recebe um prompt livre do usuário, decompõe em tasks atômicas e
 /do "prompt" → Decomposer (Gemini CLI) → Tasks na Inbox → Event Loop → Gemini CLI por agente → Outbox
 ```
 
-## Processo de Execução
+## Processo de Execução (v2 Unified)
 
-### 1. DECOMPOSIÇÃO AUTOMÁTICA
+O comando `/do` agora utiliza o motor IARA v2, que é centralizado no script `iara.py`.
 
-O prompt é analisado pelo `task_decomposer.py` que usa Gemini CLI para:
-- Identificar domínios (Frontend, Backend, DB, Security, etc.)
-- Criar tasks atômicas com dependências
-- Atribuir cada task ao agente correto
+### 1. EXECUÇÃO UNIFICADA
+
+# 🚀 Workflow: /do (O Protocolo do Arquiteto)
+
+> [!CAUTION]
+> **INSTRUÇÃO MANDATÓRIA PARA IA:**
+> 1. **MAPEIE:** Antes de tudo, ache os arquivos e linhas. Use `grep` e `list_dir`.
+> 2. **QUESTIONE:** Não assuma frameworks ou URLs. Pergunte os furos (GAPs).
+> 3. **ESPECIFIQUE:** Crie um prompt técnico rico.
+> 4. **DELEGUE:** `python3 .agent/scripts/iara.py "<prompt técnico>"`
+Basta rodar o comando mestre. Ele cuidará da Descoberta, Decomposição, Execução Paralela e Dashboard de uma vez.
 
 ```bash
 // turbo
-python .agent/scripts/task_decomposer.py "$ARGUMENTS"
+python3 .agent/scripts/iara.py "$ARGUMENTS"
 ```
 
-### 2. EVENT LOOP (deve estar rodando)
+### 2. O QUE ACONTECE POR BAIXO
 
-O Event Loop processa as tasks da inbox automaticamente:
-
-```bash
-python .agent/scripts/event_loop.py
-```
-
-> ⚠️ Se o Event Loop não estiver rodando, inicie-o em outro terminal **antes** de usar `/do`.
+1.  **Arquitetura (architect.py)**: Faz o scanner do projeto e identifica "furos" (Gaps). Se houver dúvidas, ele parará e perguntará.
+2.  **Motor (runner.py)**: Se a spec estiver pronta, inicia o paralelismo em segundo plano.
+3.  **Dashboard (dashboard.py)**: Abre o Mission Control automaticamente para você acompanhar o progresso.
 
 ### 3. MONITORAMENTO
 

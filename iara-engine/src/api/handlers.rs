@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use crate::debug::brain::BrainTrace;
 use crate::model::{QwenModel, ModelCfg};
 use crate::qwen::forward_traced;
+use crate::qwen::sampling::SamplingParams;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App State
@@ -51,6 +52,8 @@ pub struct GenerateRequest {
     pub temperature: f32,
     #[serde(default = "default_top_k")]
     pub top_k: u32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
 }
@@ -415,6 +418,12 @@ async fn generate_internal(
         return Err("Nenhum modelo carregado. Selecione um modelo no painel.".into());
     }
 
+    let sampling = SamplingParams {
+        temperature: req.temperature,
+        top_k: req.top_k as usize,
+        top_p: req.top_p,
+    };
+
     let tokens = crate::tokenizer::tokenize(&req.prompt);
     let token_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
     let prompt_eval_count = token_ids.len() as u32;
@@ -432,7 +441,7 @@ async fn generate_internal(
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, &current_tokens)
+            forward_traced(model, &current_tokens, &sampling)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
@@ -464,4 +473,5 @@ async fn generate_internal(
 
 fn default_temperature() -> f32  { 0.7 }
 fn default_top_k() -> u32        { 40 }
+fn default_top_p() -> f32        { 0.9 }
 fn default_max_tokens() -> usize { 100 }

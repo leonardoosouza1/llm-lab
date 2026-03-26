@@ -11,6 +11,7 @@
 // ============================================================================
 
 use crate::model::{QwenModel, ModelResult, ModelError};
+use crate::qwen::sampling::{SamplingParams, sample_token};
 use crate::tokenizer;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -70,6 +71,7 @@ pub struct ActivationPattern {
 pub fn forward_traced(
     model: &mut QwenModel,
     token_ids: &[u32],
+    sampling: &SamplingParams,
 ) -> ModelResult<GenerationStep> {
     let total_start = Instant::now();
     let h = model.cfg.hidden_size;
@@ -99,22 +101,29 @@ pub fn forward_traced(
         let q_dim = layer.wq.shape[0];
         let kv_dim = layer.wk.shape[0];
 
-        let q = gemm_host(&normed, &wq, n, h, q_dim);
-        let k = gemm_host(&normed, &wk, n, h, kv_dim);
+        let mut q = gemm_host(&normed, &wq, n, h, q_dim);
+        let mut k = gemm_host(&normed, &wk, n, h, kv_dim);
         let v = gemm_host(&normed, &wv, n, h, kv_dim);
 
-        // Atenção — captura energia
+        // RoPE: posição absoluta do primeiro token = tokens já em cache
+        let pos_start = layer.kv_k.seq_len();
+        crate::model::apply_rope(&mut q, n, model.cfg.num_heads,    model.cfg.head_dim, pos_start, model.cfg.rope_theta);
+        crate::model::apply_rope(&mut k, n, model.cfg.num_kv_heads, model.cfg.head_dim, pos_start, model.cfg.rope_theta);
+
+        // Atenção — captura energia (no espaço rotacionado)
         let attn_energy = q.iter().map(|&v| v * v).sum::<f32>();
 
-        layer.kv_k.extend_from_slice(&k);
-        layer.kv_v.extend_from_slice(&v);
-        let seq = layer.kv_k.len() / kv_dim;
+        layer.kv_k.append(&k);
+        layer.kv_v.append(&v);
+        let seq = layer.kv_k.seq_len();
 
         let head_dim = model.cfg.head_dim;
         let n_heads  = model.cfg.num_heads;
         let n_kv     = model.cfg.num_kv_heads;
         let scale    = (head_dim as f32).sqrt();
         let mut attn = vec![0.0f32; n * q_dim];
+        let kv_k_s = layer.kv_k.as_slice();
+        let kv_v_s = layer.kv_v.as_slice();
 
         for h_i in 0..n_heads {
             let kv_h = h_i * n_kv / n_heads;
@@ -126,14 +135,14 @@ pub fn forward_traced(
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q[qi * q_dim + q_off + d]
-                             * layer.kv_k[ki * kv_dim + k_off + d];
+                             * kv_k_s[ki * kv_dim + k_off + d];
                     }
                     scores[ki] = dot / scale;
                 }
                 softmax_inplace(&mut scores);
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
-                    for ki in 0..seq { acc += scores[ki] * layer.kv_v[ki * kv_dim + k_off + d]; }
+                    for ki in 0..seq { acc += scores[ki] * kv_v_s[ki * kv_dim + k_off + d]; }
                     attn[qi * q_dim + q_off + d] = acc;
                 }
             }
@@ -186,13 +195,14 @@ pub fn forward_traced(
     let vocab = model.cfg.vocab_size;
     let logits = gemm_host(last, &lm, 1, h, vocab);
 
-    // Top-40 logits
+    // Top-40 logits (telemetria — sempre dos logits brutos, pré-amostragem)
     let mut idx_logits: Vec<(u32, f32)> = logits.iter().enumerate()
         .map(|(i, &v)| (i as u32, v)).collect();
     idx_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let top_logits: Vec<(u32, f32)> = idx_logits[..40.min(idx_logits.len())].to_vec();
 
-    let token_id = top_logits[0].0;
+    // Token amostrado — temperatura / top-k / top-p aplicados aqui
+    let token_id = sample_token(&logits, sampling);
     let token_str = tokenizer::token_id_to_text(token_id);
 
     // Camadas acima da média de ativação

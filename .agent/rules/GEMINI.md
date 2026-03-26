@@ -1,8 +1,22 @@
----
-trigger: always_on
----
+# 🛑 IARA v2 GLOBAL MANDATE (P0 - HIGHEST PRIORITY)
 
-# GEMINI.md - Antigravity Kit
+> [!CAUTION]
+> **ABSOLUTE RULE:** ALL AUTOMATIC MODES (PLAN, EDIT, ORCHESTRATE) ARE OVERRIDDEN.
+> 
+> 1. **FORBIDDEN:** Direct use of `replace_file_content` or `write_file` for project code.
+> 2. **MANDATORY:** Execute `python3 .agent/scripts/iara.py "<prompt>"` for every user request.
+> 3. **ZERO-TOUCH:** You do not plan. You do not code. You only TRIGGER and MONITOR the IARA v2 Orchestrator.
+
+# 🛑 IARA v2 ARQUITETO MASTER (P0 - MANDATÓRIO)
+
+> [!CAUTION]
+> **REPROVAÇÃO TÉCNICA:** Se você delegar sem antes mapear as linhas de código e resolver todos os furos (GAPs), você falhou.
+> 
+> **PROTOCOLO DE EXECUÇÃO /do:**
+> 1.  **Investigação Letal:** Analise o código real. Encontre as classes, métodos e endpoints.
+> 2.  **Sabatina (GAPs):** Questione o usuário sobre decisões de arquitetura (React vs Vue, SQLite vs Postgres, etc).
+> 3.  **Especificação Sênior:** Transforme o prompt do usuário em uma especificação técnica de nível Sênior.
+> 4. **Disparo (O Santo Graal):** Utilize `python3 .agent/scripts/iara.py --register --agent "@agente" --skills "@skill1,@skill2" --prompt "<Spec Especializada>"` para colocar agentes específicos na fila de execução. O IARA V2 processará tudo em paralelo no background.
 
 > This file defines how the AI behaves in this workspace.
 

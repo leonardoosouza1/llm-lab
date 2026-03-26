@@ -73,3 +73,35 @@
 [2026-03-26 09:35:14] 🔄 Processando tarefa: task_af934e92.json (Agent: @frontend-specialist)
 [2026-03-26 09:35:14]   🚀 Executando Gemini CLI → Agent: @frontend-specialist
 [2026-03-26 09:35:14]   🚀 Tentando @frontend-specialist com modelo: gemini-2.5-flash
+[2026-03-26 15:01:24] ✅ Tarefa concluída: task_2adff99a.json → outbox/test-engineer/
+[2026-03-26 15:01:24] 🔄 Processando tarefa: task_807877f1.json (Agent: @test-engineer)
+[2026-03-26 15:01:24]   🚀 Executando Gemini CLI → Agent: @test-engineer
+[2026-03-26 15:01:24]   🚀 Tentando @test-engineer com modelo: gemini-2.5-flash
+[2026-03-26 15:04:14] ✅ Tarefa concluída: task_807877f1.json → outbox/test-engineer/
+[2026-03-26 15:04:14] 🔄 Processando tarefa: task_c57dd243.json (Agent: @security-auditor)
+[2026-03-26 15:04:14]   🚀 Executando Gemini CLI → Agent: @security-auditor
+[2026-03-26 15:04:14]   🚀 Tentando @security-auditor com modelo: gemini-2.5-flash
+[2026-03-26 15:05:07] ✅ Tarefa concluída: task_c57dd243.json → outbox/security-auditor/
+[2026-03-26 15:05:07] 🔄 Processando tarefa: task_f1acc93a.json (Agent: @backend-specialist)
+[2026-03-26 15:05:07]   🚀 Executando Gemini CLI → Agent: @backend-specialist
+[2026-03-26 15:05:07]   🚀 Tentando @backend-specialist com modelo: gemini-2.5-flash
+[2026-03-26 15:07:24] ✅ Tarefa concluída: task_f1acc93a.json → outbox/backend-specialist/
+[2026-03-26 15:07:24] 🔄 Processando tarefa: task_f6fa2e6f.json (Agent: @backend-specialist)
+[2026-03-26 15:07:24]   🚀 Executando Gemini CLI → Agent: @backend-specialist
+[2026-03-26 15:07:24]   🚀 Tentando @backend-specialist com modelo: gemini-2.5-flash
+[2026-03-26 15:09:30]   ⚠️ JSON inválido do CLI com gemini-2.5-flash: Expecting value: line 1 column 1 (char 0)
+[2026-03-26 15:09:30]   🚀 Tentando @backend-specialist com modelo: gemini-2.5-flash-lite
+[2026-03-26 15:09:55] ✅ Tarefa concluída: task_f6fa2e6f.json → outbox/backend-specialist/
+[2026-03-26 15:09:57] 🔄 Processando tarefa: task_2adff99a.json (Agent: @test-engineer)
+[2026-03-26 15:09:57]   🚀 Executando Gemini CLI → Agent: @test-engineer
+[2026-03-26 15:09:57]   🚀 Tentando @test-engineer com modelo: gemini-2.5-flash
+[2026-03-26 15:14:57]   ⏰ Timeout (300s) com modelo gemini-2.5-flash. Próximo...
+[2026-03-26 15:14:57]   🚀 Tentando @test-engineer com modelo: gemini-2.5-flash-lite
+[2026-03-26 15:15:38] ✅ Tarefa concluída: task_2adff99a.json → outbox/test-engineer/
+[2026-03-26 15:16:12] 🔁 Recuperando tarefa stuck: task_af934e92.json (age=970s)
+[2026-03-26 15:16:12] 🔄 Processando tarefa: task_af934e92.json (Agent: @frontend-specialist)
+[2026-03-26 15:16:12]   🚀 Executando Gemini CLI → Agent: @frontend-specialist
+[2026-03-26 15:16:12]   🚀 Tentando @frontend-specialist com modelo: gemini-2.5-flash
+[2026-03-26 15:21:12]   ⏰ Timeout (300s) com modelo gemini-2.5-flash. Próximo...
+[2026-03-26 15:21:12]   🚀 Tentando @frontend-specialist com modelo: gemini-2.5-flash-lite
+[2026-03-26 15:21:34] ✅ Tarefa concluída: task_af934e92.json → outbox/frontend-specialist/
