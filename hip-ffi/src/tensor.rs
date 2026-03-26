@@ -28,6 +28,14 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Tensor BF16 residente na GPU — armazena pesos como u16 (bits BF16).
+/// Usa metade da VRAM comparado ao GpuTensor F32.
+/// to_host() converte para Vec<f32> para uso em cômputo CPU.
+pub struct GpuTensorBF16 {
+    pub buf: DeviceBuffer<u16>,
+    pub shape: Vec<usize>,
+}
+
 impl GpuTensor {
     /// Aloca tensor zerado na GPU com o shape dado.
     pub fn zeros(shape: &[usize]) -> Result<Self, HipError> {
@@ -86,5 +94,43 @@ impl GpuTensor {
 
     pub fn dev_ptr_mut(&mut self) -> *mut f32 {
         self.buf.as_mut_ptr()
+    }
+}
+
+impl GpuTensorBF16 {
+    /// Carrega pesos BF16 crus (u16 bits) direto na GPU sem converter para f32.
+    /// Economiza metade da VRAM vs GpuTensor::from_slice.
+    pub fn from_bf16_bits(bits: &[u16], shape: &[usize]) -> Result<Self, HipError> {
+        assert_eq!(
+            bits.len(),
+            shape.iter().product::<usize>(),
+            "bits len não bate com shape"
+        );
+        let buf = DeviceBuffer::from_slice(bits)?;
+        Ok(Self { buf, shape: shape.to_vec() })
+    }
+
+    /// Baixa BF16 da GPU e converte para f32 no host.
+    pub fn to_host(&self) -> Result<Vec<f32>, HipError> {
+        let bits = self.buf.to_host()?;
+        let floats = bits.iter().map(|&b| {
+            // BF16 → f32: insere 16 zeros nos bits menos significativos
+            f32::from_bits((b as u32) << 16)
+        }).collect();
+        Ok(floats)
+    }
+
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    pub fn rows(&self) -> usize {
+        assert!(self.shape.len() >= 2);
+        self.shape[self.shape.len() - 2]
+    }
+
+    pub fn cols(&self) -> usize {
+        assert!(!self.shape.is_empty());
+        self.shape[self.shape.len() - 1]
     }
 }

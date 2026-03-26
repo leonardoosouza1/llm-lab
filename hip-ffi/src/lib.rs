@@ -16,4 +16,4 @@ pub mod safe;
 pub mod tensor;
 
 pub use safe::*;
-pub use tensor::GpuTensor;
+pub use tensor::{GpuTensor, GpuTensorBF16};

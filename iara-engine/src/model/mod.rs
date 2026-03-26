@@ -11,7 +11,7 @@
 
 mod kv_cache;
 use kv_cache::BoundedKvCache;
-use hip_ffi::GpuTensor;
+use hip_ffi::GpuTensorBF16;
 use half::bf16;
 use std::collections::HashMap;
 use std::path::Path;
@@ -133,15 +133,19 @@ impl ModelCfg {
 
 // ── Camada Transformer ────────────────────────────────────────────────────────
 
-/// Pesos de uma camada Qwen (todos em GPU como GpuTensor).
+/// Pesos de uma camada Qwen (GPU como BF16 — metade da VRAM vs F32).
 pub struct QwenLayer {
-    pub wq: GpuTensor,
-    pub wk: GpuTensor,
-    pub wv: GpuTensor,
-    pub wo: GpuTensor,
-    pub wgate: GpuTensor,
-    pub wup: GpuTensor,
-    pub wdown: GpuTensor,
+    pub wq: GpuTensorBF16,
+    pub wk: GpuTensorBF16,
+    pub wv: GpuTensorBF16,
+    pub wo: GpuTensorBF16,
+    pub wgate: GpuTensorBF16,
+    pub wup: GpuTensorBF16,
+    pub wdown: GpuTensorBF16,
+    // Biases de atenção (Qwen2/2.5 têm bias em Q/K/V; Qwen3 não tem)
+    pub q_bias: Option<Vec<f32>>,
+    pub k_bias: Option<Vec<f32>>,
+    pub v_bias: Option<Vec<f32>>,
     // Norm weights ficam em host (vetores pequenos, sem ganho em GPU)
     pub input_norm_w: Vec<f32>,
     pub post_attn_norm_w: Vec<f32>,
@@ -153,52 +157,100 @@ pub struct QwenLayer {
 // ── Modelo completo ───────────────────────────────────────────────────────────
 
 pub struct QwenModel {
-    pub embed: GpuTensor,       // [vocab, hidden]
+    pub embed: GpuTensorBF16,   // [vocab, hidden]
     pub layers: Vec<QwenLayer>,
     pub norm_w: Vec<f32>,       // [hidden]
-    pub lm_head: GpuTensor,     // [vocab, hidden]
+    pub lm_head: GpuTensorBF16, // [vocab, hidden]
     pub cfg: ModelCfg,
-    /// Bytes totais ocupados em VRAM pelos GpuTensors (pesos F32).
+    /// Bytes totais ocupados em VRAM pelos GpuTensorBF16 (2 bytes/elemento).
     /// Calculado uma vez no load(). Não inclui KV-cache (host) nem ativações.
     pub vram_bytes: usize,
 }
 
 impl QwenModel {
     /// Carrega pesos do diretório de safetensors.
-    /// Converte BF16 → F32 host → envia para VRAM via HIP.
+    /// Suporta single-shard (model.safetensors) e multi-shard (model.safetensors.index.json).
+    /// Mantém BF16 cru → envia para VRAM como u16 (metade da VRAM vs F32).
     pub fn load(model_dir: &Path, cfg: ModelCfg) -> ModelResult<Self> {
         log::info!(
             "⏳ Carregando Qwen nativo: {} camadas, hidden={}, vocab={}",
             cfg.num_layers, cfg.hidden_size, cfg.vocab_size
         );
 
-        // Monta mapa de shards
-        let index_path = model_dir.join("model.safetensors.index.json");
-        let index_file = std::fs::read_to_string(&index_path)?;
-        let index: serde_json::Value = serde_json::from_str(&index_file)?;
-        let weight_map = index["weight_map"].as_object()
-            .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
-
-        // mmap de cada shard
+        // Detecta single-shard vs multi-shard e monta mmaps
         let mut shards: HashMap<String, memmap2::Mmap> = HashMap::new();
-        for shard_name in weight_map.values().filter_map(|v| v.as_str()) {
-            if shards.contains_key(shard_name) { continue; }
-            let path = model_dir.join(shard_name);
-            let file = std::fs::File::open(&path)?;
+        // Some(map) = multi-shard: tensor_name → shard_filename
+        // None = single-shard: tudo em "model.safetensors"
+        let tensor_shard_map: Option<HashMap<String, String>>;
+
+        let index_path = model_dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let index_file = std::fs::read_to_string(&index_path)?;
+            let index: serde_json::Value = serde_json::from_str(&index_file)?;
+            let weight_map = index["weight_map"].as_object()
+                .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
+
+            let mut tsm: HashMap<String, String> = HashMap::new();
+            for (k, v) in weight_map {
+                if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
+            }
+            for shard_name in tsm.values() {
+                if shards.contains_key(shard_name) { continue; }
+                let file = std::fs::File::open(model_dir.join(shard_name))?;
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                shards.insert(shard_name.clone(), mmap);
+            }
+            tensor_shard_map = Some(tsm);
+            log::info!("  → multi-shard ({} shards)", shards.len());
+        } else {
+            let single = model_dir.join("model.safetensors");
+            if !single.exists() {
+                return Err(ModelError::Model(
+                    "Nenhum arquivo safetensors encontrado (sem index.json nem model.safetensors)".into()
+                ));
+            }
+            let file = std::fs::File::open(&single)?;
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            shards.insert(shard_name.to_string(), mmap);
+            log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
+            shards.insert("model.safetensors".to_string(), mmap);
+            tensor_shard_map = None;
         }
 
-        // Helper de carregamento
-        let load = |name: &str| -> ModelResult<(Vec<f32>, Vec<usize>)> {
-            let shard = weight_map[name].as_str()
-                .ok_or_else(|| ModelError::Model(format!("'{}' não no index", name)))?;
-            read_bf16_f32(shards.get(shard).unwrap(), name)
+        // Resolve mmap para um tensor (ou None se tensor não existe no índice)
+        let find_mmap = |name: &str| -> Option<&memmap2::Mmap> {
+            match &tensor_shard_map {
+                Some(tsm) => tsm.get(name).and_then(|s| shards.get(s)),
+                None => shards.get("model.safetensors"),
+            }
         };
 
-        let gpu = |name: &str| -> ModelResult<GpuTensor> {
-            let (data, shape) = load(name)?;
-            Ok(GpuTensor::from_slice(&data, &shape)?)
+        let tensor_exists = |name: &str| -> bool {
+            match &tensor_shard_map {
+                Some(tsm) => tsm.contains_key(name),
+                // single-shard: tenta parsear o header pra verificar
+                None => shards.get("model.safetensors")
+                    .map(|m| shard_has_tensor(m, name))
+                    .unwrap_or(false),
+            }
+        };
+
+        // Helper: lê BF16 cru (u16 bits) — sem converter para f32
+        let load_raw = |name: &str| -> ModelResult<(Vec<u16>, Vec<usize>)> {
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            read_bf16_raw(mmap, name)
+        };
+
+        // Helper: lê f32 (para vetores de norm/bias — pequenos, ficam na CPU)
+        let load_f32 = |name: &str| -> ModelResult<(Vec<f32>, Vec<usize>)> {
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            read_bf16_f32(mmap, name)
+        };
+
+        let gpu = |name: &str| -> ModelResult<GpuTensorBF16> {
+            let (bits, shape) = load_raw(name)?;
+            Ok(GpuTensorBF16::from_bf16_bits(&bits, &shape)?)
         };
 
         // Embedding
@@ -215,8 +267,12 @@ impl QwenModel {
                 log::info!("  → layers {}/{}", i, cfg.num_layers);
             }
             let p = format!("model.layers.{}", i);
-            let (in_w, _)  = load(&format!("{}.input_layernorm.weight", p))?;
-            let (pa_w, _)  = load(&format!("{}.post_attention_layernorm.weight", p))?;
+            let (in_w, _)  = load_f32(&format!("{}.input_layernorm.weight", p))?;
+            let (pa_w, _)  = load_f32(&format!("{}.post_attention_layernorm.weight", p))?;
+
+            let q_bias_name = format!("{}.self_attn.q_proj.bias", p);
+            let k_bias_name = format!("{}.self_attn.k_proj.bias", p);
+            let v_bias_name = format!("{}.self_attn.v_proj.bias", p);
 
             layers.push(QwenLayer {
                 wq:    gpu(&format!("{}.self_attn.q_proj.weight", p))?,
@@ -226,6 +282,9 @@ impl QwenModel {
                 wgate: gpu(&format!("{}.mlp.gate_proj.weight", p))?,
                 wup:   gpu(&format!("{}.mlp.up_proj.weight", p))?,
                 wdown: gpu(&format!("{}.mlp.down_proj.weight", p))?,
+                q_bias: if tensor_exists(&q_bias_name) { Some(load_f32(&q_bias_name)?.0) } else { None },
+                k_bias: if tensor_exists(&k_bias_name) { Some(load_f32(&k_bias_name)?.0) } else { None },
+                v_bias: if tensor_exists(&v_bias_name) { Some(load_f32(&v_bias_name)?.0) } else { None },
                 input_norm_w: in_w,
                 post_attn_norm_w: pa_w,
                 kv_k: BoundedKvCache::new(max_seq, kv_dim),
@@ -233,12 +292,18 @@ impl QwenModel {
             });
         }
 
-        let (norm_w, _) = load("model.norm.weight")?;
-        let lm_head = gpu("lm_head.weight")?;
+        let (norm_w, _) = load_f32("model.norm.weight")?;
+        // Alguns modelos usam tie_word_embeddings=true → lm_head = embed_tokens
+        let lm_head = if tensor_exists("lm_head.weight") {
+            gpu("lm_head.weight")?
+        } else {
+            log::info!("  → lm_head: usando embed_tokens (tied weights)");
+            gpu("model.embed_tokens.weight")?
+        };
 
-        // Calcula total de bytes em VRAM (todos os GpuTensors, F32 = 4 bytes/elemento)
-        let tensor_bytes = |t: &GpuTensor| -> usize {
-            t.shape.iter().product::<usize>() * 4
+        // Calcula total de bytes em VRAM (GpuTensorBF16 = 2 bytes/elemento)
+        let tensor_bytes = |t: &GpuTensorBF16| -> usize {
+            t.shape.iter().product::<usize>() * 2
         };
         let mut vram_bytes = tensor_bytes(&embed) + tensor_bytes(&lm_head);
         for l in &layers {
@@ -247,7 +312,7 @@ impl QwenModel {
                         + tensor_bytes(&l.wup) + tensor_bytes(&l.wdown);
         }
 
-        log::info!("✅ Qwen carregado — pesos em VRAM: {:.2} GB", vram_bytes as f64 / 1e9);
+        log::info!("✅ Qwen carregado — pesos BF16 em VRAM: {:.2} GB", vram_bytes as f64 / 1e9);
         Ok(Self { embed, layers, norm_w, lm_head, cfg, vram_bytes })
     }
 
@@ -286,7 +351,18 @@ impl QwenModel {
 
             let mut q = gemm(&normed, &wq, n, h, q_dim);
             let mut k = gemm(&normed, &wk, n, h, kv_dim);
-            let v = gemm(&normed, &wv, n, h, kv_dim);
+            let mut v = gemm(&normed, &wv, n, h, kv_dim);
+
+            // Bias (Qwen2/2.5): adiciona bias a Q, K, V
+            if let Some(ref b) = layer.q_bias {
+                for tok in 0..n { for d in 0..q_dim { q[tok*q_dim+d] += b[d]; } }
+            }
+            if let Some(ref b) = layer.k_bias {
+                for tok in 0..n { for d in 0..kv_dim { k[tok*kv_dim+d] += b[d]; } }
+            }
+            if let Some(ref b) = layer.v_bias {
+                for tok in 0..n { for d in 0..kv_dim { v[tok*kv_dim+d] += b[d]; } }
+            }
 
             // RoPE: pos_start = tokens já em cache antes desta chamada
             let pos_start = layer.kv_k.seq_len();
@@ -432,9 +508,44 @@ pub(crate) fn apply_rope(
     }
 }
 
-// ── Leitor BF16 safetensors ───────────────────────────────────────────────────
+// ── Leitores BF16 safetensors ─────────────────────────────────────────────────
 
+/// Lê tensor BF16 como bits crus (u16) — sem conversão para f32.
+/// Usado para pesos matriciais enviados à GPU como GpuTensorBF16.
+fn read_bf16_raw(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<u16>, Vec<usize>)> {
+    let (raw, shape) = shard_tensor_bytes(mmap, name)?;
+    let bits: Vec<u16> = raw.chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    Ok((bits, shape))
+}
+
+/// Lê tensor BF16 convertendo para f32 no host.
+/// Usado para vetores de norm (pequenos, ficam na CPU).
 fn read_bf16_f32(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<f32>, Vec<usize>)> {
+    let (raw, shape) = shard_tensor_bytes(mmap, name)?;
+    let floats: Vec<f32> = raw.chunks_exact(2).map(|b| {
+        bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
+    }).collect();
+    Ok((floats, shape))
+}
+
+/// Verifica se um tensor existe no header de um shard (single-shard mode).
+fn shard_has_tensor(mmap: &memmap2::Mmap, name: &str) -> bool {
+    if mmap.len() < 8 { return false; }
+    let hlen = match mmap[0..8].try_into().ok().map(u64::from_le_bytes) {
+        Some(n) => n as usize,
+        None => return false,
+    };
+    if mmap.len() < 8 + hlen { return false; }
+    let header: HashMap<String, serde_json::Value> = match serde_json::from_slice(&mmap[8..8 + hlen]) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    header.contains_key(name)
+}
+
+fn shard_tensor_bytes<'a>(mmap: &'a memmap2::Mmap, name: &str) -> ModelResult<(&'a [u8], Vec<usize>)> {
     if mmap.len() < 8 {
         return Err(ModelError::Model("shard inválido".into()));
     }
@@ -449,11 +560,5 @@ fn read_bf16_f32(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<f32>, Vec
     let s = offs[0].as_u64().unwrap() as usize;
     let e = offs[1].as_u64().unwrap() as usize;
     let base = 8 + hlen;
-    let raw = &mmap[base + s..base + e];
-
-    let floats: Vec<f32> = raw.chunks_exact(2).map(|b| {
-        bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
-    }).collect();
-
-    Ok((floats, shape))
+    Ok((&mmap[base + s..base + e], shape))
 }

@@ -2,7 +2,7 @@
 
 import { el, escapeHtml, createLogEntry } from '../utils.js';
 import { store } from '../store/index.js';
-import { renderLayerGrid } from '../components/layer_grid.js'; // Will be created later
+import { renderLayerGrid, renderLayerHeatmapCells } from '../components/layer_grid.js'; // Will be created later
 
 let _logId = 0; // Reset for modularization purposes. Actual logs will be stored in store.logs.
 
@@ -389,7 +389,7 @@ export function switchActiveTab(tab, initFunctions) {
   }
   if (tab === 'layers') {
     renderLayerGrid();
-    initFunctions.renderLayerHeatmapCells(); // From layer_grid.js, to be created
+    initFunctions.renderLayerHeatmapCells();
   }
   if (tab === 'trace' && store.trace) {
     initFunctions.renderTracePanel(); // From trace_panel.js, to be created
@@ -398,16 +398,3 @@ export function switchActiveTab(tab, initFunctions) {
     initFunctions.renderConsoleLogs(); // From log_console.js, to be created
   }
 }
-
-// Document-level delegation for tab switching
-document.addEventListener('click', function(e) {
-  const btn = e.target.closest('#tab-nav [data-tab]');
-  if (btn) {
-    // This will be handled by the Vue app's switchTab method, not directly here.
-    // So we just prevent default for now to avoid multiple handlers.
-    e.preventDefault();
-    // In the new modular structure, the Vue app will call its own `switchTab` method
-    // which then calls the `dom/legacy_updates.js::switchActiveTab` with the correct
-    // initialization functions.
-  }
-});
