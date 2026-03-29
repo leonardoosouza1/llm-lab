@@ -461,30 +461,40 @@ async fn generate_internal(
         model.reset_cache();
     }
 
-    for step in 0..req.max_tokens {
-        // Prefill (step 0): forward on full prompt so KV cache is populated.
-        // Decode (step > 0): forward on only the latest token — KV cache holds history.
-        // This is O(prompt) + O(max_tokens) work instead of O(n²).
-        let tokens_to_forward: &[u32] = if step == 0 {
-            if prompt_ids.is_empty() { break; }
-            &prompt_ids
-        } else {
-            std::slice::from_ref(&last_token)
-        };
+    // Prefill sequencial: processa tokens 0..n-2 apenas para popular o KV cache.
+    // Isso garante atenção causal (cada token só vê os anteriores), como no treinamento.
+    // O último token do prompt é processado pela primeira iteração do decode loop,
+    // que retorna os logits para amostrar o primeiro token gerado.
+    if prompt_ids.len() > 1 {
+        let mut model_guard = state.qwen_model.lock().await;
+        let model = model_guard.as_mut().ok_or("Model not loaded")?;
+        for &tok in &prompt_ids[..prompt_ids.len() - 1] {
+            model.forward(&[tok])
+                .map_err(|e| format!("Prefill error: {}", e))?;
+        }
+    }
 
+    // Decode: a primeira iteração processa o último token do prompt → logits para 1º token gerado.
+    // Iterações seguintes processam cada token gerado → logits para o próximo.
+    let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
+
+    for step in 0..req.max_tokens {
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, tokens_to_forward, &sampling)
+            forward_traced(model, &[decode_token], &sampling)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
-        last_token = gen_step.token_id;
+        decode_token = gen_step.token_id;
+        last_token   = decode_token;
         generated_text.push_str(&gen_step.token_str);
         brain_trace.add_step(gen_step);
         eval_count += 1;
 
-        if last_token == EOS_TOKEN { break; }
+        if last_token == EOS_TOKEN || last_token == 151643 { break; }
+
+        let _ = step; // evita warning de variável não usada
     }
 
     brain_trace.finalize();

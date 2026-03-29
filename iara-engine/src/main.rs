@@ -154,31 +154,44 @@ async fn run_engine_loop(
 
                 let mut generated_text = String::new();
                 let mut sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
-                let mut last_token: u32 = 0;
 
                 // ── ESN Fase 1: observador do stream de tokens ────────────
                 let mut esn = EsnObserver::new(ESN_SEED);
                 esn.reset();
 
-                for step in 0..MAX_STEPS {
-                    // Prefill on step 0, decode (single new token) on subsequent steps
-                    let tokens_slice: &[u32] = if step == 0 {
-                        &prompt_ids
-                    } else {
-                        std::slice::from_ref(&last_token)
-                    };
+                // Prefill sequencial: tokens 0..n-2 apenas populam o KV cache.
+                // Garante atenção causal sem máscara explícita.
+                if prompt_ids.len() > 1 {
+                    let mut guard = model.lock().await;
+                    if let Some(m) = guard.as_mut() {
+                        for &tok in &prompt_ids[..prompt_ids.len() - 1] {
+                            if let Err(e) = m.forward(&[tok]) {
+                                log::error!("Prefill error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
 
+                // Decode: começa com o último token do prompt, gera até MAX_STEPS tokens novos.
+                let mut decode_token = match prompt_ids.last() {
+                    Some(&t) => t,
+                    None => continue,
+                };
+
+                for step in 0..MAX_STEPS {
                     let gen_step = {
                         let mut guard = model.lock().await;
                         let m = match guard.as_mut() {
                             Some(m) => m,
                             None => break,
                         };
-                        match forward_traced(m, tokens_slice, &sampling) {
+                        match forward_traced(m, &[decode_token], &sampling) {
                             Ok(s) => s,
                             Err(e) => { log::error!("Forward error: {}", e); break; }
                         }
                     };
+                    decode_token = gen_step.token_id;
 
                     // ── ESN: observa logits e modula sampling ─────────────
                     // top_logits são os 40 maiores scores (pre-softmax)
@@ -240,8 +253,7 @@ async fn run_engine_loop(
                     });
                     let _ = frame_tx.send(result.to_string());
 
-                    last_token = gen_step.token_id;
-                    if last_token == EOS || last_token == 151643 { break; }
+                    if decode_token == EOS || decode_token == 151643 { break; }
                 }
 
                 let _ = frame_tx.send(serde_json::json!({
