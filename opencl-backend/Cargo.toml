@@ -1,0 +1,15 @@
+[package]
+name = "opencl-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Backend OpenCL para compute-core — Intel iGPU, AMD, NVIDIA"
+
+[dependencies]
+compute-core = { path = "../compute-core" }
+# default-features = false desativa o dynamic loading (dlopen "libOpenCL.so").
+# Habilitamos CL_VERSION_1_2 para obter CommandQueue::create_default e outras APIs.
+# Ubuntu instala libOpenCL.so.1 mas não o symlink libOpenCL.so; o link estático
+# via opencl-sys (-lOpenCL) resolve pelo linker sem depender do dlopen.
+opencl3      = { version = "0.10", default-features = false, features = ["CL_VERSION_1_2"] }
+thiserror    = "1"
+log          = "0.4"

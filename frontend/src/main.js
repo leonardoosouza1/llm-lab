@@ -165,6 +165,73 @@ createApp({
       if (trace && store.activeTab === 'trace') renderTracePanel();
     });
 
+    // ── ESN Observer watcher ──────────────────────────────────────────────
+    let esnEntropyCtx = null;
+    let esnEntropyPoints = [];
+
+    watch(() => store.esnLatest, esn => {
+      if (!esn) return;
+
+      // Update stat numbers
+      const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      setText('esn-entropy',     esn.entropy    != null ? esn.entropy.toFixed(3)     : '—');
+      setText('esn-top1',        esn.top1_prob  != null ? (esn.top1_prob * 100).toFixed(1) + '%' : '—');
+      setText('esn-state-norm',  esn.state_norm != null ? esn.state_norm.toFixed(3)  : '—');
+      setText('esn-temperature', esn.temperature != null ? esn.temperature.toFixed(3) : '—');
+      setText('esn-step',        esn.step != null ? String(esn.step) : '—');
+
+      // Trained badge
+      const badge = document.getElementById('esn-trained-badge');
+      if (badge) {
+        if (esn.readout_trained) {
+          badge.textContent = 'readout: treinado ✓';
+          badge.style.color = '#00ffc8';
+          badge.style.background = 'rgba(0,255,200,.1)';
+        } else {
+          badge.textContent = 'readout: zero (observando)';
+          badge.style.color = '#6b7280';
+          badge.style.background = 'rgba(255,255,255,.06)';
+        }
+      }
+
+      // Mini sparkline de entropia
+      esnEntropyPoints.push(esn.entropy || 0);
+      if (esnEntropyPoints.length > 200) esnEntropyPoints.shift();
+
+      const canvas = document.getElementById('esn-entropy-canvas');
+      if (!canvas) return;
+      canvas.width = canvas.offsetWidth || 600;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+      if (esnEntropyPoints.length < 2) return;
+      const max = Math.max(...esnEntropyPoints, 0.01);
+      ctx.beginPath();
+      ctx.strokeStyle = '#a855f7';
+      ctx.lineWidth = 1.5;
+      esnEntropyPoints.forEach((v, i) => {
+        const x = (i / (esnEntropyPoints.length - 1)) * W;
+        const y = H - (v / max) * (H - 4) - 2;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    });
+
+    // Reseta ESN ao iniciar nova geração
+    watch(() => store.generating, gen => {
+      if (gen) {
+        esnEntropyPoints = [];
+        store.esnHistory = [];
+        store.esnLatest = null;
+        const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        setText('esn-entropy', '—');
+        setText('esn-top1', '—');
+        setText('esn-state-norm', '—');
+        setText('esn-temperature', '—');
+        setText('esn-step', '—');
+      }
+    });
+
     console.log('IARA Neural Dashboard started');
   },
 }).mount('#app');

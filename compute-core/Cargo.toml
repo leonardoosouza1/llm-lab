@@ -1,0 +1,8 @@
+[package]
+name = "compute-core"
+version = "0.1.0"
+edition = "2021"
+description = "Abstração de backend de compute — traits e tipos para ROCm, OpenCL, CPU"
+
+[dependencies]
+thiserror = "1"

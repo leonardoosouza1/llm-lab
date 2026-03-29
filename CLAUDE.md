@@ -1,20 +1,27 @@
 # IARA LLM Engine — Visão Geral do Sistema
 
 ## O que é isso
-Motor de inferência nativo para modelos Qwen3 em AMD ROCm (RX 6750 XT, GFX1032).
-Zero frameworks (sem PyTorch, sem candle). Carrega safetensors direto em VRAM via HIP FFI.
+Motor de inferência nativo para modelos Qwen3 com arquitetura de backend dinâmica.
+Zero frameworks (sem PyTorch, sem candle). Carrega safetensors direto em VRAM via backend de compute.
 Expõe HTTP REST (porta 3000) + WebSocket (porta 8080) com painel Vue3 em tempo real.
+
+Suporta múltiplos backends de hardware detectados em runtime:
+- **ROCm/HIP** — AMD RX 6750 XT (GFX1032 / RDNA2, 12 GB GDDR6) via hipBLAS + kernels HIP
+- **OpenCL** — Intel iGPU (Iris Plus Gen 11, i7-1065G7) e qualquer GPU OpenCL 3.0
+- Detecção automática: tenta ROCm → OpenCL → erro
 
 ## Estrutura de alto nível
 
 ```
 llm-lab/
-├── iara-engine/        # Servidor Rust (tokio + axum)
+├── compute-core/       # Traits e param-structs (sem impl de hardware)
+│   └── src/            # ComputeBackend trait, AnyTensor, params
+├── rocm-backend/       # Impl AMD ROCm: wraps hip-ffi, hipBLAS + kernels HIP
+├── opencl-backend/     # Impl Intel iGPU: OpenCL C kernels (JIT) + GEMM
+├── hip-ffi/            # Bindings HIP/hipBLAS de baixo nível (usados por rocm-backend)
+├── iara-engine/        # Servidor Rust (tokio + axum) — usa só compute-core
 │   └── src/            # Ver iara-engine/CLAUDE.md
-├── hip-ffi/            # Bindings HIP → GpuTensor
-│   └── src/            # Ver hip-ffi/CLAUDE.md
 ├── frontend/           # Dashboard Vue3 (5 abas)
-│   └── CLAUDE.md
 ├── models/             # Pesos safetensors (não versionados)
 │   └── qwen3-8b/       # Modelo ativo (36 camadas, 8.2B params)
 └── run_iara.sh         # Script de execução com vars ROCm
@@ -68,26 +75,33 @@ Frontend: heatmap de camadas, top tokens, timeline
 ## Como executar
 
 ```bash
-./run_iara.sh            # debug (com vars ROCm)
-./run_iara.sh release    # release (otimizado)
+# AMD ROCm (casa)
+./run_iara.sh            # debug
+./run_iara.sh release    # release
+
+# Intel iGPU (notebook) — sem ROCm
+cargo run -p iara-engine --no-default-features --features opencl
 # Acesse: http://localhost:3000
 ```
 
 ## Invariantes críticas
 1. **Apenas um modelo por vez** — `Arc<Mutex<Option<QwenModel>>>`
-2. **BF16 → F32 na carga** — todos os pesos convertidos antes de subir p/ VRAM
-3. **KV-cache limitado** — `BoundedKvCache` com janela deslizante (`max_seq_len` do config.json)
-4. **RoPE aplicado antes do cache** — K rotacionado antes de `append()`, Q rotacionado por chamada
-5. **forward_traced nunca reutiliza KV sem reset** — `reset_cache()` obrigatório no início de cada geração nova
+2. **Pesos em BF16 no device** — `upload_bf16()` via backend; sem conversão intermediária para F32
+3. **KV-cache limitado** — janela deslizante de 4096 tokens (cap em `ModelCfg::from_config_json`)
+4. **RoPE aplicado antes do cache** — K rotacionado antes de `copy_to_kv_cache`, Q por chamada
+5. **reset_cache() obrigatório** — no início de cada geração nova (`QwenModel::reset_cache()`)
+6. **Backend via trait** — `iara-engine` nunca importa `hip-ffi` ou `opencl-backend` diretamente
 
 ## Gotchas
-- **GPU usada só para armazenamento** — forward inteiramente em CPU f32 (GEMM ~O(n³) host)
-- **rocBLAS não implementado** — próxima fase (10× speedup estimado)
-- **Sliding window** — ao atingir `max_seq_len`, evicta token mais antigo via `copy_within`
+- **Offsets em params** — `GemmBf16Params.a_offset`, `SgemmParams.{a,b,c}_offset`, `SoftmaxParams.offset_elems` são necessários para atenção multi-cabeça e lm_head do último token
+- **Sliding window** — ao atingir `max_seq_len`, evicta token mais antigo via kernel `copy_to_kv_cache`
 - **Broadcast buffer** — 512 frames; clientes lentos perdem frames silenciosamente
 - **Amostragem** — `temperature=0` → greedy; `top_k=0` → desabilitado; `top_p=1.0` → desabilitado
+- **OpenCL GEMM** — implementação naive (loop K); não usa clBLAST. Correto mas lento para modelos grandes
 
-## Hardware alvo
-- AMD RX 6750 XT (GFX1032 / RDNA2, 12 GB GDDR6)
-- ROCm 6.4.4 em `/opt/rocm-6.4.4`
-- `HSA_OVERRIDE_GFX_VERSION=10.3.0` (forçado no run_iara.sh)
+## Hardware suportado
+| Backend | Hardware | Features Cargo |
+|---------|----------|----------------|
+| ROCm/HIP | AMD RX 6750 XT (GFX1032) | `--features rocm` |
+| OpenCL | Intel Iris Plus Gen 11 (i7-1065G7) | `--features opencl` |
+| (futuro) CPU | Fallback puro Rust | `--features cpu` |

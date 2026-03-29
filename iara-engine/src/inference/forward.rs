@@ -80,10 +80,16 @@ pub fn forward_traced(
     let us_per_layer = elapsed_us / num_layers.max(1) as u128;
 
     // Top-40 logits (telemetria — pré-sampling)
+    // Usa select_nth_unstable para O(n) ao invés de O(n log n) sort completo.
+    let top_k = 40.min(logits.len());
     let mut idx_logits: Vec<(u32, f32)> = logits.iter().enumerate()
         .map(|(i, &v)| (i as u32, v)).collect();
-    idx_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let top_logits: Vec<(u32, f32)> = idx_logits[..40.min(idx_logits.len())].to_vec();
+    idx_logits.select_nth_unstable_by(top_k - 1, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut top_slice = idx_logits[..top_k].to_vec();
+    top_slice.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_logits = top_slice;
 
     // Token amostrado
     let token_id  = sample_token(&logits, sampling);

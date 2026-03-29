@@ -8,6 +8,7 @@ mod debug;
 mod generation;
 mod hardware;
 mod inference;
+mod lnn;
 mod model;
 mod storage;
 mod tokenizer;
@@ -21,6 +22,7 @@ mod experimental;
 use crate::api::handlers::{AppState, generate_handler, health_handler, debug_trace_handler,
                             models_handler, load_model_handler};
 use crate::hardware::HardwareManager;
+use crate::lnn::EsnObserver;
 use crate::model::QwenModel;
 use crate::inference::{forward_traced, SamplingParams};
 use crate::transport::{start_ws_server, EngineCommand};
@@ -81,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_loading: model_loading.clone(),
         models_dir:    Arc::new(models_dir),
         frame_tx:      frame_tx.clone(),
+        backend:       hw.backend.clone(),
     };
 
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
@@ -117,6 +120,7 @@ async fn run_engine_loop(
 ) {
     const EOS: u32 = 151645;
     const MAX_STEPS: usize = 256;
+    const ESN_SEED: u64 = 0xDEAD_BEEF_1337_4242;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -149,8 +153,12 @@ async fn run_engine_loop(
                 }
 
                 let mut generated_text = String::new();
-                let sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
+                let mut sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
                 let mut last_token: u32 = 0;
+
+                // ── ESN Fase 1: observador do stream de tokens ────────────
+                let mut esn = EsnObserver::new(ESN_SEED);
+                esn.reset();
 
                 for step in 0..MAX_STEPS {
                     // Prefill on step 0, decode (single new token) on subsequent steps
@@ -171,6 +179,26 @@ async fn run_engine_loop(
                             Err(e) => { log::error!("Forward error: {}", e); break; }
                         }
                     };
+
+                    // ── ESN: observa logits e modula sampling ─────────────
+                    // top_logits são os 40 maiores scores (pre-softmax)
+                    // A ESN computa entropia e top1_prob a partir deles (aproximação)
+                    let top_scores: Vec<f32> = gen_step.top_logits.iter().map(|(_, s)| *s).collect();
+                    esn.step(&top_scores, step, MAX_STEPS);
+                    sampling = esn.modulate(&sampling);
+                    let esn_tel = esn.telemetry();
+
+                    // Broadcast telemetria ESN
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "esn_state",
+                        "step": step,
+                        "entropy": esn_tel.entropy,
+                        "top1_prob": esn_tel.top1_prob,
+                        "state_norm": esn_tel.state_norm,
+                        "temp_delta": esn_tel.temp_delta,
+                        "temperature": sampling.temperature,
+                        "readout_trained": esn_tel.readout_trained,
+                    }).to_string());
 
                     for trace in &gen_step.layer_traces {
                         let msg = serde_json::json!({

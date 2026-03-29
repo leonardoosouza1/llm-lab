@@ -10,6 +10,8 @@ experimental = []   # Compila módulos exploratórios (physics, liquid_network, 
 stdp         = []
 circadian    = []
 actuator     = []
+rocm         = ["dep:hip-ffi", "dep:rocm-backend"]
+opencl       = ["dep:opencl-backend"]
 
 [dependencies]
 # Async runtime
@@ -30,8 +32,16 @@ bincode = "1.3"
 # Parallelism
 rayon = "1.10"
 
+# Abstração de compute — trait ComputeBackend (ROCm, OpenCL, CPU)
+compute-core = { path = "../compute-core" }
+
 # GPU nativa — HIP FFI direto (sem candle, sem rocm-rs e seu kernel sorting quebrado)
-hip-ffi = { path = "../hip-ffi" }
+# Mantido como opcional: usado pelo rocm-backend via feature "rocm"
+hip-ffi = { path = "../hip-ffi", optional = true }
+
+# Backends opcionais — compilar apenas quando necessário
+rocm-backend   = { path = "../rocm-backend", optional = true }
+opencl-backend = { path = "../opencl-backend", optional = true }
 
 # Operações matriciais CPU (fallback e pré-processamento)
 ndarray = { version = "0.16", features = ["rayon"] }

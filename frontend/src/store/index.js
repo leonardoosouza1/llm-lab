@@ -55,4 +55,8 @@ export const store = reactive({
 
   // Brain map
   brainMap: null,
+
+  // ESN (Fase 1) — observador do stream de tokens
+  esnHistory: [],   // [{step, entropy, top1_prob, state_norm, temp_delta, temperature}]
+  esnLatest: null,  // último frame ESN
 });

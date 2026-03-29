@@ -1,15 +1,18 @@
 // ============================================================================
 // kv_cache.rs — KV-Cache com janela deslizante (bounded sliding window)
 // ============================================================================
-// Mantém os últimos `max_seq_len` tokens de K ou V para uma camada.
-// Memória alocada UMA vez na carga do modelo — zero alocação durante geração.
-// Quando o cache está cheio, o token mais antigo é descartado via copy_within.
+// GpuKvCache: buffer pré-alocado via ComputeBackend (AnyTensor).
+// BoundedKvCache: cache CPU-only, inalterado.
 // ============================================================================
 
-/// Cache de K ou V em GPU — pré-alocado, nunca desce para CPU durante geração.
+use std::sync::Arc;
+use compute_core::{AnyTensor, ComputeBackend};
+
+/// Cache de K ou V em GPU — buffer pré-alocado via ComputeBackend.
+/// Layout: [max_seq_len, kv_dim] F32.
 pub struct GpuKvCache {
-    /// Buffer GPU: [max_seq_len, kv_dim] f32.
-    pub data: hip_ffi::safe::DeviceBuffer<f32>,
+    /// Buffer no device: [max_seq_len, kv_dim] F32.
+    pub data: AnyTensor,
     pub max_seq_len: usize,
     pub kv_dim: usize,
     /// Linhas válidas (tokens já escritos no cache).
@@ -17,9 +20,13 @@ pub struct GpuKvCache {
 }
 
 impl GpuKvCache {
-    pub fn new(max_seq_len: usize, kv_dim: usize) -> Result<Self, hip_ffi::HipError> {
-        let data = hip_ffi::safe::DeviceBuffer::<f32>::alloc(max_seq_len * kv_dim)?;
-        Ok(Self { data, max_seq_len, kv_dim, current_len: 0 })
+    pub fn new(
+        backend: &Arc<dyn ComputeBackend>,
+        max_seq_len: usize,
+        kv_dim: usize,
+    ) -> Self {
+        let data = backend.alloc_f32(&[max_seq_len, kv_dim]);
+        Self { data, max_seq_len, kv_dim, current_len: 0 }
     }
 
     pub fn seq_len(&self) -> usize { self.current_len }

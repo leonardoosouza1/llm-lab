@@ -126,6 +126,20 @@ export const wsManager = {
         store.modelName = msg.name || store.selectedModelName;
         break;
 
+      case 'esn_state':
+        store.esnLatest = msg;
+        store.esnHistory.push({
+          step:        msg.step,
+          entropy:     msg.entropy,
+          top1_prob:   msg.top1_prob,
+          state_norm:  msg.state_norm,
+          temp_delta:  msg.temp_delta,
+          temperature: msg.temperature,
+        });
+        // Mantém histórico em 512 entradas (uma por token gerado)
+        if (store.esnHistory.length > 512) store.esnHistory.shift();
+        break;
+
       default:
         // console.log('Unhandled WS message type:', msg.type);
         break;

@@ -21,9 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::debug::brain::BrainTrace;
 use crate::model::{QwenModel, ModelCfg};
-use hip_ffi;
 use crate::inference::forward_traced;
 use crate::inference::SamplingParams;
+use compute_core::ComputeBackend;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App State
@@ -37,6 +37,8 @@ pub struct AppState {
     pub model_loading: Arc<std::sync::atomic::AtomicBool>,
     pub models_dir:    Arc<PathBuf>,
     pub frame_tx:      tokio::sync::broadcast::Sender<String>,
+    /// Backend de compute ativo — passado para QwenModel::load() ao carregar.
+    pub backend:       Arc<dyn ComputeBackend>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,10 +134,10 @@ pub async fn health_handler(
         }
     };
 
-    // VRAM livre/total via HIP (falha silenciosa — GPU pode estar ocupada)
-    let (vram_free_gb, vram_total_gb) = match hip_ffi::hip_mem_info() {
-        Ok((free, total)) => (Some(free as f64 / 1e9), Some(total as f64 / 1e9)),
-        Err(_) => (None, None),
+    // VRAM livre/total via backend (retorna None se não disponível)
+    let (vram_free_gb, vram_total_gb) = match state.backend.mem_info() {
+        Some((free, total)) => (Some(free as f64 / 1e9), Some(total as f64 / 1e9)),
+        None => (None, None),
     };
 
     Json(HealthResponse {
@@ -308,6 +310,7 @@ pub async fn load_model_handler(
     let model_loading = state.model_loading.clone();
     let frame_tx     = state.frame_tx.clone();
     let model_name   = req.name.clone();
+    let backend      = state.backend.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -356,7 +359,7 @@ pub async fn load_model_handler(
             }
         };
 
-        match QwenModel::load(&model_path, cfg) {
+        match QwenModel::load(&model_path, cfg, backend) {
             Ok(model) => {
                 *model_arc.lock().await = Some(model);
                 model_ready.store(true, std::sync::atomic::Ordering::Relaxed);

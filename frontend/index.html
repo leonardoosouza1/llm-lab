@@ -358,6 +358,41 @@
           </div>
         </div>
 
+        <!-- ESN Observer (Fase 1) -->
+        <div class="glass-panel" id="esn-panel" style="grid-column:span 2" aria-label="ESN observer state">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🧠</span>
+              ESN Observer
+              <span style="font-size:10px;color:#a78bfa;margin-left:8px;font-family:'JetBrains Mono',monospace;">Fase 1 — Echo State Network</span>
+            </h2>
+            <span id="esn-trained-badge" style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:#6b7280;font-family:'JetBrains Mono',monospace;">readout: zero (observando)</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;padding:12px 0;">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">ENTROPY</div>
+              <div id="esn-entropy" style="font-size:20px;font-weight:700;color:#a855f7;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">TOP-1 PROB</div>
+              <div id="esn-top1" style="font-size:20px;font-weight:700;color:#00ffc8;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STATE NORM</div>
+              <div id="esn-state-norm" style="font-size:20px;font-weight:700;color:#fbbf24;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">TEMP ATUAL</div>
+              <div id="esn-temperature" style="font-size:20px;font-weight:700;color:#f87171;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STEP</div>
+              <div id="esn-step" style="font-size:20px;font-weight:700;color:#c4b5fd;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+          </div>
+          <canvas id="esn-entropy-canvas" height="60" style="width:100%;display:block;margin-top:4px;" aria-label="ESN entropy over time"></canvas>
+        </div>
+
       </div>
     </section>
 

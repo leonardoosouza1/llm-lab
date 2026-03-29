@@ -1,13 +1,13 @@
 // ============================================================================
-// model/mod.rs — Pipeline Nativo Qwen: GPU-only via hipBLAS + kernels HIP
+// model/mod.rs — Pipeline Nativo Qwen: GPU via ComputeBackend
 // ============================================================================
-// Todas as operações em VRAM:
-//   - Pesos: GpuTensorBF16 (u16, metade da VRAM)
-//   - Ativações: DeviceBuffer<f32> (scratchpad pré-alocado, zero-alloc no forward)
-//   - KV-cache: GpuKvCache (DeviceBuffer<f32> pré-alocado, append via kernel)
-//   - Projeções: hipBLAS GEMM (BF16 pesos × F32 ativações → F32 saída)
-//   - Norm/RoPE/SwiGLU/Softmax: kernels HIP customizados (llm_kernels.hip)
-//   - Único to_host(): logits finais [vocab_size] por token gerado
+// Todas as operações no device (GPU ou CPU-backend):
+//   - Pesos: AnyTensor BF16 (metade da memória)
+//   - Ativações: AnyTensor F32 (scratchpad pré-alocado, zero-alloc no forward)
+//   - KV-cache: GpuKvCache (AnyTensor F32 pré-alocado, append via backend)
+//   - Projeções: gemm_bf16_f32 (BF16 pesos × F32 ativações → F32 saída)
+//   - Norm/RoPE/SwiGLU/Softmax: kernels via ComputeBackend
+//   - Único download_f32(): logits finais [vocab_size] por token gerado
 // ============================================================================
 
 mod kv_cache;
@@ -15,12 +15,11 @@ pub(crate) use kv_cache::GpuKvCache;
 #[allow(unused_imports)]
 pub(crate) use kv_cache::BoundedKvCache;
 
-use hip_ffi::{
-    safe::DeviceBuffer,
-    GpuTensorBF16,
-    BlasHandle,
-    GpuKernels,
-    gemm_bf16_f32, sgemm_strided,
+use std::sync::Arc;
+use compute_core::{
+    ComputeBackend, AnyTensor,
+    GemmBf16Params, SgemmParams, EmbedParams, RmsNormParams,
+    RopeParams, SoftmaxParams, SiluMulParams, KvCacheParams, AddBiasParams,
 };
 use half::bf16;
 use std::collections::HashMap;
@@ -30,8 +29,8 @@ use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    #[error("HIP error: {0}")]
-    Hip(#[from] hip_ffi::HipError),
+    #[error("Backend error: {0}")]
+    Backend(#[from] compute_core::BackendError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -130,23 +129,22 @@ impl ModelCfg {
 
 // ── Scratchpad GPU ────────────────────────────────────────────────────────────
 
-/// Buffers GPU pré-alocados para o forward pass. Zero alocação durante geração.
+/// Buffers pré-alocados para o forward pass. Zero alocação durante geração.
 pub struct ForwardScratchpad {
-    pub x:        DeviceBuffer<f32>,  // [max_seq, hidden]
-    pub normed:   DeviceBuffer<f32>,  // [max_seq, hidden]
-    pub q:        DeviceBuffer<f32>,  // [max_seq, q_dim]
-    pub k:        DeviceBuffer<f32>,  // [max_seq, kv_dim]
-    pub v:        DeviceBuffer<f32>,  // [max_seq, kv_dim]
-    pub attn_out: DeviceBuffer<f32>,  // [max_seq, q_dim]
-    pub gate:     DeviceBuffer<f32>,  // [max_seq, inter]
-    pub up:       DeviceBuffer<f32>,  // [max_seq, inter]
-    pub scores:   DeviceBuffer<f32>,  // [n_heads * max_seq, max_seq] — scores de atenção
-    pub logits:   DeviceBuffer<f32>,  // [vocab_size]
-    pub tok_ids:  DeviceBuffer<u32>,  // [max_seq] — IDs de token para embed_lookup
+    pub x:        AnyTensor,  // [max_seq, hidden]
+    pub normed:   AnyTensor,  // [max_seq, hidden]
+    pub q:        AnyTensor,  // [max_seq, q_dim]
+    pub k:        AnyTensor,  // [max_seq, kv_dim]
+    pub v:        AnyTensor,  // [max_seq, kv_dim]
+    pub attn_out: AnyTensor,  // [max_seq, q_dim]
+    pub gate:     AnyTensor,  // [max_seq, inter]
+    pub up:       AnyTensor,  // [max_seq, inter]
+    pub scores:   AnyTensor,  // [n_heads * max_seq, max_seq] — scores de atenção
+    pub logits:   AnyTensor,  // [vocab_size]
 }
 
 impl ForwardScratchpad {
-    fn new(cfg: &ModelCfg) -> Result<Self, hip_ffi::HipError> {
+    fn new(cfg: &ModelCfg, backend: &Arc<dyn ComputeBackend>) -> Self {
         let ms = cfg.max_seq_len;
         let h  = cfg.hidden_size;
         let qd = cfg.num_heads * cfg.head_dim;
@@ -154,42 +152,41 @@ impl ForwardScratchpad {
         let it = cfg.intermediate_size;
         let nh = cfg.num_heads;
         let v  = cfg.vocab_size;
-        Ok(Self {
-            x:        DeviceBuffer::alloc(ms * h)?,
-            normed:   DeviceBuffer::alloc(ms * h)?,
-            q:        DeviceBuffer::alloc(ms * qd)?,
-            k:        DeviceBuffer::alloc(ms * kd)?,
-            v:        DeviceBuffer::alloc(ms * kd)?,
-            attn_out: DeviceBuffer::alloc(ms * qd)?,
-            gate:     DeviceBuffer::alloc(ms * it)?,
-            up:       DeviceBuffer::alloc(ms * it)?,
-            scores:   DeviceBuffer::alloc(nh * ms * ms)?,
-            logits:   DeviceBuffer::alloc(v)?,
-            tok_ids:  DeviceBuffer::alloc(ms)?,
-        })
+        Self {
+            x:        backend.alloc_f32(&[ms, h]),
+            normed:   backend.alloc_f32(&[ms, h]),
+            q:        backend.alloc_f32(&[ms, qd]),
+            k:        backend.alloc_f32(&[ms, kd]),
+            v:        backend.alloc_f32(&[ms, kd]),
+            attn_out: backend.alloc_f32(&[ms, qd]),
+            gate:     backend.alloc_f32(&[ms, it]),
+            up:       backend.alloc_f32(&[ms, it]),
+            scores:   backend.alloc_f32(&[nh * ms, ms]),
+            logits:   backend.alloc_f32(&[v]),
+        }
     }
 }
 
 // ── Camada Transformer ────────────────────────────────────────────────────────
 
-/// Pesos e estado de uma camada Qwen — tudo em GPU.
+/// Pesos e estado de uma camada Qwen — tensores no device via AnyTensor.
 pub struct QwenLayer {
-    // Pesos matriciais: BF16 em GPU (metade da VRAM vs F32)
-    pub wq:    GpuTensorBF16,
-    pub wk:    GpuTensorBF16,
-    pub wv:    GpuTensorBF16,
-    pub wo:    GpuTensorBF16,
-    pub wgate: GpuTensorBF16,
-    pub wup:   GpuTensorBF16,
-    pub wdown: GpuTensorBF16,
+    // Pesos matriciais: BF16 no device (metade da VRAM vs F32)
+    pub wq:    AnyTensor,   // BF16
+    pub wk:    AnyTensor,   // BF16
+    pub wv:    AnyTensor,   // BF16
+    pub wo:    AnyTensor,   // BF16
+    pub wgate: AnyTensor,   // BF16
+    pub wup:   AnyTensor,   // BF16
+    pub wdown: AnyTensor,   // BF16
     // Biases opcionais (Qwen2/2.5 têm bias em Q/K/V; Qwen3 não tem)
-    pub q_bias_gpu: Option<DeviceBuffer<f32>>,
-    pub k_bias_gpu: Option<DeviceBuffer<f32>>,
-    pub v_bias_gpu: Option<DeviceBuffer<f32>>,
-    // Norm weights em GPU (pequenos, mas evita round-trip host→device por token)
-    pub input_norm_w_gpu:    DeviceBuffer<f32>,
-    pub post_attn_norm_w_gpu: DeviceBuffer<f32>,
-    // KV-cache em GPU (janela deslizante via copy_to_kv_cache kernel)
+    pub q_bias: Option<AnyTensor>,  // F32 opcional
+    pub k_bias: Option<AnyTensor>,  // F32 opcional
+    pub v_bias: Option<AnyTensor>,  // F32 opcional
+    // Norm weights no device (pequenos, mas evita round-trip host→device por token)
+    pub input_norm_w:    AnyTensor, // F32
+    pub post_attn_norm_w: AnyTensor, // F32
+    // KV-cache no device (janela deslizante via copy_to_kv_cache)
     pub kv_k: GpuKvCache,
     pub kv_v: GpuKvCache,
 }
@@ -197,24 +194,22 @@ pub struct QwenLayer {
 // ── Modelo completo ───────────────────────────────────────────────────────────
 
 pub struct QwenModel {
-    pub embed:   GpuTensorBF16,  // [vocab, hidden]
+    pub embed:   AnyTensor,     // BF16 [vocab, hidden]
     pub layers:  Vec<QwenLayer>,
-    pub norm_w_gpu: DeviceBuffer<f32>,  // [hidden]
-    pub lm_head: GpuTensorBF16,  // [vocab, hidden]
+    pub norm_w:  AnyTensor,     // F32 [hidden]
+    pub lm_head: AnyTensor,     // BF16 [vocab, hidden]
     pub cfg:     ModelCfg,
-    /// Bytes em VRAM: pesos BF16 (2 bytes/elem) + scratchpad + KV-cache (4 bytes/elem).
+    /// Bytes estimados no device: pesos BF16 (2 bytes/elem) + scratchpad + KV-cache.
     pub vram_bytes: usize,
-    // Contexto GPU
-    pub blas:    BlasHandle,
-    pub kernels: GpuKernels,
+    pub backend: Arc<dyn ComputeBackend>,
     pub scratch: ForwardScratchpad,
 }
 
 impl QwenModel {
     /// Carrega pesos do diretório. Suporta single-shard e multi-shard.
-    pub fn load(model_dir: &Path, cfg: ModelCfg) -> ModelResult<Self> {
+    pub fn load(model_dir: &Path, cfg: ModelCfg, backend: Arc<dyn ComputeBackend>) -> ModelResult<Self> {
         log::info!(
-            "⏳ Carregando Qwen GPU: {} camadas, hidden={}, vocab={}",
+            "⏳ Carregando Qwen: {} camadas, hidden={}, vocab={}",
             cfg.num_layers, cfg.hidden_size, cfg.vocab_size
         );
 
@@ -280,14 +275,14 @@ impl QwenModel {
             read_bf16_f32(mmap, name)
         };
 
-        // Envia BF16 cru para GPU
-        let gpu = |name: &str| -> ModelResult<GpuTensorBF16> {
+        // Faz upload BF16 cru para o device via backend
+        let gpu = |name: &str| -> ModelResult<AnyTensor> {
             let (bits, shape) = load_raw(name)?;
-            Ok(GpuTensorBF16::from_bf16_bits(&bits, &shape)?)
+            Ok(backend.upload_bf16(&bits, &shape))
         };
-        // Envia vetor f32 para GPU
-        let gpu_f32 = |data: &[f32]| -> ModelResult<DeviceBuffer<f32>> {
-            Ok(DeviceBuffer::from_slice(data)?)
+        // Faz upload F32 para o device via backend
+        let gpu_f32 = |data: &[f32]| -> AnyTensor {
+            backend.upload_f32(data, &[data.len()])
         };
 
         // ── Embedding ────────────────────────────────────────────────────────
@@ -318,18 +313,24 @@ impl QwenModel {
                 wgate: gpu(&format!("{}.mlp.gate_proj.weight", p))?,
                 wup:   gpu(&format!("{}.mlp.up_proj.weight", p))?,
                 wdown: gpu(&format!("{}.mlp.down_proj.weight", p))?,
-                q_bias_gpu: if tensor_exists(&qbn) { Some(gpu_f32(&load_f32(&qbn)?.0)?) } else { None },
-                k_bias_gpu: if tensor_exists(&kbn) { Some(gpu_f32(&load_f32(&kbn)?.0)?) } else { None },
-                v_bias_gpu: if tensor_exists(&vbn) { Some(gpu_f32(&load_f32(&vbn)?.0)?) } else { None },
-                input_norm_w_gpu:    gpu_f32(&in_w)?,
-                post_attn_norm_w_gpu: gpu_f32(&pa_w)?,
-                kv_k: GpuKvCache::new(max_seq, kv_dim)?,
-                kv_v: GpuKvCache::new(max_seq, kv_dim)?,
+                q_bias: if tensor_exists(&qbn) {
+                    Some(gpu_f32(&load_f32(&qbn)?.0))
+                } else { None },
+                k_bias: if tensor_exists(&kbn) {
+                    Some(gpu_f32(&load_f32(&kbn)?.0))
+                } else { None },
+                v_bias: if tensor_exists(&vbn) {
+                    Some(gpu_f32(&load_f32(&vbn)?.0))
+                } else { None },
+                input_norm_w:    gpu_f32(&in_w),
+                post_attn_norm_w: gpu_f32(&pa_w),
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim),
             });
         }
 
         let (nw, _) = load_f32("model.norm.weight")?;
-        let norm_w_gpu = gpu_f32(&nw)?;
+        let norm_w = gpu_f32(&nw);
 
         let lm_head = if tensor_exists("lm_head.weight") {
             gpu("lm_head.weight")?
@@ -338,26 +339,25 @@ impl QwenModel {
             gpu("model.embed_tokens.weight")?
         };
 
-        // ── VRAM contabil ────────────────────────────────────────────────────
-        let bf16_bytes = |t: &GpuTensorBF16| t.shape.iter().product::<usize>() * 2;
-        let f32_bytes  = |t: &DeviceBuffer<f32>| t.len() * 4;
+        // ── Contabilidade de VRAM/memória ────────────────────────────────────
+        // Estimativa: BF16 = 2 bytes/elem, F32 = 4 bytes/elem
+        let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
+        let f32_bytes  = |t: &AnyTensor| t.numel() * 4;
 
         let mut vram_bytes = bf16_bytes(&embed) + bf16_bytes(&lm_head);
         for l in &layers {
             vram_bytes += bf16_bytes(&l.wq) + bf16_bytes(&l.wk) + bf16_bytes(&l.wv)
                         + bf16_bytes(&l.wo) + bf16_bytes(&l.wgate)
                         + bf16_bytes(&l.wup) + bf16_bytes(&l.wdown);
-            vram_bytes += f32_bytes(&l.input_norm_w_gpu) + f32_bytes(&l.post_attn_norm_w_gpu);
-            vram_bytes += l.kv_k.data.len() * 4 + l.kv_v.data.len() * 4;
+            vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
+            vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
         }
 
-        log::info!("✅ Qwen carregado — VRAM: {:.2} GB", vram_bytes as f64 / 1e9);
+        log::info!("✅ Qwen carregado — memória estimada: {:.2} GB", vram_bytes as f64 / 1e9);
 
-        let blas   = BlasHandle::new()?;
-        let kernels = GpuKernels::new()?;
-        let scratch = ForwardScratchpad::new(&cfg)?;
+        let scratch = ForwardScratchpad::new(&cfg, &backend);
 
-        Ok(Self { embed, layers, norm_w_gpu, lm_head, cfg, vram_bytes, blas, kernels, scratch })
+        Ok(Self { embed, layers, norm_w, lm_head, cfg, vram_bytes, backend, scratch })
     }
 
     pub fn reset_cache(&mut self) {
@@ -367,198 +367,277 @@ impl QwenModel {
         }
     }
 
-    /// Forward pass GPU-only.
-    /// Único to_host(): logits finais [vocab_size] → CPU para sampling.
+    /// Forward pass via ComputeBackend.
+    /// Único download_f32(): logits finais [vocab_size] → CPU para sampling.
     pub fn forward(&mut self, token_ids: &[u32]) -> ModelResult<Vec<f32>> {
-        let n  = token_ids.len() as i32;
-        let h  = self.cfg.hidden_size as i32;
-        let nh = self.cfg.num_heads as i32;
-        let nk = self.cfg.num_kv_heads as i32;
-        let hd = self.cfg.head_dim as i32;
-        let qd = nh * hd;   // q_dim
-        let kd = nk * hd;   // kv_dim
-        let it = self.cfg.intermediate_size as i32;
-        let eps = self.cfg.rms_eps;
+        let n    = token_ids.len();
+        let h    = self.cfg.hidden_size;
+        let nh   = self.cfg.num_heads;
+        let nk   = self.cfg.num_kv_heads;
+        let hd   = self.cfg.head_dim;
+        let qd   = nh * hd;   // q_dim
+        let kd   = nk * hd;   // kv_dim
+        let it   = self.cfg.intermediate_size;
+        let eps  = self.cfg.rms_eps;
         let theta = self.cfg.rope_theta;
         let scale = 1.0_f32 / (hd as f32).sqrt();
-        let vocab = self.cfg.vocab_size as i32;
+        let vocab = self.cfg.vocab_size;
 
-        // Upload token IDs para GPU
-        unsafe { hip_ffi::safe::hip_h2d(self.scratch.tok_ids.as_mut_ptr(), token_ids)?; }
-
-        // Embedding lookup: BF16 embed → f32 x [n, h]
-        unsafe { self.kernels.embed_lookup(
-            self.embed.dev_ptr(),
-            self.scratch.tok_ids.as_ptr(),
-            self.scratch.x.as_mut_ptr(),
-            n, h,
-        )?; }
+        // Embedding lookup: BF16 embed → F32 x [n, h]
+        self.backend.embed_lookup(&EmbedParams {
+            token_ids,
+            vocab: &self.embed,
+            out: &self.scratch.x,
+            n_tokens: n,
+            hidden_size: h,
+        })?;
 
         for layer in &mut self.layers {
             // ── Input RMSNorm ─────────────────────────────────────────────────
-            unsafe { self.kernels.rms_norm(
-                self.scratch.normed.as_mut_ptr(),
-                self.scratch.x.as_ptr(),
-                layer.input_norm_w_gpu.as_ptr(),
-                n, h, eps,
-            )?; }
+            self.backend.rms_norm(&RmsNormParams {
+                input:  &self.scratch.x,
+                weight: &layer.input_norm_w,
+                output: &self.scratch.normed,
+                n_tokens: n,
+                hidden_size: h,
+                eps,
+            })?;
 
-            // ── Q, K, V projections (hipBLAS BF16×F32) ───────────────────────
-            gemm_bf16_f32(&self.blas, n, qd, h, 1.0, 0.0,
-                self.scratch.normed.as_ptr(), layer.wq.dev_ptr(),
-                self.scratch.q.as_mut_ptr())?;
+            // ── Q, K, V projections (BF16 pesos × F32 ativações → F32) ────────
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: qd, k: h,
+                alpha: 1.0, beta: 0.0,
+                a: &self.scratch.normed, a_offset: 0,
+                b: &layer.wq,
+                c: &self.scratch.q,
+            })?;
 
-            gemm_bf16_f32(&self.blas, n, kd, h, 1.0, 0.0,
-                self.scratch.normed.as_ptr(), layer.wk.dev_ptr(),
-                self.scratch.k.as_mut_ptr())?;
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: kd, k: h,
+                alpha: 1.0, beta: 0.0,
+                a: &self.scratch.normed, a_offset: 0,
+                b: &layer.wk,
+                c: &self.scratch.k,
+            })?;
 
-            gemm_bf16_f32(&self.blas, n, kd, h, 1.0, 0.0,
-                self.scratch.normed.as_ptr(), layer.wv.dev_ptr(),
-                self.scratch.v.as_mut_ptr())?;
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: kd, k: h,
+                alpha: 1.0, beta: 0.0,
+                a: &self.scratch.normed, a_offset: 0,
+                b: &layer.wv,
+                c: &self.scratch.v,
+            })?;
 
             // Biases opcionais (Qwen2/2.5)
-            if let Some(ref b) = layer.q_bias_gpu {
-                unsafe { self.kernels.add_bias_inplace(self.scratch.q.as_mut_ptr(), b.as_ptr(), n, qd)?; }
+            if let Some(ref bias) = layer.q_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.q,
+                    bias,
+                    n_tokens: n,
+                    dim: qd,
+                })?;
             }
-            if let Some(ref b) = layer.k_bias_gpu {
-                unsafe { self.kernels.add_bias_inplace(self.scratch.k.as_mut_ptr(), b.as_ptr(), n, kd)?; }
+            if let Some(ref bias) = layer.k_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.k,
+                    bias,
+                    n_tokens: n,
+                    dim: kd,
+                })?;
             }
-            if let Some(ref b) = layer.v_bias_gpu {
-                unsafe { self.kernels.add_bias_inplace(self.scratch.v.as_mut_ptr(), b.as_ptr(), n, kd)?; }
+            if let Some(ref bias) = layer.v_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.v,
+                    bias,
+                    n_tokens: n,
+                    dim: kd,
+                })?;
             }
 
             // ── RoPE (in-place) ───────────────────────────────────────────────
-            let pos_start = layer.kv_k.current_len as i32;
-            unsafe {
-                self.kernels.rope_inplace(self.scratch.q.as_mut_ptr(), n, nh, hd, pos_start, theta)?;
-                self.kernels.rope_inplace(self.scratch.k.as_mut_ptr(), n, nk, hd, pos_start, theta)?;
-            }
+            let pos_start = layer.kv_k.current_len;
+            self.backend.rope_inplace(&RopeParams {
+                tensor: &self.scratch.q,
+                pos_offset: pos_start,
+                n_tokens: n,
+                n_heads: nh,
+                head_dim: hd,
+                theta,
+            })?;
+            self.backend.rope_inplace(&RopeParams {
+                tensor: &self.scratch.k,
+                pos_offset: pos_start,
+                n_tokens: n,
+                n_heads: nk,
+                head_dim: hd,
+                theta,
+            })?;
 
-            // ── Append K, V ao KV-cache GPU ───────────────────────────────────
-            unsafe {
-                self.kernels.copy_to_kv_cache(
-                    layer.kv_k.data.as_mut_ptr(),
-                    self.scratch.k.as_ptr(),
-                    n, kd, pos_start,
-                )?;
-                self.kernels.copy_to_kv_cache(
-                    layer.kv_v.data.as_mut_ptr(),
-                    self.scratch.v.as_ptr(),
-                    n, kd, pos_start,
-                )?;
-            }
-            layer.kv_k.current_len += n as usize;
-            layer.kv_v.current_len += n as usize;
-            let seq = layer.kv_k.current_len as i32;
+            // ── Append K, V ao KV-cache ───────────────────────────────────────
+            self.backend.copy_to_kv_cache(&KvCacheParams {
+                cache:        &layer.kv_k.data,
+                new_kv:       &self.scratch.k,
+                insert_pos:   pos_start,
+                n_new_tokens: n,
+                kv_dim:       kd,
+                max_seq:      self.cfg.max_seq_len,
+            })?;
+            layer.kv_k.current_len += n;
+
+            self.backend.copy_to_kv_cache(&KvCacheParams {
+                cache:        &layer.kv_v.data,
+                new_kv:       &self.scratch.v,
+                insert_pos:   pos_start,
+                n_new_tokens: n,
+                kv_dim:       kd,
+                max_seq:      self.cfg.max_seq_len,
+            })?;
+            layer.kv_v.current_len += n;
+
+            let seq = layer.kv_k.current_len;
 
             // ── Attention: Q × K^T → softmax → × V ───────────────────────────
-            // Processa cabeçote por cabeçote via hipBLAS GEMM com stride.
+            // Processa cabeçote por cabeçote via sgemm com offsets.
             // K e V estão em [seq, kv_dim] com stride kv_dim entre tokens.
             //
-            // Para cabeçote h: Q_h = q[*, h*hd..(h+1)*hd], lda = qd
-            //                  K_h = kv_k[*, kv_h*hd..(kv_h+1)*hd], lda = kd
+            // Para cabeçote hi:
+            //   Q_h offset: hi * hd  (stride qd entre tokens)
+            //   K_h offset: kv_h * hd (stride kd entre tokens, no cache)
+            //   scores offset: hi * n * seq
             //
-            // scores_h[n, seq] = Q_h[n, hd] × K_h^T[hd, seq]
-            // Em col-major: scores^T[seq, n] = K_h[seq, hd]×Q_h^T[hd, n]
-            //   sgemm_strided(OP_N=K, OP_T=Q_h, M=seq, N=n, K=hd, lda=kd, ldb=qd, ldc=seq)
-            //   → stores in column-major, reads as row-major scores[n, seq] ✓
+            // scores_h[n, seq] = scale × Q_h × K_h^T  — row-major
+            // C[qi*seq + ki] = scale × Q_h[qi, :] · K_h[ki, :]
+            // Kernel row-major: M=n (queries), N=seq (keys), K=hd
+            //   A = Q_h[n, hd]:   trans_a=false, a_offset=hi*hd, lda=qd
+            //   B = K_h[seq, hd]: trans_b=true,  b_offset=kv_h*hd, ldb=kd
+            //   C = scores[n, seq]: c_offset=hi*n*seq, ldc=seq
+            for hi in 0..nh {
+                let kv_h = hi * nk / nh;
 
-            let kv_k_ptr = layer.kv_k.data.as_ptr();
-            let kv_v_ptr = layer.kv_v.data.as_ptr();
+                self.backend.sgemm(&SgemmParams {
+                    trans_a: false,
+                    trans_b: true,
+                    m: n, n: seq, k: hd,
+                    alpha: scale, beta: 0.0,
+                    a: &self.scratch.q,
+                    lda: qd,
+                    a_offset: hi * hd,
+                    b: &layer.kv_k.data,
+                    ldb: kd,
+                    b_offset: kv_h * hd,
+                    c: &self.scratch.scores,
+                    ldc: seq,
+                    c_offset: hi * n * seq,
+                })?;
 
-            for hi in 0..(nh as usize) {
-                let kv_h = hi * (nk as usize) / (nh as usize);
+                // Softmax row-wise: cada query normaliza sobre seq keys
+                self.backend.softmax_rows(&SoftmaxParams {
+                    scores: &self.scratch.scores,
+                    offset_elems: hi * n * seq,
+                    n_rows: n,
+                    row_len: seq,
+                })?;
 
-                let q_h  = unsafe { self.scratch.q.as_ptr().add(hi * hd as usize) };
-                let k_h  = unsafe { kv_k_ptr.add(kv_h * hd as usize) };
-                let v_h  = unsafe { kv_v_ptr.add(kv_h * hd as usize) };
-                // scores_h buffer: offset by head
-                let sc_h = unsafe { self.scratch.scores.as_mut_ptr()
-                                        .add(hi * (n as usize) * (seq as usize)) };
-                let out_h = unsafe { self.scratch.attn_out.as_mut_ptr()
-                                         .add(hi * hd as usize) };
-
-                // scores_h[n, seq] = scale × Q_h × K_h^T
-                // col-major: [seq, n] = K_h[seq, hd](no T) × Q_h^T[hd, n] (T)
-                sgemm_strided(&self.blas,
-                    false, true,       // transA=K_h(no T in row-major), transB=Q_h(T)
-                    seq, n, hd,        // M=seq, N=n, K=hd
-                    scale, 0.0,
-                    k_h, kd,           // K_h ptr, lda=kd (stride between K rows)
-                    q_h, qd,           // Q_h ptr, ldb=qd (stride between Q rows)
-                    sc_h, seq,         // output, ldc=seq
-                )?;
-
-                // Softmax over seq dimension (rows of scores_h[n, seq])
-                unsafe { self.kernels.softmax_rows(sc_h, n, seq)?; }
-
-                // out_h[n, hd] = scores_h[n, seq] × V_h[seq, hd]
-                // col-major: [hd, n] = V_h^T[hd, seq] × scores_h^T[seq, n]
-                sgemm_strided(&self.blas,
-                    true, false,       // transA=V_h(T), transB=scores(no T)
-                    hd, n, seq,        // M=hd, N=n, K=seq
-                    1.0, 0.0,
-                    v_h, kd,           // V_h ptr, lda=kd
-                    sc_h, seq,         // scores ptr, ldb=seq
-                    out_h, qd,         // output into attn_out[n, hi*hd..], stride=qd
-                )?;
+                // out_h[n, hd] = attn_weights[n, seq] × V_h[seq, hd]  — row-major
+                // C[qi*qd + hi*hd + d] = Σ_ki attn[qi,ki] × V_h[ki, d]
+                // A = attn[n, seq]: trans_a=false, a_offset=hi*n*seq, lda=seq
+                // B = V_h[seq, hd]: trans_b=false, b_offset=kv_h*hd, ldb=kd
+                // C = attn_out[n, qd]: c_offset=hi*hd, ldc=qd
+                self.backend.sgemm(&SgemmParams {
+                    trans_a: false,
+                    trans_b: false,
+                    m: n, n: hd, k: seq,
+                    alpha: 1.0, beta: 0.0,
+                    a: &self.scratch.scores,
+                    lda: seq,
+                    a_offset: hi * n * seq,
+                    b: &layer.kv_v.data,
+                    ldb: kd,
+                    b_offset: kv_h * hd,
+                    c: &self.scratch.attn_out,
+                    ldc: qd,
+                    c_offset: hi * hd,
+                })?;
             }
 
             // ── Output projection: attn_out × wo^T → x (residual) ─────────────
-            // x = x + normed_proj (onde normed_proj = attn_out × wo^T)
-            // Usa beta=1.0 para acumular direto em x
-            gemm_bf16_f32(&self.blas, n, h, qd, 1.0, 1.0,
-                self.scratch.attn_out.as_ptr(), layer.wo.dev_ptr(),
-                self.scratch.x.as_mut_ptr())?;
+            // x = x + attn_out × wo^T  (beta=1.0 para acumular em x)
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: h, k: qd,
+                alpha: 1.0, beta: 1.0,
+                a: &self.scratch.attn_out, a_offset: 0,
+                b: &layer.wo,
+                c: &self.scratch.x,
+            })?;
 
             // ── Post-attention RMSNorm ────────────────────────────────────────
-            unsafe { self.kernels.rms_norm(
-                self.scratch.normed.as_mut_ptr(),
-                self.scratch.x.as_ptr(),
-                layer.post_attn_norm_w_gpu.as_ptr(),
-                n, h, eps,
-            )?; }
+            self.backend.rms_norm(&RmsNormParams {
+                input:  &self.scratch.x,
+                weight: &layer.post_attn_norm_w,
+                output: &self.scratch.normed,
+                n_tokens: n,
+                hidden_size: h,
+                eps,
+            })?;
 
-            // ── MLP: gate_proj, up_proj ──────────────────────────────────────
-            gemm_bf16_f32(&self.blas, n, it, h, 1.0, 0.0,
-                self.scratch.normed.as_ptr(), layer.wgate.dev_ptr(),
-                self.scratch.gate.as_mut_ptr())?;
+            // ── MLP: gate_proj, up_proj ───────────────────────────────────────
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: it, k: h,
+                alpha: 1.0, beta: 0.0,
+                a: &self.scratch.normed, a_offset: 0,
+                b: &layer.wgate,
+                c: &self.scratch.gate,
+            })?;
 
-            gemm_bf16_f32(&self.blas, n, it, h, 1.0, 0.0,
-                self.scratch.normed.as_ptr(), layer.wup.dev_ptr(),
-                self.scratch.up.as_mut_ptr())?;
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: it, k: h,
+                alpha: 1.0, beta: 0.0,
+                a: &self.scratch.normed, a_offset: 0,
+                b: &layer.wup,
+                c: &self.scratch.up,
+            })?;
 
             // SwiGLU: gate = silu(gate) * up (in-place em gate)
-            unsafe { self.kernels.silu_mul_inplace(
-                self.scratch.gate.as_mut_ptr(),
-                self.scratch.up.as_ptr(),
-                n, it,
-            )?; }
+            self.backend.silu_mul_inplace(&SiluMulParams {
+                gate: &self.scratch.gate,
+                up:   &self.scratch.up,
+                n_tokens: n,
+                intermediate_size: it,
+            })?;
 
             // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
-            gemm_bf16_f32(&self.blas, n, h, it, 1.0, 1.0,
-                self.scratch.gate.as_ptr(), layer.wdown.dev_ptr(),
-                self.scratch.x.as_mut_ptr())?;
+            self.backend.gemm_bf16_f32(&GemmBf16Params {
+                m: n, n: h, k: it,
+                alpha: 1.0, beta: 1.0,
+                a: &self.scratch.gate, a_offset: 0,
+                b: &layer.wdown,
+                c: &self.scratch.x,
+            })?;
         }
 
         // ── Final RMSNorm ─────────────────────────────────────────────────────
-        unsafe { self.kernels.rms_norm(
-            self.scratch.normed.as_mut_ptr(),
-            self.scratch.x.as_ptr(),
-            self.norm_w_gpu.as_ptr(),
-            n, h, eps,
-        )?; }
+        self.backend.rms_norm(&RmsNormParams {
+            input:  &self.scratch.x,
+            weight: &self.norm_w,
+            output: &self.scratch.normed,
+            n_tokens: n,
+            hidden_size: h,
+            eps,
+        })?;
 
         // ── lm_head (apenas o último token) ──────────────────────────────────
-        // Envia só o último token: normed[(n-1)*h .. n*h]
-        let last_normed = unsafe { self.scratch.normed.as_ptr().add((n as usize - 1) * h as usize) };
-        gemm_bf16_f32(&self.blas, 1, vocab, h, 1.0, 0.0,
-            last_normed, self.lm_head.dev_ptr(),
-            self.scratch.logits.as_mut_ptr())?;
+        // a_offset aponta para o último token: (n-1) * hidden_size
+        self.backend.gemm_bf16_f32(&GemmBf16Params {
+            m: 1, n: vocab, k: h,
+            alpha: 1.0, beta: 0.0,
+            a: &self.scratch.normed,
+            a_offset: (n - 1) * h,
+            b: &self.lm_head,
+            c: &self.scratch.logits,
+        })?;
 
         // ── Download logits: único to_host() de todo o forward ───────────────
-        let mut logits = vec![0.0f32; vocab as usize];
-        unsafe { hip_ffi::safe::hip_d2h(&mut logits, self.scratch.logits.as_ptr())?; }
+        let logits = self.backend.download_f32(&self.scratch.logits);
         Ok(logits)
     }
 }
@@ -611,7 +690,7 @@ fn shard_tensor_bytes<'a>(mmap: &'a memmap2::Mmap, name: &str) -> ModelResult<(&
 }
 
 // ── CPU fallbacks (mantidos para referência e testes) ─────────────────────────
-// Usadas apenas em testes unitários — não chamadas durante inferência GPU.
+// Usadas apenas em testes unitários — não chamadas durante inferência.
 
 #[allow(dead_code)]
 pub(crate) fn apply_rope(

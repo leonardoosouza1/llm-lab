@@ -2,6 +2,9 @@
 members = [
     "iara-engine",
     "hip-ffi",
+    "compute-core",
+    "rocm-backend",
+    "opencl-backend",
 ]
 resolver = "2"
 

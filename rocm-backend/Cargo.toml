@@ -1,0 +1,10 @@
+[package]
+name = "rocm-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Backend ROCm/HIP para compute-core — AMD RDNA2 (GFX1032)"
+
+[dependencies]
+compute-core = { path = "../compute-core" }
+hip-ffi      = { path = "../hip-ffi" }
+thiserror    = "1"
