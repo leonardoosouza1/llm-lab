@@ -3,18 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="IARA LLM Observability Dashboard — Neural Lab Interface">
+  <meta name="description" content="IARA LLM Observability Dashboard — Amazonian Bio-Tech Interface">
   <!-- Open Graph / Facebook -->
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://iara.ai/">
   <meta property="og:title" content="IARA — LLM Observability Dashboard">
-  <meta property="og:description" content="Cinematic neural observability interface with glassmorphism design.">
+  <meta property="og:description" content="Amazonian Bio-Tech interface with dynamic, layered design.">
   <meta property="og:image" content="src/assets/mockup.jpeg">
   <title>IARA — LLM Observability</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -22,14 +21,15 @@
 <div id="app">
 
   <!-- ═══════════════════════════════════════════════════
-       TOP BAR
+       SIDEBAR
   ════════════════════════════════════════════════════ -->
-  <header id="topbar" role="banner">
-
-    <div class="logo" aria-label="IARA Neural Engine">
-      🧬 IARA
+  <aside id="sidebar" role="navigation" aria-label="Main navigation and status">
+    <div class="sidebar-header">
+      <div class="logo" aria-label="IARA Neural Engine">
+        🧬 IARA
+      </div>
     </div>
-
+    
     <nav id="tab-nav" role="tablist" aria-label="Dashboard panels">
       <button
         class="tab-btn tab-btn--active"
@@ -110,8 +110,7 @@
         <span id="topbar-tps" class="status-value" aria-label="Tokens per second">—</span>
       </div>
     </div>
-
-  </header>
+  </aside>
 
   <!-- ═══════════════════════════════════════════════════
        MAIN CONTENT

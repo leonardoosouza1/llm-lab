@@ -13,13 +13,15 @@ mod model;
 mod storage;
 mod tokenizer;
 mod transport;
+mod telemetry; // Adiciona o módulo de telemetria
+
 
 // ── Módulos exploratórios (pesquisa, não integrados ao pipeline) ──────────────
 // Compilados apenas em modo experimental para não poluir build de produção.
 #[cfg(feature = "experimental")]
 mod experimental;
 
-use crate::api::handlers::{AppState, generate_handler, health_handler, debug_trace_handler,
+use crate::api::handlers::{AppState, generate_handler, debug_trace_handler,
                             models_handler, load_model_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
@@ -32,6 +34,8 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use axum::{routing::{get, post}, Router};
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::services::ServeDir;
+use sysinfo::{System, SystemExt}; // Importa System e SystemExt
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,8 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Initialize sysinfo and create telemetry router
+    let mut sys = System::new_all();
+    sys.refresh_all(); // Initial refresh
+    let shared_sys_info = Arc::new(Mutex::new(sys));
+    let telemetry_routes = telemetry::telemetry_router(shared_sys_info.clone());
+
     let app = Router::new()
-        .route("/health",                 get(health_handler))
+        .merge(telemetry_routes) // Merge telemetry routes
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
         .route("/api/generate",           post(generate_handler))

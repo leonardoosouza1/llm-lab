@@ -114,6 +114,11 @@ def architect_pipeline(user_prompt):
             inner_content = inner_content.split("```json")[1].split("```")[0].strip()
         elif "```" in inner_content:
             inner_content = inner_content.split("```")[1].split("```")[0].strip()
+        else:
+            start = inner_content.find('{')
+            end = inner_content.rfind('}')
+            if start != -1 and end != -1:
+                inner_content = inner_content[start:end+1]
             
         data = json.loads(inner_content)
         print(f"DEBUG: Status retornado: {data.get('status')}")
