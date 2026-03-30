@@ -9,3 +9,5 @@ Cargo.lock
 models/*
 target/*
 **/__pycache__
+.agent/events
+**/*.db
