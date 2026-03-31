@@ -14,4 +14,4 @@
 
 pub mod esn;
 
-pub use esn::{EsnObserver, EsnTelemetry};
+pub use esn::EsnObserver;

@@ -139,6 +139,10 @@ pub fn hip_module_load(path: &std::path::Path) -> Result<hipModule_t, HipError> 
     Ok(m)
 }
 
+pub fn hip_stream_synchronize(stream: hipStream_t) -> Result<(), HipError> {
+    unsafe { hip_check(hipStreamSynchronize(stream)) }
+}
+
 pub fn hip_module_load_data(image: &[u8]) -> Result<hipModule_t, HipError> {
     let mut m: hipModule_t = ptr::null_mut();
     unsafe { hip_check(hipModuleLoadData(&mut m, image.as_ptr() as *const _))? };

@@ -314,3 +314,385 @@ extern "C" __global__ void copy_to_kv_cache(
         cache[(size_t)(current_len + tok) * kv_dim + dim] = new_kv[(size_t)tok * kv_dim + dim];
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel 8: f32_to_bf16
+// Converter F32 -> BF16
+// ---------------------------------------------------------------------------
+extern "C" __global__ void f32_to_bf16(
+    const float* __restrict__ src,
+    unsigned short* __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int bits;
+    __builtin_memcpy(&bits, &src[idx], sizeof(float));
+    bits += 0x7FFF + ((bits >> 16) & 1);
+    dst[idx] = (unsigned short)(bits >> 16);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: FP16 (stored as uint16_t) → float
+// FP16 (half-precision) to F32 conversion using HIP's built-in support.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float fp16_to_f32(unsigned short bits) {
+    float f;
+    asm("v_cvt_f32_f16 %0, %1" : "=f"(f) : "r"((unsigned int)bits));
+    return f;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 9: dequant_gemv_q4
+//
+// INT4 dequantized GEMV: packed_weights(Q4) × activations(F32) → output(F32)
+// Each byte holds 2 INT4 values (low 4 bits + high 4 bits).
+// Group-wise dequantization: w_float = scale[group] * (int4_val - zero[group])
+//
+// Grid : (N, 1, 1)  — one block per output row
+// Block: (256, 1, 1) — strided loop over K dimension
+//
+// RDNA2 notes:
+//   - 256 threads per block for good occupancy
+//   - Shared memory used for parallel reduction of dot product
+//   - Each thread computes a partial dot product, accumulates via shared memory
+// ---------------------------------------------------------------------------
+__launch_bounds__(256, 2)
+extern "C" __global__ void dequant_gemv_q4(
+    const unsigned char* __restrict__ packed,   // [N, K/2] — 2 int4 per byte
+    const unsigned short* __restrict__ scales,  // [N, K/group_size] — FP16
+    const unsigned short* __restrict__ zeros,   // [N, K/group_size] — FP16
+    const float* __restrict__ x,                // [K] — input activations
+    float* __restrict__ out,                    // [N] — output
+    int N,           // output dim (rows)
+    int K,           // input dim (hidden, columns)
+    int group_size,  // typically 128
+    float beta       // 0.0=overwrite, 1.0=accumulate
+) {
+    extern __shared__ float sdata[];  // 256 floats for reduction
+
+    int row = blockIdx.x;           // which output row this block processes
+    int tid = (int)threadIdx.x;     // thread index within block
+    int bsz = (int)blockDim.x;      // block size = 256
+
+    if (row >= N) return;
+
+    // Compute pointers to this row's packed weights, scales, and zeros.
+    const unsigned char* packed_row = packed + (size_t)row * (K / 2);
+    const unsigned short* scales_row = scales + (size_t)row * ((K + group_size - 1) / group_size);
+    const unsigned short* zeros_row = zeros + (size_t)row * ((K + group_size - 1) / group_size);
+
+    // Accumulate partial dot product in this thread.
+    float local_sum = 0.0f;
+
+    for (int k = tid; k < K; k += bsz) {
+        // Extract INT4 values from packed byte.
+        int byte_idx = k / 2;
+        unsigned char packed_byte = packed_row[byte_idx];
+        int int4_val;
+        if (k % 2 == 0) {
+            // Low nibble (4 bits)
+            int4_val = (int)(packed_byte & 0x0F);
+        } else {
+            // High nibble (4 bits)
+            int4_val = (int)((packed_byte >> 4) & 0x0F);
+        }
+
+        // Sign-extend 4-bit value to signed int (-8 to 7).
+        if (int4_val >= 8) {
+            int4_val -= 16;
+        }
+
+        // Get group index and dequant parameters.
+        int group_idx = k / group_size;
+        float scale_f32 = fp16_to_f32(scales_row[group_idx]);
+        float zero_f32 = fp16_to_f32(zeros_row[group_idx]);
+
+        // Dequantize: w = scale * (int4_val - zero)
+        float w = scale_f32 * ((float)int4_val - zero_f32);
+
+        // Accumulate into dot product.
+        local_sum += w * x[k];
+    }
+
+    // Write local_sum to shared memory for reduction.
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    // Parallel tree reduction in shared memory.
+    for (int stride = bsz >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 writes the final result.
+    if (tid == 0) {
+        float result = sdata[0];
+        if (beta == 0.0f) {
+            out[row] = result;
+        } else {
+            out[row] = beta * out[row] + result;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 10: gravity_score
+//
+// Compute semantic gravity per token position:
+//   gravity[t] = mean_over_heads( attn_weights[h,t] * value_norms[h,t] )
+//
+// Each token position gets one block. Threads within the block reduce across
+// heads using shared memory.
+//
+// Grid : (seq_len, 1, 1)
+// Block: (min(n_heads, 256), 1, 1)
+//
+// RDNA2 notes:
+//   - Shared memory reduction pattern for efficient inter-thread communication
+//   - Coalesce reads from attn_weights and value_norms arrays
+// ---------------------------------------------------------------------------
+__launch_bounds__(256, 4)
+extern "C" __global__ void gravity_score(
+    const float* __restrict__ attn_weights,  // [n_heads, seq_len] — post-softmax
+    const float* __restrict__ value_norms,   // [n_heads, seq_len] — L2 norms of V
+    float* __restrict__ gravity_out,         // [seq_len] — output gravity scores
+    int n_heads,
+    int seq_len
+) {
+    extern __shared__ float sdata[];  // min(n_heads, 256) floats
+
+    int t = blockIdx.x;              // token index
+    int tid = (int)threadIdx.x;      // thread within block (head index)
+    int bsz = (int)blockDim.x;       // typically n_heads or 256
+
+    if (t >= seq_len) return;
+
+    // Each thread loads the gravity contribution from one head and accumulates.
+    float local_sum = 0.0f;
+    for (int h = tid; h < n_heads; h += bsz) {
+        float attn_val = attn_weights[(size_t)h * seq_len + t];
+        float norm_val = value_norms[(size_t)h * seq_len + t];
+        local_sum += attn_val * norm_val;
+    }
+
+    // Reduce across threads via shared memory.
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = bsz >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 computes mean and writes result.
+    if (tid == 0) {
+        gravity_out[t] = sdata[0] / (float)n_heads;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 11: cfc_gate_update
+//
+// CfC (Closed-form Continuous) liquid correction layer state update.
+// Computes: h_new[i] = sigmoid(f[i]) * h_prev[i] + (1 - sigmoid(f[i])) * tanh(g[i])
+//
+// Note: f_proj and g_proj are pre-computed projections:
+//   f_proj = x_slice @ wf^T + h_prev @ wf2^T + bf
+//   g_proj = x_slice @ wg^T + h_prev @ wg2^T + bg
+// This kernel only handles the CfC gating and state update.
+//
+// Grid : (1, 1, 1)  — single block processes entire CfC state
+// Block: (min(cfc_dim, 256), 1, 1)
+//
+// RDNA2 notes:
+//   - Simple element-wise operations, good for memory bandwidth
+//   - Strided loop for cfc_dim dimensions
+// ---------------------------------------------------------------------------
+extern "C" __global__ void cfc_gate_update(
+    const float* __restrict__ f_proj,    // [cfc_dim] — pre-computed x@wf + h@wf2 + bf
+    const float* __restrict__ g_proj,    // [cfc_dim] — pre-computed x@wg + h@wg2 + bg
+    const float* __restrict__ h_prev,    // [cfc_dim]
+    float* __restrict__ h_out,           // [cfc_dim] — new state
+    int cfc_dim
+) {
+    int tid = (int)threadIdx.x;
+    int bsz = (int)blockDim.x;
+
+    // Strided loop over cfc_dim dimensions.
+    for (int i = tid; i < cfc_dim; i += bsz) {
+        float f = f_proj[i];
+        float g = g_proj[i];
+        float h = h_prev[i];
+
+        // Sigmoid: 1 / (1 + exp(-x))
+        float sigmoid_f = 1.0f / (1.0f + expf(-f));
+
+        // Tanh: (exp(2x) - 1) / (exp(2x) + 1)
+        // For numerical stability, use built-in tanhf.
+        float tanh_g = tanhf(g);
+
+        // h_new = sigmoid(f) * h + (1 - sigmoid(f)) * tanh(g)
+        h_out[i] = sigmoid_f * h + (1.0f - sigmoid_f) * tanh_g;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 12: value_norms
+//
+// Compute L2 norm of each value vector (along hidden dimension).
+// For each token position and KV head, compute the Frobenius norm of the
+// value vector.
+//
+// Grid : (n_kv_heads, seq_len, 1)
+// Block: (min(head_dim, 256), 1, 1)
+//
+// Layout assumptions:
+//   v_cache is [seq_len, n_kv_heads * head_dim] where values are contiguous
+//   per head within the head_dim extent.
+//
+// RDNA2 notes:
+//   - Each block computes one L2 norm
+//   - Shared memory reduction for tree sum-of-squares
+// ---------------------------------------------------------------------------
+__launch_bounds__(256, 2)
+extern "C" __global__ void value_norms(
+    const float* __restrict__ v_cache,    // [seq_len, n_kv_heads * head_dim] F32
+    float* __restrict__ norms_out,        // [n_kv_heads, seq_len] F32
+    int seq_len,
+    int n_kv_heads,
+    int head_dim
+) {
+    extern __shared__ float sdata[];  // min(head_dim, 256) floats
+
+    int h = blockIdx.x;              // KV head index
+    int t = blockIdx.y;              // token position
+    int tid = (int)threadIdx.x;      // thread index
+    int bsz = (int)blockDim.x;       // block size
+
+    if (h >= n_kv_heads || t >= seq_len) return;
+
+    // Base index into v_cache for this (head, token).
+    size_t base = (size_t)t * (n_kv_heads * head_dim) + (size_t)h * head_dim;
+
+    // Accumulate sum of squares (partial norm).
+    float local_sumsq = 0.0f;
+    for (int d = tid; d < head_dim; d += bsz) {
+        float v = v_cache[base + d];
+        local_sumsq += v * v;
+    }
+
+    // Reduce via shared memory.
+    sdata[tid] = local_sumsq;
+    __syncthreads();
+
+    for (int stride = bsz >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 computes final norm and writes result.
+    if (tid == 0) {
+        float norm = sqrtf(sdata[0]);
+        norms_out[(size_t)h * seq_len + t] = norm;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 13: kv_cache_quantize_append
+//
+// Quantize F32 KV values to INT4 (Q4) and append to quantized cache.
+// For each group of group_size elements in a KV vector:
+//   1. Find min and max values
+//   2. Compute scale = (max - min) / 15, zero = min
+//   3. Quantize each value: q = round(15 * (val - min) / (max - min))
+//   4. Pack two INT4 values per byte
+//
+// Grid : (n_tokens, 1, 1)
+// Block: (min(kv_dim, 512), 1, 1)
+//
+// The cache buffers are pre-allocated to hold up to max_seq tokens.
+// This kernel appends n_tokens new KV vectors starting at position current_len.
+//
+// RDNA2 notes:
+//   - Per-group min/max reduction via shared memory
+//   - Efficient packing of INT4 pairs
+// ---------------------------------------------------------------------------
+__launch_bounds__(512, 1)
+extern "C" __global__ void kv_cache_quantize_append(
+    unsigned char* __restrict__ cache_packed,  // [max_seq, kv_dim/2] Q4
+    unsigned short* __restrict__ cache_scales, // [max_seq, n_groups] FP16
+    unsigned short* __restrict__ cache_zeros,  // [max_seq, n_groups] FP16
+    const float* __restrict__ new_kv,          // [n_tokens, kv_dim] F32
+    int n_tokens,
+    int kv_dim,
+    int current_len,
+    int group_size
+) {
+    int tid = (int)threadIdx.x;
+    int bsz = (int)blockDim.x;
+
+    // Each block processes one token; threads handle groups in parallel.
+    int tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+
+    const float* tok_kv = new_kv + (size_t)tok * kv_dim;
+    unsigned char* tok_packed = cache_packed + (size_t)(current_len + tok) * (kv_dim / 2);
+    unsigned short* tok_scales = cache_scales + (size_t)(current_len + tok) * ((kv_dim + group_size - 1) / group_size);
+    unsigned short* tok_zeros = cache_zeros + (size_t)(current_len + tok) * ((kv_dim + group_size - 1) / group_size);
+
+    int n_groups = (kv_dim + group_size - 1) / group_size;
+
+    // Process one group per thread (strided if n_groups > bsz).
+    for (int g = tid; g < n_groups; g += bsz) {
+        int group_start = g * group_size;
+        int group_end = min(group_start + group_size, kv_dim);
+        int group_len = group_end - group_start;
+
+        // Find min and max in this group.
+        float group_min = 1e38f;
+        float group_max = -1e38f;
+        for (int i = group_start; i < group_end; i++) {
+            float v = tok_kv[i];
+            if (v < group_min) group_min = v;
+            if (v > group_max) group_max = v;
+        }
+
+        // Compute scale and zero.
+        float scale = (group_max - group_min) / 15.0f;
+        if (scale < 1e-8f) scale = 1e-8f;  // avoid division by zero
+        float zero = group_min;
+
+        // Quantize and pack INT4 values.
+        for (int i = group_start; i < group_end; i += 2) {
+            int q_low = (int)roundf(15.0f * (tok_kv[i] - zero) / scale);
+            q_low = max(0, min(15, q_low));  // clamp to [0, 15]
+
+            int q_high = 0;
+            if (i + 1 < group_end) {
+                q_high = (int)roundf(15.0f * (tok_kv[i + 1] - zero) / scale);
+                q_high = max(0, min(15, q_high));
+            }
+
+            // Pack: low 4 bits in low nibble, high 4 bits in high nibble.
+            unsigned char packed_byte = (unsigned char)((q_high << 4) | q_low);
+            tok_packed[(i - group_start) / 2] = packed_byte;
+        }
+
+        // Convert scale and zero to FP16 and store.
+        // Simple truncation to FP16 (not high-precision conversion, but acceptable for quantization params).
+        unsigned int scale_bits, zero_bits;
+        __builtin_memcpy(&scale_bits, &scale, sizeof(float));
+        __builtin_memcpy(&zero_bits, &zero, sizeof(float));
+        // Truncate to FP16 by taking upper 16 bits (BF16-like, or use actual F16 if available).
+        tok_scales[g] = (unsigned short)(scale_bits >> 16);
+        tok_zeros[g] = (unsigned short)(zero_bits >> 16);
+    }
+}

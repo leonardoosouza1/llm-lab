@@ -50,6 +50,8 @@ fn u16_ptr(t: &AnyTensor) -> *const u16 {
 pub struct RocmBackend {
     blas:    hip_ffi::BlasHandle,
     kernels: hip_ffi::GpuKernels,
+    tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
+    act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
 }
 
 // SAFETY: `BlasHandle` and `GpuKernels` both declare `unsafe impl Send + Sync`
@@ -72,7 +74,21 @@ impl RocmBackend {
         let kernels = hip_ffi::GpuKernels::new()
             .map_err(|e| BackendError::NotAvailable(format!("GpuKernels: {e}")))?;
 
-        Ok(Self { blas, kernels })
+        // Pre-allocate a buffer for up to 4096 tokens (max_seq_len) to avoid 
+        // VRAM fragmentation (memory leak footprint) during the generation loop.
+        let tok_buf = hip_ffi::safe::DeviceBuffer::<u32>::alloc(4096)
+            .map_err(|e| BackendError::NotAvailable(format!("HIP alloc: {e}")))?;
+
+        // Pre-allocate BF16 activations buffer for GEMM (max: 4096 seq x 8192 hidden) = 33.5M elems (~67 MB)
+        let act_bf16 = hip_ffi::safe::DeviceBuffer::<u16>::alloc(4096 * 8192)
+            .map_err(|e| BackendError::NotAvailable(format!("HIP alloc act_bf16: {e}")))?;
+
+        Ok(Self { 
+            blas, 
+            kernels, 
+            tok_buf: std::sync::Mutex::new(tok_buf),
+            act_bf16: std::sync::Mutex::new(act_bf16),
+        })
     }
 }
 
@@ -120,6 +136,26 @@ impl ComputeBackend for RocmBackend {
         let b_ptr = u16_ptr(p.b);
         let c_ptr = f32_mut_ptr(p.c);
 
+        let mut act_guard = self.act_bf16.lock().unwrap();
+        let expected_elems = p.m * p.k;
+        if expected_elems > act_guard.len() {
+            return Err(BackendError::Gemm(format!("act_bf16 overflow: {expected_elems} elems")));
+        }
+
+        unsafe {
+             self.kernels.f32_to_bf16(
+                 a_ptr,
+                 act_guard.as_mut_ptr(),
+                 expected_elems as i32
+             ).map_err(|e| BackendError::Gemm(format!("Cast: {e}")))?;
+
+             // Explicitly synchronize current stream (default) to ensure BF16 cast is complete 
+             // before hipblasGemmEx reads from it. This prevents 'Invalid Value' errors
+             // caused by out-of-order data hazards on some RDNA2 drivers.
+             hip_ffi::safe::hip_stream_synchronize(std::ptr::null_mut())
+                 .map_err(|e| BackendError::Gemm(format!("Post-cast sync: {e}")))?;
+        }
+
         hip_ffi::gemm_bf16_f32(
             &self.blas,
             p.m as i32,
@@ -127,7 +163,7 @@ impl ComputeBackend for RocmBackend {
             p.k as i32,
             p.alpha,
             p.beta,
-            a_ptr,
+            act_guard.as_ptr(),
             b_ptr,
             c_ptr,
         )
@@ -161,14 +197,23 @@ impl ComputeBackend for RocmBackend {
     // ── Custom kernels ────────────────────────────────────────────────────────
 
     fn embed_lookup(&self, p: &EmbedParams) -> Result<(), BackendError> {
-        // Upload token IDs (host slice) to a temporary GPU buffer.
-        let tok_buf = DeviceBuffer::<u32>::from_slice(p.token_ids)
-            .map_err(|e| BackendError::Transfer(e.to_string()))?;
+        // Obter lock do buffer pré-alocado
+        let mut buf_guard = self.tok_buf.lock().unwrap();
+
+        if p.token_ids.len() > buf_guard.len() {
+            return Err(BackendError::Transfer("Muitos tokens para tok_buf pre-alocado".into()));
+        }
+
+        // Upload token IDs (host slice) to the pre-allocated GPU buffer.
+        unsafe {
+            hip_ffi::safe::hip_h2d(buf_guard.as_mut_ptr(), p.token_ids)
+                .map_err(|e| BackendError::Transfer(e.to_string()))?;
+        }
 
         unsafe {
             self.kernels.embed_lookup(
                 u16_ptr(p.vocab),
-                tok_buf.as_ptr(),
+                buf_guard.as_ptr(),
                 f32_mut_ptr(p.out),
                 p.n_tokens as i32,
                 p.hidden_size as i32,

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::inference::{GenerationStep, LayerActivationTrace};
+use crate::inference::GenerationStep;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Core Type: BrainTrace

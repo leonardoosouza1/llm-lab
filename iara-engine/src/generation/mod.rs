@@ -17,7 +17,6 @@
 use crate::lnn::EsnObserver;
 use crate::tokenizer;
 use crate::model::QwenModel;
-use crate::model::ModelResult;
 use crate::inference::{SamplingParams, sample_token};
 use tokio::sync::broadcast;
 use serde::Serialize;

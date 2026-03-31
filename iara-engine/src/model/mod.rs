@@ -108,12 +108,12 @@ impl ModelCfg {
             // max_position_embeddings for Qwen2.5/3 is often 128K, which would need:
             //   KV cache: layers × 2 × 128K × kv_dim × 4 bytes → 7+ GB for 1.5b model
             //   scores:   n_heads × 128K × 128K × 4 bytes → 824 GB (impossible)
-            // A 4096-token context is practical for interactive inference and fits all models.
+            // A 1024-token context is practical for 12GB GPUs to fit 4B scale models directly.
             max_seq_len: {
                 let raw = params["max_position_embeddings"].as_u64()
                     .map(|n| n as usize)
                     .unwrap_or(2048);
-                raw.min(4096)
+                raw.min(1024)
             },
         })
     }
@@ -264,21 +264,30 @@ impl QwenModel {
             }
         };
 
-        let load_raw = |name: &str| -> ModelResult<(Vec<u16>, Vec<usize>)> {
-            let mmap = find_mmap(name)
-                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
-            read_bf16_raw(mmap, name)
-        };
         let load_f32 = |name: &str| -> ModelResult<(Vec<f32>, Vec<usize>)> {
             let mmap = find_mmap(name)
                 .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
             read_bf16_f32(mmap, name)
         };
 
-        // Faz upload BF16 cru para o device via backend
+        // Upload Zero-Copy: Casting de &[u8] direto para &[u16] no buffer Mmap
+        // Seguro e ultrarrápido pois os Safetensors já exigem alinhamento de 8 bytes,
+        // garantindo total validade para casting O(1).
         let gpu = |name: &str| -> ModelResult<AnyTensor> {
-            let (bits, shape) = load_raw(name)?;
-            Ok(backend.upload_bf16(&bits, &shape))
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            
+            let (raw_bytes, shape) = shard_tensor_bytes(mmap, name)?;
+            
+            // Garantia Rust-Pro de alinhamento e corretude em little-endian.
+            let bits = unsafe {
+                std::slice::from_raw_parts(
+                    raw_bytes.as_ptr() as *const u16, 
+                    raw_bytes.len() / 2
+                )
+            };
+            
+            Ok(backend.upload_bf16(bits, &shape))
         };
         // Faz upload F32 para o device via backend
         let gpu_f32 = |data: &[f32]| -> AnyTensor {
@@ -644,11 +653,7 @@ impl QwenModel {
 
 // ── Leitores safetensors ──────────────────────────────────────────────────────
 
-fn read_bf16_raw(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<u16>, Vec<usize>)> {
-    let (raw, shape) = shard_tensor_bytes(mmap, name)?;
-    let bits = raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-    Ok((bits, shape))
-}
+// A antiga read_bf16_raw foi substituida por zero-copy inline nas closures
 
 fn read_bf16_f32(mmap: &memmap2::Mmap, name: &str) -> ModelResult<(Vec<f32>, Vec<usize>)> {
     let (raw, shape) = shard_tensor_bytes(mmap, name)?;

@@ -3,6 +3,7 @@
 // ============================================================================
 
 // ── Core inference pipeline ───────────────────────────────────────────────────
+mod acp;        // Agent Communication Protocol (ACP) module
 mod api;
 mod debug;
 mod generation;
@@ -28,13 +29,14 @@ use crate::lnn::EsnObserver;
 use crate::model::QwenModel;
 use crate::inference::{forward_traced, SamplingParams};
 use crate::transport::{start_ws_server, EngineCommand};
+use crate::acp;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use axum::{routing::{get, post}, Router};
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::services::ServeDir;
-use sysinfo::{System, SystemExt}; // Importa System e SystemExt
+use sysinfo::System; // Importa System
 
 
 #[tokio::main]
@@ -79,6 +81,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_frame_tx = frame_tx.clone();
     tokio::spawn(run_engine_loop(engine_model, cmd_rx, engine_frame_tx));
 
+    // Initialize sysinfo and create telemetry router
+    // Usamos new_with_specifics() em vez de new_all() para evitar varreduras lentas (ou deadlocks) em discos (mounts fuse) e rede
+    let mut sys = System::new_with_specifics(
+        sysinfo::RefreshKind::new()
+            .with_memory(sysinfo::MemoryRefreshKind::everything())
+            .with_cpu(sysinfo::CpuRefreshKind::everything())
+    );
+    sys.refresh_memory();
+    sys.refresh_cpu(); // Initial refresh
+    let shared_sys_info = Arc::new(Mutex::new(sys));
+    let telemetry_routes = telemetry::telemetry_router();
+
     // 7. Axum HTTP server (port 3000) — starts immediately, no model loaded yet
     let app_state = AppState {
         qwen_model:    qwen_model.clone(),
@@ -88,29 +102,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         models_dir:    Arc::new(models_dir),
         frame_tx:      frame_tx.clone(),
         backend:       hw.backend.clone(),
+        shared_sys_info: shared_sys_info.clone(),
     };
-
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Initialize sysinfo and create telemetry router
-    let mut sys = System::new_all();
-    sys.refresh_all(); // Initial refresh
-    let shared_sys_info = Arc::new(Mutex::new(sys));
-    let telemetry_routes = telemetry::telemetry_router(shared_sys_info.clone());
+    // Cria armazenador de runs ACP
+    let acp_store = acp::create_run_store();
 
-    let app = Router::new()
+    // Combina AppState e AcpRunStore para o router ACP
+    let acp_app_state = acp::AcpAppState {
+        app: app_state.clone(),
+        acp_store: Arc::new(acp_store),
+    };
+
+    // Cria o router principal
+    let mut app = Router::new()
         .merge(telemetry_routes) // Merge telemetry routes
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
         .route("/api/generate",           post(generate_handler))
         .route("/api/debug/last-trace",   get(debug_trace_handler))
+        .with_state(app_state.clone());
+
+    // Adiciona as rotas ACP manualmente (pois estão em estado diferente)
+    let acp_routes = Router::new()
+        .route("/ping", axum::routing::get(acp::handlers::ping))
+        .route("/agents", axum::routing::get(acp::handlers::list_agents))
+        .route("/agents/:name", axum::routing::get(acp::handlers::get_agent))
+        .route("/runs", axum::routing::post(acp::handlers::create_run))
+        .route("/runs/:run_id", axum::routing::get(acp::handlers::get_run).post(acp::handlers::resume_run))
+        .route("/runs/:run_id/cancel", axum::routing::post(acp::handlers::cancel_run))
+        .route("/runs/:run_id/events", axum::routing::get(acp::handlers::get_run_events))
+        .with_state(acp_app_state);
+
+    app = app.nest("/acp/v1", acp_routes);
+
+    let app = app
         .fallback_service(ServeDir::new(&frontend_dir))
-        .layer(cors)
-        .with_state(app_state);
+        .layer(cors);
 
     let http_addr: std::net::SocketAddr = "0.0.0.0:3000".parse()?;
     log::info!("🌐 HTTP em http://localhost:3000");

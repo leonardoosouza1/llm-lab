@@ -39,6 +39,7 @@ pub struct AppState {
     pub frame_tx:      tokio::sync::broadcast::Sender<String>,
     /// Backend de compute ativo — passado para QwenModel::load() ao carregar.
     pub backend:       Arc<dyn ComputeBackend>,
+    pub shared_sys_info: crate::telemetry::SharedSystemInfo,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

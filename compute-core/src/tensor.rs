@@ -4,7 +4,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
-    BF16, // armazenado como u16 (bits de BF16)
+    BF16,  // armazenado como u16 (bits de BF16)
+    Q4,    // INT4 comprimido: 2 valores por byte
+    Q2,    // INT2 comprimido: 4 valores por byte
 }
 
 /// Tensor type-erased. Cada backend cria tensores com seu próprio buffer interno,

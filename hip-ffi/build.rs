@@ -141,7 +141,7 @@ fn main() {
 
     let status = std::process::Command::new(&hipcc)
         .args(&[
-            "--offload-arch=gfx1032",
+            "--offload-arch=gfx1030",
             "-O3",
             "--genco",
             "-o", kernel_out.to_str().unwrap(),

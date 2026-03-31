@@ -103,3 +103,63 @@ pub struct AddBiasParams<'a> {
     pub n_tokens: usize,
     pub dim: usize,
 }
+
+/// GEMV dequantizado: pesos INT4 comprimido × ativações F32 → F32
+/// Dequantiza on-the-fly: w_float = scale * (packed_val - zero)
+pub struct GemvQ4Params<'a> {
+    pub m: usize,                  // linhas (n_tokens, tipicamente 1 no decode)
+    pub n: usize,                  // colunas de saída (out_dim)
+    pub k: usize,                  // dimensão interna (in_dim)
+    pub packed: &'a AnyTensor,     // [n, k/2] Q4 comprimido (2 valores por byte)
+    pub scales: &'a AnyTensor,     // [n, k/group_size] F16 scales por grupo
+    pub zeros: &'a AnyTensor,      // [n, k/group_size] F16 zero-points por grupo
+    pub group_size: usize,         // tipicamente 128
+    pub x: &'a AnyTensor,          // [m, k] F32 ativações
+    pub out: &'a AnyTensor,        // [m, n] F32 saída
+    pub beta: f32,                 // 0.0 sobrescreve, 1.0 acumula (residual)
+}
+
+/// Gravity Score: calcula importância semântica por token
+/// gravity(i) = média(attn_score(i) * ||value_vec(i)||₂) sobre heads
+pub struct GravityScoreParams<'a> {
+    pub attn_weights: &'a AnyTensor,  // [n_heads, seq_len] F32 (após softmax)
+    pub value_norms: &'a AnyTensor,   // [n_heads, seq_len] F32 (normas L2 dos V)
+    pub gravity_out: &'a AnyTensor,   // [seq_len] F32 (média sobre heads)
+    pub n_heads: usize,
+    pub seq_len: usize,
+}
+
+/// CfC Forward: Closed-form Continuous liquid correction layer
+/// h(t) = σ(f) · h_prev + (1-σ(f)) · tanh(g)
+/// onde f = x @ wf + h_prev @ wf2 + bf
+///      g = x @ wg + h_prev @ wg2 + bg
+pub struct CfcForwardParams<'a> {
+    pub x: &'a AnyTensor,         // [n_tokens, hidden] F32 — hidden state do transformer
+    pub h_prev: &'a AnyTensor,    // [cfc_dim] F32 — estado CfC anterior
+    pub wf: &'a AnyTensor,        // [cfc_dim, hidden] F32 — pesos do gate f
+    pub wf2: &'a AnyTensor,       // [cfc_dim, cfc_dim] F32 — recurrence f
+    pub bf: &'a AnyTensor,        // [cfc_dim] F32 — bias f
+    pub wg: &'a AnyTensor,        // [cfc_dim, hidden] F32 — pesos do candidate g
+    pub wg2: &'a AnyTensor,       // [cfc_dim, cfc_dim] F32 — recurrence g
+    pub bg: &'a AnyTensor,        // [cfc_dim] F32 — bias g
+    pub wout: &'a AnyTensor,      // [hidden, cfc_dim] F32 — projeção de saída
+    pub bout: &'a AnyTensor,      // [hidden] F32 — bias de saída
+    pub h_out: &'a AnyTensor,     // [cfc_dim] F32 — novo estado (escrita)
+    pub correction: &'a AnyTensor, // [n_tokens, hidden] F32 — correção (escrita, somada ao residual)
+    pub n_tokens: usize,
+    pub hidden: usize,
+    pub cfc_dim: usize,
+}
+
+/// Quantized KV Cache: append com quantização on-the-fly
+pub struct KvCacheQuantizedParams<'a> {
+    pub cache: &'a AnyTensor,     // [max_seq, kv_dim/2] Q4 comprimido
+    pub scales: &'a AnyTensor,    // [max_seq, kv_dim/group_size] F16
+    pub zeros: &'a AnyTensor,     // [max_seq, kv_dim/group_size] F16
+    pub new_kv: &'a AnyTensor,    // [n_new, kv_dim] F32 (será quantizado)
+    pub insert_pos: usize,
+    pub n_new_tokens: usize,
+    pub kv_dim: usize,
+    pub max_seq: usize,
+    pub group_size: usize,
+}

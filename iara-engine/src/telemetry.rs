@@ -5,9 +5,12 @@ use axum::{
     Router,
 };
 use serde::Serialize;
-use sysinfo::{CpuExt, System, SystemExt};
-use std::sync::{Arc, Mutex};
-use log::{error, info};
+use sysinfo::{System};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use log::info;
+use crate::api::handlers::AppState; // Import AppState
+
 
 // Shared state for sysinfo, wrapped in Arc<Mutex> for thread-safe access
 pub type SharedSystemInfo = Arc<Mutex<System>>;
@@ -20,8 +23,8 @@ pub struct HealthResponse {
     cpu_usage_percent: f32,
 }
 
-pub async fn health_check(State(sys): State<SharedSystemInfo>) -> impl IntoResponse {
-    let mut sys = sys.lock().unwrap();
+pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let mut sys = state.shared_sys_info.lock().await;
 
     // Refresh system information
     sys.refresh_memory();
@@ -54,8 +57,7 @@ pub async fn health_check(State(sys): State<SharedSystemInfo>) -> impl IntoRespo
     (StatusCode::OK, Json(response)).into_response()
 }
 
-pub fn telemetry_router(sys_info: SharedSystemInfo) -> Router {
+pub fn telemetry_router() -> Router<AppState> {
     Router::new()
         .route("/health", axum::routing::get(health_check))
-        .with_state(sys_info)
 }

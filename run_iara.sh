@@ -3,6 +3,8 @@
 # run_iara.sh — V5: ROCm-Native LLVM/Clang (AMD RX 6750 XT)
 # =============================================================
 
+set -e
+
 # 1. Limpeza de Travas
 rm -f iara-engine/target/.package-cache
 
@@ -25,10 +27,13 @@ echo "🔧 GFX_OVERRIDE: $HSA_OVERRIDE_GFX_VERSION"
 # 5. Execução (workspace root)
 # Argumento opcional: diretório dos modelos (default: ./models)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 MODELS_DIR="${2:-$SCRIPT_DIR/models}"
 
+CARGO_BIN="${HOME}/.cargo/bin/cargo"
+
 if [ "$1" == "release" ]; then
-    cargo run --release -p iara-engine -- "$MODELS_DIR"
+    RUST_LOG=info "$CARGO_BIN" run --release -p iara-engine --features rocm -- "$MODELS_DIR" 
 else
-    cargo run -p iara-engine -- "$MODELS_DIR"
+    RUST_LOG=info "$CARGO_BIN" run -p iara-engine --features rocm -- "$MODELS_DIR"
 fi

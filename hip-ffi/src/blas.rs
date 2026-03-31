@@ -57,7 +57,7 @@ pub fn gemm_bf16_f32(
     k: i32,   // inner dim (hidden)
     alpha: f32,
     beta: f32,
-    a_f32: *const f32,    // activations [m, k]
+    a_bf16: *const u16,   // activations [m, k] (BF16 bits)
     b_bf16: *const u16,   // weights [n, k] (BF16 bits)
     c_f32: *mut f32,      // output [m, n]
 ) -> Result<(), HipError> {
@@ -74,8 +74,8 @@ pub fn gemm_bf16_f32(
             b_bf16 as *const std::ffi::c_void,
             hipDataType_HIP_R_16BF,
             k,
-            a_f32 as *const std::ffi::c_void,
-            hipDataType_HIP_R_32F,
+            a_bf16 as *const std::ffi::c_void,
+            hipDataType_HIP_R_16BF,
             k,
             &beta as *const f32 as *const std::ffi::c_void,
             c_f32 as *mut std::ffi::c_void,

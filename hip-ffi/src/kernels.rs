@@ -49,6 +49,7 @@ pub struct GpuKernels {
     fn_silu_mul:       hipFunction_t,
     fn_softmax_rows:   hipFunction_t,
     fn_copy_kv_cache:  hipFunction_t,
+    fn_f32_to_bf16:    hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -77,6 +78,7 @@ impl GpuKernels {
         let fn_silu_mul      = get_fn!("silu_mul_inplace");
         let fn_softmax_rows  = get_fn!("softmax_rows");
         let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
+        let fn_f32_to_bf16   = get_fn!("f32_to_bf16");
 
         Ok(Self {
             module,
@@ -87,6 +89,7 @@ impl GpuKernels {
             fn_silu_mul,
             fn_softmax_rows,
             fn_copy_kv_cache,
+            fn_f32_to_bf16,
         })
     }
 }
@@ -484,6 +487,34 @@ impl GpuKernels {
                 &mut p_n_tokens    as *mut i32        as *mut std::ffi::c_void,
                 &mut p_kv_dim      as *mut i32        as *mut std::ffi::c_void,
                 &mut p_current_len as *mut i32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Convert F32 to BF16 (stored as u16)
+    pub unsafe fn f32_to_bf16(
+        &self,
+        src: *const f32,
+        dst: *mut u16,
+        n: i32,
+    ) -> Result<(), HipError> {
+        let block_x = block_size(n as u32, 256);
+        let grid_x = ceil_div(n as u32, block_x);
+        
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_n   = n;
+
+        hip_launch_kernel(
+            self.fn_f32_to_bf16,
+            (grid_x, 1, 1),
+            (block_x, 1, 1),
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut u16   as *mut std::ffi::c_void,
+                &mut p_n   as *mut i32        as *mut std::ffi::c_void,
             ],
         )
     }
