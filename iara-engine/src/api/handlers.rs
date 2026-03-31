@@ -42,6 +42,10 @@ pub struct AppState {
     pub shared_sys_info: crate::telemetry::SharedSystemInfo,
     /// ACP Run Store — armazena estado das execuções do protocolo ACP
     pub acp_store:     Arc<crate::acp::state::AcpRunStore>,
+    /// Habilita quantização Q4 ao carregar modelos (env: IARA_QUANTIZE)
+    pub quantize_on_load: bool,
+    /// Habilita Cascade Feedback Control (CfC) para modularização de camadas
+    pub enable_cfc: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,12 +312,14 @@ pub async fn load_model_handler(
     }).to_string());
 
     // Spawn background load
-    let model_arc    = state.qwen_model.clone();
-    let model_ready  = state.model_ready.clone();
+    let model_arc     = state.qwen_model.clone();
+    let model_ready   = state.model_ready.clone();
     let model_loading = state.model_loading.clone();
-    let frame_tx     = state.frame_tx.clone();
-    let model_name   = req.name.clone();
-    let backend      = state.backend.clone();
+    let frame_tx      = state.frame_tx.clone();
+    let model_name    = req.name.clone();
+    let backend       = state.backend.clone();
+    let quantize_on_load = state.quantize_on_load;
+    let enable_cfc    = state.enable_cfc;
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -362,7 +368,19 @@ pub async fn load_model_handler(
             }
         };
 
-        match QwenModel::load(&model_path, cfg, backend) {
+        // Tenta carregar com quantização se habilitado
+        let load_result = if quantize_on_load {
+            log::info!("🔧 Carregando com quantização Q4 (IARA_QUANTIZE=1)");
+            let _ = frame_tx.send(serde_json::json!({
+                "type": "status",
+                "message": format!("Carregando '{}' com quantização Q4...", model_name)
+            }).to_string());
+            QwenModel::load_quantized(&model_path, cfg, backend, enable_cfc)
+        } else {
+            QwenModel::load(&model_path, cfg, backend)
+        };
+
+        match load_result {
             Ok(model) => {
                 *model_arc.lock().await = Some(model);
                 model_ready.store(true, std::sync::atomic::Ordering::Relaxed);

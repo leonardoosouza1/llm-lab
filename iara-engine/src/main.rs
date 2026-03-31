@@ -23,7 +23,7 @@ mod telemetry; // Adiciona o módulo de telemetria
 mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, debug_trace_handler,
-                            models_handler, load_model_handler};
+                            models_handler, load_model_handler, health_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
 use crate::model::QwenModel;
@@ -55,6 +55,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("⚠️  models_dir não existe: {:?}", models_dir);
     } else {
         log::info!("📂 models_dir: {:?}", models_dir.canonicalize().unwrap_or(models_dir.clone()));
+    }
+
+    // 2b. Opções de carregamento de modelo (variáveis de ambiente)
+    let quantize_on_load = std::env::var("IARA_QUANTIZE")
+        .map(|v| v == "1" || v == "q4" || v == "true")
+        .unwrap_or(false);
+    let enable_cfc = std::env::var("IARA_CFC")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
+    if quantize_on_load {
+        log::info!("🔧 Quantização Q4 habilitada ao carregar modelos (IARA_QUANTIZE=1)");
+    }
+    if enable_cfc {
+        log::info!("🔧 Cascade Feedback Control (CfC) habilitado (IARA_CFC=1)");
     }
 
     // 3. Shared state — no model loaded at startup
@@ -106,6 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend:       hw.backend.clone(),
         shared_sys_info: shared_sys_info.clone(),
         acp_store:     Arc::new(acp_store),
+        quantize_on_load,
+        enable_cfc,
     };
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
     let cors = CorsLayer::new()
@@ -115,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .merge(telemetry_routes) // Merge telemetry routes
+        .route("/health",                 get(health_handler))
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
         .route("/api/generate",           post(generate_handler))
@@ -234,6 +252,15 @@ async fn run_engine_loop(
                         "temperature": sampling.temperature,
                         "readout_trained": esn_tel.readout_trained,
                     }).to_string());
+
+                    // Broadcast Gravity/CfC telemetry se habilitado (Fase 2)
+                    // TODO: Integrar com GravitySystem e CfcLayer quando disponíveis
+                    // let _ = frame_tx.send(serde_json::json!({
+                    //     "type": "gravity_telemetry",
+                    //     "step": step,
+                    //     "attractor_distance": ...,
+                    //     "stability_index": ...,
+                    // }).to_string());
 
                     for trace in &gen_step.layer_traces {
                         let msg = serde_json::json!({

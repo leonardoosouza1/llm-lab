@@ -149,8 +149,7 @@ pub async fn create_run(
                 Json(json!({
                     "error": "Nenhum modelo carregado. Carregue um modelo primeiro."
                 })),
-            )
-                .into_response();
+            ).into_response();
         }
     }
 
@@ -172,8 +171,7 @@ pub async fn create_run(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "Prompt vazio no input" })),
-        )
-            .into_response();
+        ).into_response();
     }
 
     // Extrai parâmetros de sampling da metadata
@@ -221,8 +219,7 @@ pub async fn create_run(
             Json(json!({
                 "error": format!("Modo inválido: {}. Use 'sync', 'async' ou 'stream'", req.mode)
             })),
-        )
-            .into_response();
+        ).into_response();
     }
 
     // Para modo "sync" — executa imediatamente
@@ -278,8 +275,7 @@ pub async fn create_run(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(response),
-                )
-                    .into_response();
+                ).into_response();
             }
         }
     }
@@ -365,6 +361,7 @@ pub async fn get_run(
 
 /// POST /acp/v1/runs/:run_id — resume uma run pausada (não implementado ainda)
 pub async fn resume_run(
+    _state: State<AppState>,
     Path(run_id): Path<String>,
 ) -> impl IntoResponse {
     (
