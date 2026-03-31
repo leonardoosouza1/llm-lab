@@ -28,7 +28,9 @@ pub fn acp_router() -> Router<AppState> {
         // Agent management
         .route("/agents", get(handlers::list_agents))
         .route("/agents/:name", get(handlers::get_agent))
-        // Run management — TODO: Fix Axum Handler trait issue with State + Json extractors
+        // Run management
+        // NOTE: Handlers with State + Json extractors são comentados por enquanto (Axum 0.7 trait issues)
+        // Fase 2 irá fazer refactor para usar wrapper structs ou boxing
         // .route("/runs", post(handlers::create_run))
         // .route("/runs/:run_id", get(handlers::get_run).post(handlers::resume_run))
         // .route("/runs/:run_id/cancel", post(handlers::cancel_run))
