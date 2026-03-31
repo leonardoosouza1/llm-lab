@@ -222,6 +222,7 @@ pub fn quantize_bf16_to_q4(
 // ── Upload para GPU ──────────────────────────────────────────────────────────
 
 /// Upload de QuantizationCpuResult para GPU via backend.
+#[allow(dead_code)]
 pub fn upload_quantized(
     result: &QuantizationCpuResult,
     shape: &[usize],
@@ -394,6 +395,7 @@ pub fn read_iara_header(mmap: &[u8]) -> QuantizationResult<(IaraHeader, usize)> 
 }
 
 /// Carrega tensor quantizado de memmap .iara.
+#[allow(dead_code)]
 pub fn load_quantized_tensor_from_iara(
     mmap: &[u8],
     tensor_name: &str,
