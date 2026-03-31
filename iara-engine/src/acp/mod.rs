@@ -18,35 +18,10 @@ use axum::{
 };
 
 use crate::api::handlers::AppState;
-use state::AcpRunStore;
-use std::sync::Arc;
-
-/// Combined state: AppState + Arc<AcpRunStore>
-pub struct AcpAppState {
-    pub app: AppState,
-    pub acp_store: Arc<AcpRunStore>,
-}
-
-impl Clone for AcpAppState {
-    fn clone(&self) -> Self {
-        AcpAppState {
-            app: self.app.clone(),
-            acp_store: self.acp_store.clone(),
-        }
-    }
-}
 
 /// Cria router ACP com todos os endpoints v1
-/// Retorna um Router que pode ser usado com .nest()
-pub fn acp_router(app_state: AppState, acp_store: AcpRunStore) -> Router<AcpAppState> {
-    // Armazena AcpRunStore em um Arc para compartilhamento
-    let acp_store_arc = Arc::new(acp_store);
-
-    let combined = AcpAppState {
-        app: app_state,
-        acp_store: acp_store_arc,
-    };
-
+/// Usa AppState que inclui o acp_store
+pub fn acp_router() -> Router<AppState> {
     Router::new()
         // Health check
         .route("/ping", get(handlers::ping))
@@ -61,10 +36,9 @@ pub fn acp_router(app_state: AppState, acp_store: AcpRunStore) -> Router<AcpAppS
         )
         .route("/runs/:run_id/cancel", post(handlers::cancel_run))
         .route("/runs/:run_id/events", get(handlers::get_run_events))
-        .with_state(combined)
 }
 
 /// Helper para criar AcpRunStore vazio
-pub fn create_run_store() -> AcpRunStore {
-    AcpRunStore::new()
+pub fn create_run_store() -> state::AcpRunStore {
+    state::AcpRunStore::new()
 }

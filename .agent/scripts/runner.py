@@ -17,14 +17,17 @@ POLL_INTERVAL = 3  # seconds
 
 # 2. Intelligent Model Mapping
 MODEL_MAP = {
-    "orchestrator": "gemini-2.5-pro",
-    "project-planner": "gemini-2.5-pro",
-    "backend-specialist": "gemini-2.5-pro",
-    "default": "gemini-2.5-flash"
+    "orchestrator": "gemini-3.1-pro",
+    "project-planner": "gemini-3.1-pro",
+    "backend-specialist": "gemini-3.1-pro",
+    "default": "gemini-3.1-flash"
 }
 
 def get_model_for_agent(agent_role):
     """Returns the correct Gemini model based on the agent's role."""
+    clean_role = agent_role.replace("@", "").lower()
+    if "pro" in clean_role or "archaeologist" in clean_role or "auditor" in clean_role:
+        return "gemini-3.1-pro"
     return MODEL_MAP.get(agent_role, MODEL_MAP["default"])
 
 async def read_agent_context_natively(agent_role):
@@ -34,15 +37,25 @@ async def read_agent_context_natively(agent_role):
     """
     clean_role = agent_role.replace("@", "")
     file_path = os.path.join(AGENTS_DIR, f"{clean_role}.md")
+    skill_path1 = os.path.join(PROJECT_ROOT, ".agent", "skills", clean_role, "SKILL.md")
+    skill_path2 = os.path.join(PROJECT_ROOT, ".agent", "skills", f"{clean_role}.md")
     
-    if not os.path.exists(file_path):
-        logging.warning(f"Agent context file not found for role {agent_role} at {file_path}")
+    target_path = None
+    if os.path.exists(file_path):
+        target_path = file_path
+    elif os.path.exists(skill_path1):
+        target_path = skill_path1
+    elif os.path.exists(skill_path2):
+        target_path = skill_path2
+        
+    if not target_path:
+        logging.warning(f"Agent context file not found for role {agent_role}")
         return ""
 
     try:
         # Running file I/O in a separate thread for non-blocking operations
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: open(file_path, "r", encoding="utf-8").read())
+        return await loop.run_in_executor(None, lambda: open(target_path, "r", encoding="utf-8").read())
     except Exception as e:
         logging.error(f"Error reading agent context for {agent_role}: {e}")
         return ""
@@ -111,7 +124,13 @@ async def execute_agent_task(task, semaphore):
                 env=env
             )
             
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=400)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logging.error(f"[Task #{task_id}] Timeout atingido (400s).")
+                await asyncio.to_thread(update_task_status, task_id, 'FAILED', {"status": "error", "result": "Timeout atingido (400s)"})
+                return
 
             if proc.returncode != 0:
                 logging.error(f"[Task #{task_id}] Gemini CLI failed. stderr: {stderr.decode()}")
@@ -142,8 +161,7 @@ async def execute_agent_task(task, semaphore):
                 logging.info(f"[Task #{task_id}] Task completed with status: {task_status}")
 
             except json.JSONDecodeError as e:
-                logging.error(f"[Task #{task_id}] Failed to decode JSON from Gemini CLI output: {e}
-Raw output: {response_text}")
+                logging.error(f"[Task #{task_id}] Failed to decode JSON from Gemini CLI output: {e}\\nRaw output: {response_text}")
                 await asyncio.to_thread(update_task_status, task_id, 'FAILED', {"status": "error", "result": "JSON Decode Error", "raw_output": response_text})
 
         except Exception as e:

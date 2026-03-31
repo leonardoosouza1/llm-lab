@@ -8,7 +8,7 @@ from state_manager import add_run, add_task, initialize_db
 GEMINI_BIN = "/home/leonardo/.nvm/versions/node/v22.16.0/bin/gemini"
 PROJECT_ROOT = "/home/leonardo/projects/LLM/llm-lab"
 
-def run_gemini(prompt, model="gemini-2.5-flash"):
+def run_gemini(prompt, model="gemini-3.1-pro"):
     """Runs Gemini CLI and returns the raw output."""
     try:
         env = os.environ.copy()
@@ -99,7 +99,7 @@ def architect_pipeline(user_prompt):
     """
     
     print("🧠 Analisando gaps e decompondo...")
-    response_raw = run_gemini(gap_prompt)
+    response_raw = run_gemini(gap_prompt, "gemini-3.1-pro")
     if not response_raw:
         print("❌ Sem resposta do Gemini.")
         return

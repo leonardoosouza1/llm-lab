@@ -40,6 +40,8 @@ pub struct AppState {
     /// Backend de compute ativo — passado para QwenModel::load() ao carregar.
     pub backend:       Arc<dyn ComputeBackend>,
     pub shared_sys_info: crate::telemetry::SharedSystemInfo,
+    /// ACP Run Store — armazena estado das execuções do protocolo ACP
+    pub acp_store:     Arc<crate::acp::state::AcpRunStore>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

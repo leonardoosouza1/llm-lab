@@ -21,7 +21,7 @@ use axum::{
 use serde_json::json;
 
 use crate::acp::types::*;
-use crate::acp::AcpAppState;
+use crate::api::handlers::AppState;
 use crate::inference::forward_traced;
 use crate::inference::SamplingParams;
 
@@ -48,9 +48,9 @@ pub async fn ping() -> Json<PingResponse> {
 
 /// GET /acp/v1/agents — lista agentes disponíveis (um por modelo carregado)
 pub async fn list_agents(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let guard = state.app.qwen_model.lock().await;
+    let guard = state.qwen_model.lock().await;
     let mut agents = vec![];
 
     if let Some(m) = guard.as_ref() {
@@ -90,10 +90,10 @@ pub async fn list_agents(
 
 /// GET /acp/v1/agents/:name — retorna manifesto de um agente específico
 pub async fn get_agent(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let guard = state.app.qwen_model.lock().await;
+    let guard = state.qwen_model.lock().await;
 
     if let Some(m) = guard.as_ref() {
         let agent_name = format!(
@@ -134,17 +134,15 @@ pub async fn get_agent(
 
 /// POST /acp/v1/runs — cria e executa uma run (modo sync)
 pub async fn create_run(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
     Json(req): Json<RunRequest>,
 ) -> impl IntoResponse {
-    let app_state = &state.app;
-    let acp_store = &state.acp_store;
     // Gera ID único para a run
     let run_id = uuid::Uuid::new_v4().to_string();
 
     // Valida se o agente existe
     {
-        let guard = app_state.qwen_model.lock().await;
+        let guard = state.qwen_model.lock().await;
         if guard.is_none() {
             return (
                 StatusCode::NOT_FOUND,
@@ -230,7 +228,7 @@ pub async fn create_run(
     // Para modo "sync" — executa imediatamente
     if req.mode == "sync" {
         match execute_inference(
-            &app_state,
+            &state,
             &prompt_text,
             temperature,
             top_k,
@@ -255,7 +253,7 @@ pub async fn create_run(
                 }]);
 
                 // Armazena run
-                acp_store.store_run(
+                state.acp_store.store_run(
                     run_id.clone(),
                     crate::acp::state::RunStore {
                         response: response.clone(),
@@ -269,7 +267,7 @@ pub async fn create_run(
                 response.status = RunStatus::Failed;
                 response.error = Some(e.to_string());
 
-                acp_store.store_run(
+                state.acp_store.store_run(
                     run_id.clone(),
                     crate::acp::state::RunStore {
                         response: response.clone(),
@@ -290,7 +288,7 @@ pub async fn create_run(
     response.status = RunStatus::InProgress;
     response.started_at = Some(chrono::Utc::now().to_rfc3339());
 
-    acp_store.store_run(
+    state.acp_store.store_run(
         run_id.clone(),
         crate::acp::state::RunStore {
             response: response.clone(),
@@ -299,8 +297,8 @@ pub async fn create_run(
     ).await;
 
     // Spawn background task para execução async
-    let acp_store_clone = acp_store.clone();
-    let app_state_clone = app_state.clone();
+    let acp_store_clone = state.acp_store.clone();
+    let app_state_clone = state.clone();
     let run_id_clone = run_id.clone();
 
     tokio::spawn(async move {
@@ -352,11 +350,10 @@ pub async fn create_run(
 
 /// GET /acp/v1/runs/:run_id — retorna status e output de uma run
 pub async fn get_run(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> impl IntoResponse {
-    let acp_store = &state.acp_store;
-    match acp_store.get_run(&run_id).await {
+    match state.acp_store.get_run(&run_id).await {
         Some(store) => (StatusCode::OK, Json(store.response)).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -382,17 +379,16 @@ pub async fn resume_run(
 
 /// POST /acp/v1/runs/:run_id/cancel — cancela uma run
 pub async fn cancel_run(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> impl IntoResponse {
-    let acp_store = &state.acp_store;
-    match acp_store.get_run(&run_id).await {
+    match state.acp_store.get_run(&run_id).await {
         Some(mut store) => {
             if store.response.status == RunStatus::InProgress {
                 store.response.status = RunStatus::Cancelled;
                 store.response.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
-                let _ = acp_store.store_run(run_id, store.clone()).await;
+                let _ = state.acp_store.store_run(run_id, store.clone()).await;
 
                 return (StatusCode::OK, Json(store.response)).into_response();
             }
@@ -415,11 +411,10 @@ pub async fn cancel_run(
 
 /// GET /acp/v1/runs/:run_id/events — lista eventos de uma run
 pub async fn get_run_events(
-    State(state): State<AcpAppState>,
+    State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> impl IntoResponse {
-    let acp_store = &state.acp_store;
-    let events = acp_store.get_events(&run_id).await;
+    let events = state.acp_store.get_events(&run_id).await;
     (StatusCode::OK, Json(json!({ "events": events }))).into_response()
 }
 
@@ -428,7 +423,7 @@ pub async fn get_run_events(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn execute_inference(
-    app_state: &crate::api::handlers::AppState,
+    state: &crate::api::handlers::AppState,
     prompt: &str,
     temperature: f32,
     top_k: usize,
@@ -437,7 +432,7 @@ async fn execute_inference(
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Validação de modelo carregado
     {
-        let guard = app_state.qwen_model.lock().await;
+        let guard = state.qwen_model.lock().await;
         if guard.is_none() {
             return Err("Modelo não carregado".into());
         }
@@ -463,14 +458,14 @@ async fn execute_inference(
 
     // Reset KV cache — evita estado antigo
     {
-        let mut guard = app_state.qwen_model.lock().await;
+        let mut guard = state.qwen_model.lock().await;
         let model = guard.as_mut().ok_or("Model not loaded")?;
         model.reset_cache();
     }
 
     // Prefill: processa tokens 0..n-2 apenas para popular KV cache
     if prompt_ids.len() > 1 {
-        let mut model_guard = app_state.qwen_model.lock().await;
+        let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
             model
@@ -484,7 +479,7 @@ async fn execute_inference(
 
     for _step in 0..max_tokens {
         let gen_step = {
-            let mut model_guard = app_state.qwen_model.lock().await;
+            let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
             forward_traced(model, &[decode_token], &sampling)
                 .map_err(|e| format!("Forward pass error: {}", e))?
