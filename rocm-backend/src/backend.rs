@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use compute_core::{
-    AnyTensor, BackendError, ComputeBackend, DType,
     params::{
         AddBiasParams, CfcForwardParams, EmbedParams, GemmBf16Params, GemvQ4Params,
-        GravityScoreParams, KvCacheParams, KvCacheQuantizedParams,
-        RmsNormParams, RopeParams, SgemmParams, SiluMulParams, SoftmaxParams,
+        GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, RmsNormParams, RopeParams,
+        SgemmParams, SiluMulParams, SoftmaxParams,
     },
+    AnyTensor, BackendError, ComputeBackend, DType,
 };
 
 use hip_ffi::safe::DeviceBuffer;
@@ -72,7 +72,7 @@ fn u8_mut_ptr(t: &AnyTensor) -> *mut u8 {
 // ── RocmBackend ───────────────────────────────────────────────────────────────
 
 pub struct RocmBackend {
-    blas:    hip_ffi::BlasHandle,
+    blas: hip_ffi::BlasHandle,
     kernels: hip_ffi::GpuKernels,
     tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
     act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
@@ -89,8 +89,7 @@ impl RocmBackend {
     /// Returns `Err(BackendError::NotAvailable)` if HIP cannot be initialised,
     /// hipBLAS context creation fails, or the kernel module fails to load.
     pub fn probe() -> Result<Self, BackendError> {
-        hip_ffi::hip_set_device(0)
-            .map_err(|e| BackendError::NotAvailable(format!("HIP: {e}")))?;
+        hip_ffi::hip_set_device(0).map_err(|e| BackendError::NotAvailable(format!("HIP: {e}")))?;
 
         let blas = hip_ffi::BlasHandle::new()
             .map_err(|e| BackendError::NotAvailable(format!("hipBLAS: {e}")))?;
@@ -98,7 +97,7 @@ impl RocmBackend {
         let kernels = hip_ffi::GpuKernels::new()
             .map_err(|e| BackendError::NotAvailable(format!("GpuKernels: {e}")))?;
 
-        // Pre-allocate a buffer for up to 4096 tokens (max_seq_len) to avoid 
+        // Pre-allocate a buffer for up to 4096 tokens (max_seq_len) to avoid
         // VRAM fragmentation (memory leak footprint) during the generation loop.
         let tok_buf = hip_ffi::safe::DeviceBuffer::<u32>::alloc(4096)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc: {e}")))?;
@@ -107,9 +106,9 @@ impl RocmBackend {
         let act_bf16 = hip_ffi::safe::DeviceBuffer::<u16>::alloc(4096 * 8192)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc act_bf16: {e}")))?;
 
-        Ok(Self { 
-            blas, 
-            kernels, 
+        Ok(Self {
+            blas,
+            kernels,
             tok_buf: std::sync::Mutex::new(tok_buf),
             act_bf16: std::sync::Mutex::new(act_bf16),
         })
@@ -176,21 +175,21 @@ impl ComputeBackend for RocmBackend {
         let mut act_guard = self.act_bf16.lock().unwrap();
         let expected_elems = p.m * p.k;
         if expected_elems > act_guard.len() {
-            return Err(BackendError::Gemm(format!("act_bf16 overflow: {expected_elems} elems")));
+            return Err(BackendError::Gemm(format!(
+                "act_bf16 overflow: {expected_elems} elems"
+            )));
         }
 
         unsafe {
-             self.kernels.f32_to_bf16(
-                 a_ptr,
-                 act_guard.as_mut_ptr(),
-                 expected_elems as i32
-             ).map_err(|e| BackendError::Gemm(format!("Cast: {e}")))?;
+            self.kernels
+                .f32_to_bf16(a_ptr, act_guard.as_mut_ptr(), expected_elems as i32)
+                .map_err(|e| BackendError::Gemm(format!("Cast: {e}")))?;
 
-             // Explicitly synchronize current stream (default) to ensure BF16 cast is complete 
-             // before hipblasGemmEx reads from it. This prevents 'Invalid Value' errors
-             // caused by out-of-order data hazards on some RDNA2 drivers.
-             hip_ffi::safe::hip_stream_synchronize(std::ptr::null_mut())
-                 .map_err(|e| BackendError::Gemm(format!("Post-cast sync: {e}")))?;
+            // Explicitly synchronize current stream (default) to ensure BF16 cast is complete
+            // before hipblasGemmEx reads from it. This prevents 'Invalid Value' errors
+            // caused by out-of-order data hazards on some RDNA2 drivers.
+            hip_ffi::safe::hip_stream_synchronize(std::ptr::null_mut())
+                .map_err(|e| BackendError::Gemm(format!("Post-cast sync: {e}")))?;
         }
 
         hip_ffi::gemm_bf16_f32(
@@ -238,7 +237,9 @@ impl ComputeBackend for RocmBackend {
         let mut buf_guard = self.tok_buf.lock().unwrap();
 
         if p.token_ids.len() > buf_guard.len() {
-            return Err(BackendError::Transfer("Muitos tokens para tok_buf pre-alocado".into()));
+            return Err(BackendError::Transfer(
+                "Muitos tokens para tok_buf pre-alocado".into(),
+            ));
         }
 
         // Upload token IDs (host slice) to the pre-allocated GPU buffer.
@@ -290,11 +291,8 @@ impl ComputeBackend for RocmBackend {
     fn softmax_rows(&self, p: &SoftmaxParams) -> Result<(), BackendError> {
         let scores_ptr = unsafe { f32_mut_ptr(p.scores).add(p.offset_elems) };
         unsafe {
-            self.kernels.softmax_rows(
-                scores_ptr,
-                p.n_rows as i32,
-                p.row_len as i32,
-            )
+            self.kernels
+                .softmax_rows(scores_ptr, p.n_rows as i32, p.row_len as i32)
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
@@ -577,8 +575,7 @@ impl ComputeBackend for RocmBackend {
     // ── Sync and info ─────────────────────────────────────────────────────────
 
     fn sync(&self) -> Result<(), BackendError> {
-        hip_ffi::safe::hip_device_sync()
-            .map_err(|e| BackendError::Kernel(e.to_string()))
+        hip_ffi::safe::hip_device_sync().map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn mem_info(&self) -> Option<(usize, usize)> {

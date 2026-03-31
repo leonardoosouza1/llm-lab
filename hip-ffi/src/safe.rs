@@ -172,8 +172,12 @@ pub unsafe fn hip_launch_kernel(
 ) -> Result<(), HipError> {
     hip_check(hipModuleLaunchKernel(
         func,
-        grid.0, grid.1, grid.2,
-        block.0, block.1, block.2,
+        grid.0,
+        grid.1,
+        grid.2,
+        block.0,
+        block.1,
+        block.2,
         shared_mem,
         stream,
         args.as_mut_ptr(),
@@ -217,10 +221,18 @@ impl<T: Copy> DeviceBuffer<T> {
         Ok(out)
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
-    pub fn as_ptr(&self) -> *const T { self.ptr }
-    pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
 
     /// Ponteiro como argumento de kernel (double-pointer necessário no HIP module API).
     pub fn kernel_arg(&self) -> *mut std::ffi::c_void {

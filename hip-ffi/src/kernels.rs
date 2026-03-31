@@ -16,8 +16,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::raw::{hipFunction_t, hipModule_t};
-use crate::safe::{hip_launch_kernel, hip_module_get_function, hip_module_load_data,
-                  hip_module_unload, HipError};
+use crate::safe::{
+    hip_launch_kernel, hip_module_get_function, hip_module_load_data, hip_module_unload, HipError,
+};
 use std::ptr;
 
 // ---------------------------------------------------------------------------
@@ -26,8 +27,7 @@ use std::ptr;
 
 /// The compiled kernel object, embedded at build time.
 /// `build.rs` is responsible for producing `$OUT_DIR/llm_kernels.hsaco`.
-static KERNEL_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/llm_kernels.hsaco"));
+static KERNEL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/llm_kernels.hsaco"));
 
 // ---------------------------------------------------------------------------
 // GpuKernels — loaded module with cached function handles
@@ -41,20 +41,20 @@ static KERNEL_BYTES: &[u8] =
 /// from any thread after the module is loaded, provided the caller serialises
 /// concurrent launches (e.g. via a Mutex or by using separate streams).
 pub struct GpuKernels {
-    module:                hipModule_t,
-    fn_embed_lookup:       hipFunction_t,
-    fn_rms_norm:           hipFunction_t,
-    fn_add_bias:           hipFunction_t,
-    fn_rope_inplace:       hipFunction_t,
-    fn_silu_mul:           hipFunction_t,
-    fn_softmax_rows:       hipFunction_t,
-    fn_copy_kv_cache:      hipFunction_t,
-    fn_f32_to_bf16:        hipFunction_t,
-    fn_dequant_gemv_q4:    hipFunction_t,
-    fn_gravity_score:      hipFunction_t,
-    fn_cfc_gate_update:    hipFunction_t,
-    fn_value_norms:        hipFunction_t,
-    fn_kv_cache_quantize:  hipFunction_t,
+    module: hipModule_t,
+    fn_embed_lookup: hipFunction_t,
+    fn_rms_norm: hipFunction_t,
+    fn_add_bias: hipFunction_t,
+    fn_rope_inplace: hipFunction_t,
+    fn_silu_mul: hipFunction_t,
+    fn_softmax_rows: hipFunction_t,
+    fn_copy_kv_cache: hipFunction_t,
+    fn_f32_to_bf16: hipFunction_t,
+    fn_dequant_gemv_q4: hipFunction_t,
+    fn_gravity_score: hipFunction_t,
+    fn_cfc_gate_update: hipFunction_t,
+    fn_value_norms: hipFunction_t,
+    fn_kv_cache_quantize: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -76,19 +76,19 @@ impl GpuKernels {
             };
         }
 
-        let fn_embed_lookup       = get_fn!("embed_lookup");
-        let fn_rms_norm           = get_fn!("rms_norm");
-        let fn_add_bias           = get_fn!("add_bias_inplace");
-        let fn_rope_inplace       = get_fn!("rope_inplace");
-        let fn_silu_mul           = get_fn!("silu_mul_inplace");
-        let fn_softmax_rows       = get_fn!("softmax_rows");
-        let fn_copy_kv_cache      = get_fn!("copy_to_kv_cache");
-        let fn_f32_to_bf16        = get_fn!("f32_to_bf16");
-        let fn_dequant_gemv_q4    = get_fn!("dequant_gemv_q4");
-        let fn_gravity_score      = get_fn!("gravity_score");
-        let fn_cfc_gate_update    = get_fn!("cfc_gate_update");
-        let fn_value_norms        = get_fn!("value_norms");
-        let fn_kv_cache_quantize  = get_fn!("kv_cache_quantize_append");
+        let fn_embed_lookup = get_fn!("embed_lookup");
+        let fn_rms_norm = get_fn!("rms_norm");
+        let fn_add_bias = get_fn!("add_bias_inplace");
+        let fn_rope_inplace = get_fn!("rope_inplace");
+        let fn_silu_mul = get_fn!("silu_mul_inplace");
+        let fn_softmax_rows = get_fn!("softmax_rows");
+        let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
+        let fn_f32_to_bf16 = get_fn!("f32_to_bf16");
+        let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4");
+        let fn_gravity_score = get_fn!("gravity_score");
+        let fn_cfc_gate_update = get_fn!("cfc_gate_update");
+        let fn_value_norms = get_fn!("value_norms");
+        let fn_kv_cache_quantize = get_fn!("kv_cache_quantize_append");
 
         Ok(Self {
             module,
@@ -114,7 +114,9 @@ impl Drop for GpuKernels {
         if !self.module.is_null() {
             // Unloading may fail only if the module was already unloaded, which
             // cannot happen with this RAII wrapper.  Ignore the result in Drop.
-            unsafe { let _ = hip_module_unload(self.module); }
+            unsafe {
+                let _ = hip_module_unload(self.module);
+            }
             self.module = ptr::null_mut();
         }
     }
@@ -155,7 +157,7 @@ fn ceil_div(a: u32, b: u32) -> u32 {
 /// Falls back to `min_block` if `dim` is smaller than it.
 #[inline(always)]
 fn block_size(dim: u32, max_block: u32) -> u32 {
-    let mut b = 64u32;          // RDNA2 wavefront; minimum sensible block
+    let mut b = 64u32; // RDNA2 wavefront; minimum sensible block
     while b * 2 <= dim.min(max_block) {
         b *= 2;
     }
@@ -185,33 +187,33 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn embed_lookup(
         &self,
-        embed_bf16: *const u16,  // [vocab, hidden] BF16 on GPU
-        token_ids:  *const u32,  // [n_tokens] on GPU
-        out:        *mut f32,    // [n_tokens, hidden] on GPU
-        n_tokens:   i32,
-        hidden:     i32,
+        embed_bf16: *const u16, // [vocab, hidden] BF16 on GPU
+        token_ids: *const u32,  // [n_tokens] on GPU
+        out: *mut f32,          // [n_tokens, hidden] on GPU
+        n_tokens: i32,
+        hidden: i32,
     ) -> Result<(), HipError> {
         let bsz = block_size(hidden as u32, 256);
-        let grid  = (n_tokens as u32, 1, 1);
+        let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
 
         // Mutable copies so we can take &mut for the args array.
-        let mut p_embed     = embed_bf16;
+        let mut p_embed = embed_bf16;
         let mut p_token_ids = token_ids;
-        let mut p_out       = out;
-        let mut p_hidden    = hidden;
+        let mut p_out = out;
+        let mut p_hidden = hidden;
 
         hip_launch_kernel(
             self.fn_embed_lookup,
             grid,
             block,
-            0,              // no dynamic shared memory
+            0,               // no dynamic shared memory
             ptr::null_mut(), // default stream
             &mut [
-                &mut p_embed     as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_embed as *mut *const u16 as *mut std::ffi::c_void,
                 &mut p_token_ids as *mut *const u32 as *mut std::ffi::c_void,
-                &mut p_out       as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_hidden    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_hidden as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -232,24 +234,24 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn rms_norm(
         &self,
-        out:      *mut f32,    // [n_tokens, hidden] on GPU
-        x:        *const f32,  // [n_tokens, hidden] on GPU
-        w:        *const f32,  // [hidden] on GPU
+        out: *mut f32, // [n_tokens, hidden] on GPU
+        x: *const f32, // [n_tokens, hidden] on GPU
+        w: *const f32, // [hidden] on GPU
         n_tokens: i32,
-        hidden:   i32,
-        eps:      f32,
+        hidden: i32,
+        eps: f32,
     ) -> Result<(), HipError> {
         let bsz = block_size(hidden as u32, 1024);
         let shared_bytes = bsz * std::mem::size_of::<f32>() as u32;
 
-        let grid  = (n_tokens as u32, 1, 1);
+        let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
 
-        let mut p_out    = out;
-        let mut p_x      = x;
-        let mut p_w      = w;
+        let mut p_out = out;
+        let mut p_x = x;
+        let mut p_w = w;
         let mut p_hidden = hidden;
-        let mut p_eps    = eps;
+        let mut p_eps = eps;
 
         hip_launch_kernel(
             self.fn_rms_norm,
@@ -258,11 +260,11 @@ impl GpuKernels {
             shared_bytes,
             ptr::null_mut(),
             &mut [
-                &mut p_out    as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_x      as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_w      as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_hidden as *mut i32        as *mut std::ffi::c_void,
-                &mut p_eps    as *mut f32        as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_w as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_hidden as *mut i32 as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -282,18 +284,18 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn add_bias_inplace(
         &self,
-        x:        *mut f32,    // [n_tokens, dim] on GPU
-        bias:     *const f32,  // [dim] on GPU
+        x: *mut f32,      // [n_tokens, dim] on GPU
+        bias: *const f32, // [dim] on GPU
         n_tokens: i32,
-        dim:      i32,
+        dim: i32,
     ) -> Result<(), HipError> {
         let bsz = block_size(dim as u32, 1024);
-        let grid  = (n_tokens as u32, 1, 1);
+        let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
 
-        let mut p_x    = x;
+        let mut p_x = x;
         let mut p_bias = bias;
-        let mut p_dim  = dim;
+        let mut p_dim = dim;
 
         hip_launch_kernel(
             self.fn_add_bias,
@@ -302,9 +304,9 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_x    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_x as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_bias as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_dim  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_dim as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -325,22 +327,22 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn rope_inplace(
         &self,
-        x:         *mut f32,  // [n_tokens, n_heads, head_dim] on GPU
-        n_tokens:  i32,
-        n_heads:   i32,
-        head_dim:  i32,
+        x: *mut f32, // [n_tokens, n_heads, head_dim] on GPU
+        n_tokens: i32,
+        n_heads: i32,
+        head_dim: i32,
         pos_start: i32,
-        theta:     f32,
+        theta: f32,
     ) -> Result<(), HipError> {
         let half = (head_dim / 2) as u32;
-        let grid  = (n_tokens as u32, n_heads as u32, 1);
+        let grid = (n_tokens as u32, n_heads as u32, 1);
         let block = (half, 1, 1);
 
-        let mut p_x         = x;
-        let mut p_n_heads   = n_heads;
-        let mut p_head_dim  = head_dim;
+        let mut p_x = x;
+        let mut p_n_heads = n_heads;
+        let mut p_head_dim = head_dim;
         let mut p_pos_start = pos_start;
-        let mut p_theta     = theta;
+        let mut p_theta = theta;
 
         hip_launch_kernel(
             self.fn_rope_inplace,
@@ -349,11 +351,11 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_x         as *mut *mut f32 as *mut std::ffi::c_void,
-                &mut p_n_heads   as *mut i32      as *mut std::ffi::c_void,
-                &mut p_head_dim  as *mut i32      as *mut std::ffi::c_void,
-                &mut p_pos_start as *mut i32      as *mut std::ffi::c_void,
-                &mut p_theta     as *mut f32      as *mut std::ffi::c_void,
+                &mut p_x as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
+                &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_pos_start as *mut i32 as *mut std::ffi::c_void,
+                &mut p_theta as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -374,18 +376,18 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn silu_mul_inplace(
         &self,
-        gate:     *mut f32,   // [n_tokens, inter] on GPU — modified in-place
-        up:       *const f32, // [n_tokens, inter] on GPU
+        gate: *mut f32, // [n_tokens, inter] on GPU — modified in-place
+        up: *const f32, // [n_tokens, inter] on GPU
         n_tokens: i32,
-        inter:    i32,
+        inter: i32,
     ) -> Result<(), HipError> {
-        let total       = (n_tokens * inter) as u32;
+        let total = (n_tokens * inter) as u32;
         let block_x: u32 = 256;
-        let grid  = (ceil_div(total, block_x), 1, 1);
+        let grid = (ceil_div(total, block_x), 1, 1);
         let block = (block_x, 1, 1);
 
-        let mut p_gate  = gate;
-        let mut p_up    = up;
+        let mut p_gate = gate;
+        let mut p_up = up;
         let mut p_total = (n_tokens * inter) as i32;
 
         hip_launch_kernel(
@@ -395,9 +397,9 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_gate  as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_up    as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_total as *mut i32        as *mut std::ffi::c_void,
+                &mut p_gate as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_up as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_total as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -420,9 +422,9 @@ impl GpuKernels {
     /// `n_rows * seq_len` f32 elements.
     pub unsafe fn softmax_rows(
         &self,
-        scores:   *mut f32,  // [n_rows, seq_len] on GPU
-        n_rows:   i32,
-        seq_len:  i32,
+        scores: *mut f32, // [n_rows, seq_len] on GPU
+        n_rows: i32,
+        seq_len: i32,
     ) -> Result<(), HipError> {
         // Choose block size = next power-of-two >= seq_len, capped at 1024.
         let bsz = {
@@ -434,10 +436,10 @@ impl GpuKernels {
         };
         let shared_bytes = bsz * std::mem::size_of::<f32>() as u32;
 
-        let grid  = (n_rows as u32, 1, 1);
+        let grid = (n_rows as u32, 1, 1);
         let block = (bsz, 1, 1);
 
-        let mut p_scores  = scores;
+        let mut p_scores = scores;
         let mut p_seq_len = seq_len;
 
         hip_launch_kernel(
@@ -447,8 +449,8 @@ impl GpuKernels {
             shared_bytes,
             ptr::null_mut(),
             &mut [
-                &mut p_scores  as *mut *mut f32 as *mut std::ffi::c_void,
-                &mut p_seq_len as *mut i32      as *mut std::ffi::c_void,
+                &mut p_scores as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -473,21 +475,21 @@ impl GpuKernels {
     /// f32 elements.
     pub unsafe fn copy_to_kv_cache(
         &self,
-        cache:       *mut f32,    // [max_seq, kv_dim] on GPU
-        new_kv:      *const f32,  // [n_tokens, kv_dim] on GPU
-        n_tokens:    i32,
-        kv_dim:      i32,
+        cache: *mut f32,    // [max_seq, kv_dim] on GPU
+        new_kv: *const f32, // [n_tokens, kv_dim] on GPU
+        n_tokens: i32,
+        kv_dim: i32,
         current_len: i32,
     ) -> Result<(), HipError> {
-        let total      = (n_tokens * kv_dim) as u32;
-        let block_x    = total.min(1024);
-        let grid  = (1, 1, 1);
+        let total = (n_tokens * kv_dim) as u32;
+        let block_x = total.min(1024);
+        let grid = (1, 1, 1);
         let block = (block_x, 1, 1);
 
-        let mut p_cache       = cache;
-        let mut p_new_kv      = new_kv;
-        let mut p_n_tokens    = n_tokens;
-        let mut p_kv_dim      = kv_dim;
+        let mut p_cache = cache;
+        let mut p_new_kv = new_kv;
+        let mut p_n_tokens = n_tokens;
+        let mut p_kv_dim = kv_dim;
         let mut p_current_len = current_len;
 
         hip_launch_kernel(
@@ -497,11 +499,11 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_cache       as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_new_kv      as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_n_tokens    as *mut i32        as *mut std::ffi::c_void,
-                &mut p_kv_dim      as *mut i32        as *mut std::ffi::c_void,
-                &mut p_current_len as *mut i32        as *mut std::ffi::c_void,
+                &mut p_cache as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_new_kv as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_n_tokens as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_current_len as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -518,7 +520,7 @@ impl GpuKernels {
 
         let mut p_src = src;
         let mut p_dst = dst;
-        let mut p_n   = n;
+        let mut p_n = n;
 
         hip_launch_kernel(
             self.fn_f32_to_bf16,
@@ -528,8 +530,8 @@ impl GpuKernels {
             ptr::null_mut(),
             &mut [
                 &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_dst as *mut *mut u16   as *mut std::ffi::c_void,
-                &mut p_n   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -550,11 +552,11 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn dequant_gemv_q4(
         &self,
-        packed: *const u8,      // [n, k/2] Q4 comprimido
-        scales: *const f32,     // [n, k/group_size] F32 escalas
-        zeros: *const f32,      // [n, k/group_size] F32 zero-points
-        x: *const f32,          // [m, k] F32 ativações
-        out: *mut f32,          // [m, n] F32 saída
+        packed: *const u8,  // [n, k/2] Q4 comprimido
+        scales: *const f32, // [n, k/group_size] F32 escalas
+        zeros: *const f32,  // [n, k/group_size] F32 zero-points
+        x: *const f32,      // [m, k] F32 ativações
+        out: *mut f32,      // [m, n] F32 saída
         m: i32,
         n: i32,
         k: i32,
@@ -562,19 +564,19 @@ impl GpuKernels {
         beta: f32,
     ) -> Result<(), HipError> {
         let bsz = block_size(k as u32, 1024);
-        let grid  = (n as u32, 1, 1);
+        let grid = (n as u32, 1, 1);
         let block = (bsz, 1, 1);
 
-        let mut p_packed      = packed;
-        let mut p_scales      = scales;
-        let mut p_zeros       = zeros;
-        let mut p_x           = x;
-        let mut p_out         = out;
-        let mut p_m           = m;
-        let mut p_n           = n;
-        let mut p_k           = k;
-        let mut p_group_size  = group_size;
-        let mut p_beta        = beta;
+        let mut p_packed = packed;
+        let mut p_scales = scales;
+        let mut p_zeros = zeros;
+        let mut p_x = x;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_group_size = group_size;
+        let mut p_beta = beta;
 
         hip_launch_kernel(
             self.fn_dequant_gemv_q4,
@@ -583,16 +585,16 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_packed     as *mut *const u8  as *mut std::ffi::c_void,
-                &mut p_scales     as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_zeros      as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_x          as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_out        as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_m          as *mut i32        as *mut std::ffi::c_void,
-                &mut p_n          as *mut i32        as *mut std::ffi::c_void,
-                &mut p_k          as *mut i32        as *mut std::ffi::c_void,
-                &mut p_group_size as *mut i32        as *mut std::ffi::c_void,
-                &mut p_beta       as *mut f32        as *mut std::ffi::c_void,
+                &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_scales as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_zeros as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_group_size as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -612,22 +614,22 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn gravity_score(
         &self,
-        attn_weights: *const f32,  // [n_heads, seq_len] F32 após softmax
-        value_norms: *const f32,   // [n_heads, seq_len] F32 normas L2
-        gravity_out: *mut f32,     // [seq_len] F32 saída
+        attn_weights: *const f32, // [n_heads, seq_len] F32 após softmax
+        value_norms: *const f32,  // [n_heads, seq_len] F32 normas L2
+        gravity_out: *mut f32,    // [seq_len] F32 saída
         n_heads: i32,
         seq_len: i32,
     ) -> Result<(), HipError> {
         let shared_bytes = (n_heads as u32) * std::mem::size_of::<f32>() as u32;
 
-        let grid  = (seq_len as u32, 1, 1);
+        let grid = (seq_len as u32, 1, 1);
         let block = (n_heads as u32, 1, 1);
 
         let mut p_attn_weights = attn_weights;
-        let mut p_value_norms  = value_norms;
-        let mut p_gravity_out  = gravity_out;
-        let mut p_n_heads      = n_heads;
-        let mut p_seq_len      = seq_len;
+        let mut p_value_norms = value_norms;
+        let mut p_gravity_out = gravity_out;
+        let mut p_n_heads = n_heads;
+        let mut p_seq_len = seq_len;
 
         hip_launch_kernel(
             self.fn_gravity_score,
@@ -637,10 +639,10 @@ impl GpuKernels {
             ptr::null_mut(),
             &mut [
                 &mut p_attn_weights as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_value_norms  as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_gravity_out  as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_n_heads      as *mut i32        as *mut std::ffi::c_void,
-                &mut p_seq_len      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_value_norms as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_gravity_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
+                &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -659,21 +661,21 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn value_norms(
         &self,
-        values: *const f32,     // [n_heads, seq_len, head_dim] F32
-        norms_out: *mut f32,    // [n_heads, seq_len] F32 saída
+        values: *const f32,  // [n_heads, seq_len, head_dim] F32
+        norms_out: *mut f32, // [n_heads, seq_len] F32 saída
         n_heads: i32,
         seq_len: i32,
         head_dim: i32,
     ) -> Result<(), HipError> {
         let block_x: u32 = 256;
-        let grid  = (1, 1, 1);
+        let grid = (1, 1, 1);
         let block = (block_x, 1, 1);
 
-        let mut p_values    = values;
+        let mut p_values = values;
         let mut p_norms_out = norms_out;
-        let mut p_n_heads   = n_heads;
-        let mut p_seq_len   = seq_len;
-        let mut p_head_dim  = head_dim;
+        let mut p_n_heads = n_heads;
+        let mut p_seq_len = seq_len;
+        let mut p_head_dim = head_dim;
 
         hip_launch_kernel(
             self.fn_value_norms,
@@ -682,11 +684,11 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_values    as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_norms_out as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_n_heads   as *mut i32        as *mut std::ffi::c_void,
-                &mut p_seq_len   as *mut i32        as *mut std::ffi::c_void,
-                &mut p_head_dim  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_values as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_norms_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
+                &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
+                &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -705,19 +707,19 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn cfc_gate_update(
         &self,
-        f_proj: *const f32,    // [cfc_dim] F32 — forget gate
-        g_proj: *const f32,    // [cfc_dim] F32 — candidate gate
-        h_prev: *const f32,    // [cfc_dim] F32 — anterior estado
-        h_out: *mut f32,       // [cfc_dim] F32 — novo estado (escrita)
+        f_proj: *const f32, // [cfc_dim] F32 — forget gate
+        g_proj: *const f32, // [cfc_dim] F32 — candidate gate
+        h_prev: *const f32, // [cfc_dim] F32 — anterior estado
+        h_out: *mut f32,    // [cfc_dim] F32 — novo estado (escrita)
         cfc_dim: i32,
     ) -> Result<(), HipError> {
         let block_x = block_size(cfc_dim as u32, 256);
         let grid_x = ceil_div(cfc_dim as u32, block_x);
 
-        let mut p_f_proj  = f_proj;
-        let mut p_g_proj  = g_proj;
-        let mut p_h_prev  = h_prev;
-        let mut p_h_out   = h_out;
+        let mut p_f_proj = f_proj;
+        let mut p_g_proj = g_proj;
+        let mut p_h_prev = h_prev;
+        let mut p_h_out = h_out;
         let mut p_cfc_dim = cfc_dim;
 
         hip_launch_kernel(
@@ -727,11 +729,11 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_f_proj  as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_g_proj  as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_h_prev  as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_h_out   as *mut *mut f32   as *mut std::ffi::c_void,
-                &mut p_cfc_dim as *mut i32        as *mut std::ffi::c_void,
+                &mut p_f_proj as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_g_proj as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_h_prev as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_h_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_cfc_dim as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
@@ -750,10 +752,10 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn kv_cache_quantize_append(
         &self,
-        cache: *mut u8,         // [max_seq, kv_dim/2] Q4 comprimido
-        scales: *mut f32,       // [max_seq, kv_dim/group_size] F32
-        zeros: *mut f32,        // [max_seq, kv_dim/group_size] F32
-        new_kv: *const f32,     // [n_new, kv_dim] F32
+        cache: *mut u8,     // [max_seq, kv_dim/2] Q4 comprimido
+        scales: *mut f32,   // [max_seq, kv_dim/group_size] F32
+        zeros: *mut f32,    // [max_seq, kv_dim/group_size] F32
+        new_kv: *const f32, // [n_new, kv_dim] F32
         insert_pos: i32,
         n_new_tokens: i32,
         kv_dim: i32,
@@ -761,18 +763,18 @@ impl GpuKernels {
         group_size: i32,
     ) -> Result<(), HipError> {
         let block_x: u32 = 256;
-        let grid  = (1, 1, 1);
+        let grid = (1, 1, 1);
         let block = (block_x, 1, 1);
 
-        let mut p_cache        = cache;
-        let mut p_scales       = scales;
-        let mut p_zeros        = zeros;
-        let mut p_new_kv       = new_kv;
-        let mut p_insert_pos   = insert_pos;
+        let mut p_cache = cache;
+        let mut p_scales = scales;
+        let mut p_zeros = zeros;
+        let mut p_new_kv = new_kv;
+        let mut p_insert_pos = insert_pos;
         let mut p_n_new_tokens = n_new_tokens;
-        let mut p_kv_dim       = kv_dim;
-        let mut p_max_seq      = max_seq;
-        let mut p_group_size   = group_size;
+        let mut p_kv_dim = kv_dim;
+        let mut p_max_seq = max_seq;
+        let mut p_group_size = group_size;
 
         hip_launch_kernel(
             self.fn_kv_cache_quantize,
@@ -781,15 +783,15 @@ impl GpuKernels {
             0,
             ptr::null_mut(),
             &mut [
-                &mut p_cache        as *mut *mut u8   as *mut std::ffi::c_void,
-                &mut p_scales       as *mut *mut f32  as *mut std::ffi::c_void,
-                &mut p_zeros        as *mut *mut f32  as *mut std::ffi::c_void,
-                &mut p_new_kv       as *mut *const f32 as *mut std::ffi::c_void,
-                &mut p_insert_pos   as *mut i32        as *mut std::ffi::c_void,
-                &mut p_n_new_tokens as *mut i32        as *mut std::ffi::c_void,
-                &mut p_kv_dim       as *mut i32        as *mut std::ffi::c_void,
-                &mut p_max_seq      as *mut i32        as *mut std::ffi::c_void,
-                &mut p_group_size   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_cache as *mut *mut u8 as *mut std::ffi::c_void,
+                &mut p_scales as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_zeros as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_new_kv as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_insert_pos as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_new_tokens as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_max_seq as *mut i32 as *mut std::ffi::c_void,
+                &mut p_group_size as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }

@@ -275,6 +275,36 @@ impl ComputeBackend for OpenClBackend {
         )
     }
 
+    /// Upload de dados INT4 comprimido (2 valores por byte).
+    /// Armazenado como buffer U8 — dequantização ocorre no kernel GEMV.
+    fn upload_q4(&self, data: &[u8], shape: &[usize]) -> AnyTensor {
+        let mut buf = self
+            .alloc_u16_buf(data.len())
+            .expect("OpenCL: falha ao alocar Q4 para upload");
+        // Reinterpretar U8 como U16: cada 2 bytes U8 → 1 U16
+        let u16_data: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        self.upload_u16_into_buf(&u16_data, &mut buf);
+        AnyTensor::new(
+            Arc::new(buf) as Arc<dyn Any + Send + Sync>,
+            shape.to_vec(),
+            DType::Q4,
+        )
+    }
+
+    /// Aloca buffer Q4 não inicializado.
+    fn alloc_q4(&self, shape: &[usize]) -> AnyTensor {
+        let len: usize = shape.iter().product();
+        let buf = self.alloc_u16_buf(len).expect("OpenCL: falha ao alocar Q4");
+        AnyTensor::new(
+            Arc::new(buf) as Arc<dyn Any + Send + Sync>,
+            shape.to_vec(),
+            DType::Q4,
+        )
+    }
+
     fn download_f32(&self, t: &AnyTensor) -> Vec<f32> {
         let buf = Self::f32_buf(t);
         let mut result = vec![0f32; buf.len];
@@ -801,6 +831,38 @@ impl ComputeBackend for OpenClBackend {
     }
 
     // ── Sync e informações ────────────────────────────────────────────────
+
+    fn gemv_q4(&self, _p: &compute_core::GemvQ4Params) -> Result<(), BackendError> {
+        // Placeholder: GEMV INT4 dequantizado não implementado em OpenCL
+        // Seria necessário: dequantizar on-the-fly + GEMV
+        Err(BackendError::Kernel(
+            "OpenCL: GEMV Q4 não implementado".to_string(),
+        ))
+    }
+
+    fn gravity_score(&self, _p: &compute_core::GravityScoreParams) -> Result<(), BackendError> {
+        // Placeholder: gravity score não implementado em OpenCL
+        Err(BackendError::Kernel(
+            "OpenCL: gravity_score não implementado".to_string(),
+        ))
+    }
+
+    fn cfc_forward(&self, _p: &compute_core::CfcForwardParams) -> Result<(), BackendError> {
+        // Placeholder: CfC forward não implementado em OpenCL
+        Err(BackendError::Kernel(
+            "OpenCL: cfc_forward não implementado".to_string(),
+        ))
+    }
+
+    fn kv_cache_quantized_append(
+        &self,
+        _p: &compute_core::KvCacheQuantizedParams,
+    ) -> Result<(), BackendError> {
+        // Placeholder: KV cache quantizado não implementado em OpenCL
+        Err(BackendError::Kernel(
+            "OpenCL: kv_cache_quantized_append não implementado".to_string(),
+        ))
+    }
 
     fn sync(&self) -> Result<(), BackendError> {
         self.ctx
