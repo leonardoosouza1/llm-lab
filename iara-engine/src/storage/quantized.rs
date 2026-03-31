@@ -1,0 +1,544 @@
+// ============================================================================
+// storage/quantized.rs — Carregamento e quantização INT4
+// ============================================================================
+// Suporta:
+//   1. Quantização on-load: BF16 → INT4 (grupo-sábio na CPU)
+//   2. Formato .iara: pré-quantizado para carga rápida
+//   3. Upload GPU: INT4 packed + scales + zeros
+// ============================================================================
+
+use half::bf16;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::Arc;
+use compute_core::{ComputeBackend, AnyTensor};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// ── Erros ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum QuantizationError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Quantization error: {0}")]
+    Quantize(String),
+
+    #[error("Invalid IARA format: {0}")]
+    InvalidFormat(String),
+
+    #[error("Backend error: {0}")]
+    Backend(String),
+
+    #[error("Shape mismatch: expected {expected}, got {actual}")]
+    ShapeMismatch { expected: String, actual: String },
+}
+
+pub type QuantizationResult<T> = std::result::Result<T, QuantizationError>;
+
+// ── Tensor quantizado ────────────────────────────────────────────────────────
+
+/// Tensor INT4 quantizado com metadados de grupo.
+/// Todos os tensores (packed, scales, zeros) residem na GPU via AnyTensor.
+pub struct QuantizedTensor {
+    /// [rows, cols/2] INT4 comprimido na GPU (2 valores por byte)
+    pub packed: AnyTensor,
+
+    /// [rows, n_groups] F32 na GPU — escalas por grupo
+    pub scales: AnyTensor,
+
+    /// [rows, n_groups] F32 na GPU — zero-points por grupo
+    pub zeros: AnyTensor,
+
+    /// Shape original [rows, cols]
+    pub shape: [usize; 2],
+
+    /// Tamanho do grupo (tipicamente 128)
+    pub group_size: usize,
+}
+
+// ── Resultado de quantização (CPU-side) ──────────────────────────────────────
+
+/// Resultado intermediário da quantização INT4 na CPU.
+/// Pronto para upload via ComputeBackend.
+pub struct QuantizationCpuResult {
+    /// Bytes comprimidos INT4: [rows * cols / 2]
+    pub packed: Vec<u8>,
+
+    /// Escalas F32: [rows * n_groups]
+    pub scales: Vec<f32>,
+
+    /// Zero-points F32: [rows * n_groups]
+    pub zeros: Vec<f32>,
+
+    /// Número de grupos por linha
+    pub n_groups_per_row: usize,
+}
+
+// ── Quantização CPU: BF16 → INT4 ────────────────────────────────────────────
+
+/// Quantiza tensor BF16 para INT4 na CPU.
+///
+/// Algoritmo por grupo de `group_size` pesos:
+///   1. Converter BF16 → F32
+///   2. Encontrar min/max do grupo
+///   3. scale = (max - min) / 15.0
+///   4. zero = min
+///   5. q = clamp(round((val - zero) / scale), 0, 15)
+///   6. Pack 2 valores INT4 por byte (low nibble + high nibble)
+///
+/// # Arguments
+/// * `bf16_data` — slice de bits BF16 (como u16)
+/// * `shape` — [rows, cols]
+/// * `group_size` — tipicamente 128; deve dividir cols
+///
+/// # Returns
+/// Erro se cols não é divisível por group_size ou shape está vazio
+pub fn quantize_bf16_to_q4(
+    bf16_data: &[u16],
+    shape: &[usize],
+    group_size: usize,
+) -> QuantizationResult<QuantizationCpuResult> {
+    if shape.len() != 2 {
+        return Err(QuantizationError::Quantize(
+            format!("shape deve ter 2 dimensões, got {}", shape.len()),
+        ));
+    }
+
+    let rows = shape[0];
+    let cols = shape[1];
+
+    if cols % group_size != 0 {
+        return Err(QuantizationError::Quantize(
+            format!(
+                "cols {} não é divisível por group_size {}",
+                cols, group_size
+            ),
+        ));
+    }
+
+    if bf16_data.len() != rows * cols {
+        return Err(QuantizationError::Quantize(
+            format!(
+                "data length {} ≠ rows*cols {}*{}={}",
+                bf16_data.len(),
+                rows,
+                cols,
+                rows * cols
+            ),
+        ));
+    }
+
+    let n_groups_per_row = cols / group_size;
+    let packed_size = rows * cols / 2; // 2 valores INT4 por byte
+    let mut packed = vec![0u8; packed_size];
+    let mut scales = Vec::with_capacity(rows * n_groups_per_row);
+    let mut zeros = Vec::with_capacity(rows * n_groups_per_row);
+
+    // Quantizar por linha
+    for row_idx in 0..rows {
+        let row_start = row_idx * cols;
+        let row_data = &bf16_data[row_start..row_start + cols];
+
+        // Quantizar cada grupo
+        for group_idx in 0..n_groups_per_row {
+            let group_start = group_idx * group_size;
+            let group_end = group_start + group_size;
+            let group_data = &row_data[group_start..group_end];
+
+            // Converter BF16 → F32 e encontrar min/max
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            let f32_data: Vec<f32> = group_data
+                .iter()
+                .map(|&bits| {
+                    let f = bf16::from_bits(bits).to_f32();
+                    min_val = min_val.min(f);
+                    max_val = max_val.max(f);
+                    f
+                })
+                .collect();
+
+            // Evitar quantização trivial (todos zeros)
+            let scale = if (max_val - min_val).abs() < 1e-10 {
+                1.0
+            } else {
+                (max_val - min_val) / 15.0
+            };
+
+            let zero = min_val;
+            scales.push(scale);
+            zeros.push(zero);
+
+            // Quantizar valores do grupo
+            let q_data: Vec<u8> = f32_data
+                .iter()
+                .map(|&val| {
+                    let normalized = if scale.abs() > 1e-10 {
+                        (val - zero) / scale
+                    } else {
+                        0.0
+                    };
+                    let quantized = normalized.round() as i32;
+                    quantized.clamp(0, 15) as u8
+                })
+                .collect();
+
+            // Pack 2 valores INT4 por byte: low nibble + high nibble
+            for i in 0..group_size / 2 {
+                let lo = q_data[2 * i];
+                let hi = q_data[2 * i + 1];
+                let packed_byte = (hi << 4) | lo;
+
+                let packed_idx = row_idx * (cols / 2) + group_idx * (group_size / 2) + i;
+                packed[packed_idx] = packed_byte;
+            }
+        }
+    }
+
+    log::info!(
+        "📊 Quantização Q4: [{}, {}] BF16 → packed {} B + scales {} + zeros {}",
+        rows,
+        cols,
+        packed.len(),
+        scales.len(),
+        zeros.len()
+    );
+
+    Ok(QuantizationCpuResult {
+        packed,
+        scales,
+        zeros,
+        n_groups_per_row,
+    })
+}
+
+// ── Upload para GPU ──────────────────────────────────────────────────────────
+
+/// Upload de QuantizationCpuResult para GPU via backend.
+pub fn upload_quantized(
+    result: &QuantizationCpuResult,
+    shape: &[usize],
+    group_size: usize,
+    backend: &Arc<dyn ComputeBackend>,
+) -> QuantizationResult<QuantizedTensor> {
+    if shape.len() != 2 {
+        return Err(QuantizationError::Quantize(
+            format!("shape deve ter 2 dimensões, got {}", shape.len()),
+        ));
+    }
+
+    let rows = shape[0];
+    let cols = shape[1];
+
+    // Upload packed INT4: [rows, cols/2]
+    let packed = backend.upload_q4(&result.packed, &[rows, cols / 2]);
+
+    // Upload scales F32: [rows, n_groups]
+    let scales = backend.upload_f32(&result.scales, &[rows, result.n_groups_per_row]);
+
+    // Upload zeros F32: [rows, n_groups]
+    let zeros = backend.upload_f32(&result.zeros, &[rows, result.n_groups_per_row]);
+
+    log::info!(
+        "✅ Quantizado upload: packed {} B, scales [{}, {}], zeros [{}, {}]",
+        result.packed.len(),
+        rows,
+        result.n_groups_per_row,
+        rows,
+        result.n_groups_per_row
+    );
+
+    Ok(QuantizedTensor {
+        packed,
+        scales,
+        zeros,
+        shape: [rows, cols],
+        group_size,
+    })
+}
+
+// ── Formato .iara (pré-quantizado) ───────────────────────────────────────────
+
+/// Metadados de um tensor dentro de um arquivo .iara
+#[derive(Clone, Serialize, Deserialize)]
+pub struct IaraTensorMeta {
+    /// Shape original [rows, cols]
+    pub shape: [usize; 2],
+
+    /// Offset no arquivo de dados (absoluto)
+    pub packed_offset: usize,
+    pub packed_len: usize,
+
+    pub scales_offset: usize,
+    pub scales_len: usize,
+
+    pub zeros_offset: usize,
+    pub zeros_len: usize,
+}
+
+/// Header de um arquivo .iara
+#[derive(Clone, Serialize, Deserialize)]
+pub struct IaraHeader {
+    pub model_type: String,
+    pub quantization: String,
+    pub group_size: usize,
+    pub tensors: HashMap<String, IaraTensorMeta>,
+}
+
+/// Magic bytes do formato .iara
+const IARA_MAGIC: &[u8; 4] = b"IARA";
+const IARA_VERSION: u32 = 1;
+
+/// Escreve arquivo .iara com pesos pré-quantizados.
+///
+/// Layout:
+/// ```
+/// [4 bytes]   magic "IARA"
+/// [4 bytes]   version (u32 LE)
+/// [4 bytes]   header_len (u32 LE)
+/// [header_len] JSON header com metadados por tensor
+/// [...]        tensor data (packed Q4 + scales + zeros, concatenados)
+/// ```
+pub fn write_iara_file(
+    path: &Path,
+    header: &IaraHeader,
+    data: &[u8],
+) -> QuantizationResult<()> {
+    let mut file = File::create(path)?;
+
+    // Magic + version
+    file.write_all(IARA_MAGIC)?;
+    file.write_all(&IARA_VERSION.to_le_bytes())?;
+
+    // Header JSON
+    let header_json = serde_json::to_string(header)?;
+    let header_bytes = header_json.as_bytes();
+    file.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+    file.write_all(header_bytes)?;
+
+    // Data
+    file.write_all(data)?;
+
+    log::info!(
+        "💾 .iara escrito: {} | {} tensores | {:.2} GB",
+        path.display(),
+        header.tensors.len(),
+        data.len() as f64 / 1e9
+    );
+
+    Ok(())
+}
+
+/// Lê header de um arquivo .iara (já mapeado em memória).
+pub fn read_iara_header(mmap: &[u8]) -> QuantizationResult<(IaraHeader, usize)> {
+    if mmap.len() < 12 {
+        return Err(QuantizationError::InvalidFormat(
+            "Arquivo muito pequeno: < 12 bytes".into(),
+        ));
+    }
+
+    // Magic
+    if &mmap[0..4] != IARA_MAGIC {
+        return Err(QuantizationError::InvalidFormat(
+            format!(
+                "Magic inválido: {:?} (esperado IARA)",
+                &mmap[0..4]
+            ),
+        ));
+    }
+
+    // Version
+    let version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
+    if version != IARA_VERSION {
+        return Err(QuantizationError::InvalidFormat(
+            format!(
+                "Version incompatível: {} (esperado {})",
+                version, IARA_VERSION
+            ),
+        ));
+    }
+
+    // Header length
+    let header_len = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
+    let header_end = 12 + header_len;
+
+    if mmap.len() < header_end {
+        return Err(QuantizationError::InvalidFormat(
+            format!(
+                "Arquivo truncado: esperava {} bytes, tem {} bytes",
+                header_end,
+                mmap.len()
+            ),
+        ));
+    }
+
+    let header_json = std::str::from_utf8(&mmap[12..header_end])
+        .map_err(|e| QuantizationError::InvalidFormat(format!("UTF-8 inválido: {}", e)))?;
+
+    let header: IaraHeader = serde_json::from_str(header_json)?;
+
+    log::info!(
+        "📖 .iara header lido: {} tensores, group_size={}",
+        header.tensors.len(),
+        header.group_size
+    );
+
+    Ok((header, header_end))
+}
+
+/// Carrega tensor quantizado de memmap .iara.
+pub fn load_quantized_tensor_from_iara(
+    mmap: &[u8],
+    tensor_name: &str,
+    meta: &IaraTensorMeta,
+    header_start: usize,
+    backend: &Arc<dyn ComputeBackend>,
+    group_size: usize,
+) -> QuantizationResult<QuantizedTensor> {
+    let rows = meta.shape[0];
+    let cols = meta.shape[1];
+    let n_groups = cols / group_size;
+
+    // Offsets absolutos no mmap (a partir do início dos dados)
+    let data_start = header_start;
+    let packed_start = data_start + meta.packed_offset;
+    let scales_start = data_start + meta.scales_offset;
+    let zeros_start = data_start + meta.zeros_offset;
+
+    // Validar bounds
+    if packed_start + meta.packed_len > mmap.len()
+        || scales_start + meta.scales_len > mmap.len()
+        || zeros_start + meta.zeros_len > mmap.len()
+    {
+        return Err(QuantizationError::InvalidFormat(
+            "Offsets de tensor excedem tamanho do arquivo".into(),
+        ));
+    }
+
+    // Extrair slices
+    let packed_bytes = &mmap[packed_start..packed_start + meta.packed_len];
+    let scales_bytes = &mmap[scales_start..scales_start + meta.scales_len];
+    let zeros_bytes = &mmap[zeros_start..zeros_start + meta.zeros_len];
+
+    // Parsear F32 (escalas e zeros)
+    let scales: Vec<f32> = scales_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    let zeros: Vec<f32> = zeros_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    if scales.len() != rows * n_groups || zeros.len() != rows * n_groups {
+        return Err(QuantizationError::Quantize(
+            format!(
+                "Tamanho de scales/zeros inconsistente: {} vs {} (esperado {})",
+                scales.len(),
+                zeros.len(),
+                rows * n_groups
+            ),
+        ));
+    }
+
+    // Upload para GPU
+    let packed = backend.upload_q4(packed_bytes, &[rows, cols / 2]);
+    let scales = backend.upload_f32(&scales, &[rows, n_groups]);
+    let zeros = backend.upload_f32(&zeros, &[rows, n_groups]);
+
+    log::info!(
+        "📥 Tensor quantizado carregado: {} | shape [{}, {}]",
+        tensor_name,
+        rows,
+        cols
+    );
+
+    Ok(QuantizedTensor {
+        packed,
+        scales,
+        zeros,
+        shape: [rows, cols],
+        group_size,
+    })
+}
+
+// ── Helper: converter QuantizationCpuResult para bytes para arquivo .iara ─────
+
+/// Converte resultado de quantização em bytes para escrita em .iara.
+/// Retorna (bytes concatenados, metadados com offsets).
+pub fn cpu_result_to_bytes(
+    result: &QuantizationCpuResult,
+    shape: &[usize],
+) -> (Vec<u8>, IaraTensorMeta) {
+    let rows = shape[0];
+    let cols = shape[1];
+
+    let mut data = Vec::new();
+
+    // Packed INT4
+    let packed_offset = 0;
+    let packed_len = result.packed.len();
+    data.extend_from_slice(&result.packed);
+
+    // Scales F32
+    let scales_offset = data.len();
+    let scales_len = result.scales.len() * 4;
+    for &s in &result.scales {
+        data.extend_from_slice(&s.to_le_bytes());
+    }
+
+    // Zeros F32
+    let zeros_offset = data.len();
+    let zeros_len = result.zeros.len() * 4;
+    for &z in &result.zeros {
+        data.extend_from_slice(&z.to_le_bytes());
+    }
+
+    let meta = IaraTensorMeta {
+        shape: [rows, cols],
+        packed_offset,
+        packed_len,
+        scales_offset,
+        scales_len,
+        zeros_offset,
+        zeros_len,
+    };
+
+    (data, meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quantize_bf16_to_q4() {
+        // Teste simples: tensores pequenos com valores conhecidos
+        let rows = 2;
+        let cols = 4;
+        let group_size = 2;
+
+        // Criar dados BF16: [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+        let values = vec![1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+        let bf16_data: Vec<u16> = values
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect();
+
+        let result = quantize_bf16_to_q4(&bf16_data, &[rows, cols], group_size)
+            .expect("quantização falhou");
+
+        // Verificações básicas
+        assert_eq!(result.packed.len(), rows * cols / 2);
+        assert_eq!(result.scales.len(), rows * (cols / group_size));
+        assert_eq!(result.zeros.len(), rows * (cols / group_size));
+    }
+}

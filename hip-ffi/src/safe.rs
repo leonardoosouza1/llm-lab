@@ -235,3 +235,17 @@ impl<T> Drop for DeviceBuffer<T> {
         }
     }
 }
+
+// ── Convenience alloc/upload for u8 (INT4 quantized data) ──────────────────
+
+impl DeviceBuffer<u8> {
+    /// Aloca u8 buffer para dados Q4 comprimidos.
+    pub fn alloc_u8(n_bytes: usize) -> Result<Self, HipError> {
+        Self::alloc(n_bytes)
+    }
+
+    /// Upload de slice u8 host → device (para Q4 packed data).
+    pub fn upload_u8(data: &[u8]) -> Result<Self, HipError> {
+        Self::from_slice(data)
+    }
+}

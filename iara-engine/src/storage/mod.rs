@@ -1,8 +1,18 @@
 // ============================================================================
-// storage/ — Leitura de pesos safetensors, decoder e embedding
+// storage/ — Leitura de pesos safetensors, decoder, embedding e quantização
 // ============================================================================
 pub mod decoder;
 pub mod embedding;
+pub mod quantized;
+
+// ── Re-exports para fácil acesso ──
+#[allow(unused_imports)]
+pub use quantized::{
+    QuantizedTensor, QuantizationError, QuantizationResult, QuantizationCpuResult,
+    IaraTensorMeta, IaraHeader,
+    quantize_bf16_to_q4, upload_quantized, write_iara_file, read_iara_header,
+    load_quantized_tensor_from_iara, cpu_result_to_bytes,
+};
 
 // ============================================================================
 // safetensors — Leitura zero-copy de pesos via memmap2
