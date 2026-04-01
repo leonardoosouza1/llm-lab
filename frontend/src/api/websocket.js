@@ -140,6 +140,24 @@ export const wsManager = {
         if (store.esnHistory.length > 512) store.esnHistory.shift();
         break;
 
+      case 'gravity_state':
+        store.gravityLatest = msg;
+        store.gravityHistory.push({
+          step:        msg.step,
+          history_len: msg.history_len,
+          threshold:   msg.threshold,
+        });
+        if (store.gravityHistory.length > 512) store.gravityHistory.shift();
+        break;
+
+      case 'cfc_state':
+        store.cfcLatest = msg;
+        break;
+
+      case 'q4_status':
+        store.q4Latest = msg;
+        break;
+
       default:
         // console.log('Unhandled WS message type:', msg.type);
         break;

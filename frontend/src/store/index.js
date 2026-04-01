@@ -59,4 +59,14 @@ export const store = reactive({
   // ESN (Fase 1) — observador do stream de tokens
   esnHistory: [],   // [{step, entropy, top1_prob, state_norm, temp_delta, temperature}]
   esnLatest: null,  // último frame ESN
+
+  // Gravity (Fase 2) — gravidade semântica
+  gravityLatest: null,   // último frame gravity_state
+  gravityHistory: [],    // [{step, history_len, threshold}]
+
+  // CfC (Fase 2) — Liquid Correction Layer
+  cfcLatest: null,       // último frame cfc_state
+
+  // Q4 Quantization status
+  q4Latest: null,        // último frame q4_status
 });

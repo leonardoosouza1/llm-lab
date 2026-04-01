@@ -392,6 +392,81 @@
           <canvas id="esn-entropy-canvas" height="60" style="width:100%;display:block;margin-top:4px;" aria-label="ESN entropy over time"></canvas>
         </div>
 
+        <!-- Semantic Gravity (Fase 2) -->
+        <div class="glass-panel" id="gravity-panel" style="grid-column:span 1;display:none;" aria-label="Semantic Gravity system state">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🌌</span>
+              Semantic Gravity
+              <span style="font-size:10px;color:#fbbf24;margin-left:8px;font-family:'JetBrains Mono',monospace;">Fase 2 — Token Importance</span>
+            </h2>
+            <span id="gravity-badge" style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:#6b7280;font-family:'JetBrains Mono',monospace;">inactive</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px 0;">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">THRESHOLD</div>
+              <div id="gravity-threshold" style="font-size:20px;font-weight:700;color:#fbbf24;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">HISTORY</div>
+              <div id="gravity-history-len" style="font-size:20px;font-weight:700;color:#f97316;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STEP</div>
+              <div id="gravity-step" style="font-size:20px;font-weight:700;color:#c4b5fd;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+          </div>
+          <canvas id="gravity-threshold-canvas" height="50" style="width:100%;display:block;margin-top:4px;" aria-label="Gravity threshold over time"></canvas>
+        </div>
+
+        <!-- CfC Liquid Correction (Fase 2) -->
+        <div class="glass-panel" id="cfc-panel" style="grid-column:span 1;display:none;" aria-label="CfC Liquid Correction Layer state">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">💧</span>
+              CfC Correction
+              <span style="font-size:10px;color:#38bdf8;margin-left:8px;font-family:'JetBrains Mono',monospace;">Fase 2 — Liquid Neural Network</span>
+            </h2>
+            <span id="cfc-badge" style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:#6b7280;font-family:'JetBrains Mono',monospace;">inactive</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px 0;">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">CFC DIM</div>
+              <div id="cfc-dim" style="font-size:20px;font-weight:700;color:#38bdf8;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">PARAMS</div>
+              <div id="cfc-params" style="font-size:20px;font-weight:700;color:#818cf8;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">VRAM</div>
+              <div id="cfc-vram" style="font-size:20px;font-weight:700;color:#34d399;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Q4 Quantization Status -->
+        <div class="glass-panel" id="q4-panel" style="grid-column:span 2;display:none;" aria-label="Q4 quantization status">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">📦</span>
+              Quantization
+              <span style="font-size:10px;color:#f472b6;margin-left:8px;font-family:'JetBrains Mono',monospace;">INT4 — Group-wise Q4</span>
+            </h2>
+            <span id="q4-badge" style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(0,255,200,.1);color:#00ffc8;font-family:'JetBrains Mono',monospace;">active</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:12px 0;">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">VRAM TOTAL</div>
+              <div id="q4-vram" style="font-size:20px;font-weight:700;color:#f472b6;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">COMPRESSION</div>
+              <div id="q4-compression" style="font-size:20px;font-weight:700;color:#00ffc8;font-family:'JetBrains Mono',monospace;">~4x</div>
+            </div>
+          </div>
+        </div>
+
       </div>
     </section>
 

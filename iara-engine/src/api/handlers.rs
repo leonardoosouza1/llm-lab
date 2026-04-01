@@ -104,6 +104,7 @@ pub struct ModelInfo {
     pub has_vision: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -123,6 +124,7 @@ pub struct HealthResponse {
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn health_handler(
     State(state): State<AppState>,
 ) -> Json<HealthResponse> {
@@ -471,7 +473,7 @@ async fn generate_internal(
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
-    let mut last_token: u32 = 0;
+    let mut last_token: u32;
 
     const EOS_TOKEN: u32 = 151645;
 

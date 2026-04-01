@@ -217,18 +217,96 @@ createApp({
       ctx.stroke();
     });
 
-    // Reseta ESN ao iniciar nova geração
+    // ── Gravity watcher ────────────────────────────────────────────────
+    let gravityThresholdPoints = [];
+
+    watch(() => store.gravityLatest, grav => {
+      if (!grav) return;
+      const panel = document.getElementById('gravity-panel');
+      if (panel) panel.style.display = '';
+
+      const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      setText('gravity-threshold',   grav.threshold != null ? grav.threshold.toFixed(3) : '—');
+      setText('gravity-history-len', grav.history_len != null ? String(grav.history_len) : '—');
+      setText('gravity-step',        grav.step != null ? String(grav.step) : '—');
+
+      const badge = document.getElementById('gravity-badge');
+      if (badge) { badge.textContent = 'active'; badge.style.color = '#fbbf24'; badge.style.background = 'rgba(251,191,36,.1)'; }
+
+      // Sparkline threshold
+      gravityThresholdPoints.push(grav.threshold || 0);
+      if (gravityThresholdPoints.length > 200) gravityThresholdPoints.shift();
+
+      const canvas = document.getElementById('gravity-threshold-canvas');
+      if (!canvas || gravityThresholdPoints.length < 2) return;
+      canvas.width = canvas.offsetWidth || 600;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+      const max = Math.max(...gravityThresholdPoints, 0.01);
+      ctx.beginPath();
+      ctx.strokeStyle = '#fbbf24';
+      ctx.lineWidth = 1.5;
+      gravityThresholdPoints.forEach((v, i) => {
+        const x = (i / (gravityThresholdPoints.length - 1)) * W;
+        const y = H - (v / max) * (H - 4) - 2;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    });
+
+    // ── CfC watcher ──────────────────────────────────────────────────
+    watch(() => store.cfcLatest, cfc => {
+      if (!cfc) return;
+      const panel = document.getElementById('cfc-panel');
+      if (panel) panel.style.display = '';
+
+      const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      setText('cfc-dim',    cfc.cfc_dim != null ? String(cfc.cfc_dim) : '—');
+      setText('cfc-params', cfc.param_count != null ? (cfc.param_count > 1e6 ? (cfc.param_count / 1e6).toFixed(1) + 'M' : (cfc.param_count / 1e3).toFixed(1) + 'K') : '—');
+      setText('cfc-vram',   cfc.vram_mb != null ? cfc.vram_mb.toFixed(1) + ' MB' : '—');
+
+      const badge = document.getElementById('cfc-badge');
+      if (badge) { badge.textContent = 'active'; badge.style.color = '#38bdf8'; badge.style.background = 'rgba(56,189,248,.1)'; }
+    });
+
+    // ── Q4 watcher ───────────────────────────────────────────────────
+    watch(() => store.q4Latest, q4 => {
+      if (!q4) return;
+      const panel = document.getElementById('q4-panel');
+      if (panel) panel.style.display = '';
+
+      const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      setText('q4-vram', q4.vram_mb != null ? q4.vram_mb.toFixed(0) + ' MB' : '—');
+
+      const badge = document.getElementById('q4-badge');
+      if (badge) { badge.textContent = 'Q4 active'; badge.style.color = '#00ffc8'; badge.style.background = 'rgba(0,255,200,.1)'; }
+    });
+
+    // Reseta ESN + Gravity + CfC ao iniciar nova geração
     watch(() => store.generating, gen => {
       if (gen) {
         esnEntropyPoints = [];
+        gravityThresholdPoints = [];
         store.esnHistory = [];
         store.esnLatest = null;
+        store.gravityLatest = null;
+        store.gravityHistory = [];
+        store.cfcLatest = null;
+        store.q4Latest = null;
         const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         setText('esn-entropy', '—');
         setText('esn-top1', '—');
         setText('esn-state-norm', '—');
         setText('esn-temperature', '—');
         setText('esn-step', '—');
+        setText('gravity-threshold', '—');
+        setText('gravity-history-len', '—');
+        setText('gravity-step', '—');
+        setText('cfc-dim', '—');
+        setText('cfc-params', '—');
+        setText('cfc-vram', '—');
+        setText('q4-vram', '—');
       }
     });
 
