@@ -1340,6 +1340,50 @@ textarea {
   border-color: rgba(255, 65, 54, 0.3);
 }
 
+.filter-btn--esn {
+  color: var(--text-secondary);
+}
+
+.filter-btn--esn.filter-btn--active,
+.filter-btn--esn:hover {
+  color: #a855f7;
+  background: rgba(168, 85, 247, 0.15);
+  border-color: rgba(168, 85, 247, 0.3);
+}
+
+.filter-btn--gravity {
+  color: var(--text-secondary);
+}
+
+.filter-btn--gravity.filter-btn--active,
+.filter-btn--gravity:hover {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.15);
+  border-color: rgba(251, 191, 36, 0.3);
+}
+
+.filter-btn--cfc {
+  color: var(--text-secondary);
+}
+
+.filter-btn--cfc.filter-btn--active,
+.filter-btn--cfc:hover {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.15);
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
+.filter-btn--pipeline {
+  color: var(--text-secondary);
+}
+
+.filter-btn--pipeline.filter-btn--active,
+.filter-btn--pipeline:hover {
+  color: #f472b6;
+  background: rgba(244, 114, 182, 0.15);
+  border-color: rgba(244, 114, 182, 0.3);
+}
+
 /* Log List */
 
 .log-list {

@@ -7,13 +7,17 @@ let _consoleAutoScroll = true;
 let _selectedLogId = null;
 
 export function renderConsoleLogs() {
-  const container = el('console-log-list');
+  const container = el('log-list');
   if (!container) return;
 
   const filter = store.logFilter;
   const entries = store.logs.filter(function(e) {
     if (filter === 'ALL') return true;
     if (filter === 'WS')   return e.type === 'ws-in' || e.type === 'ws-out';
+    if (filter === 'esn_state') return e.summary && e.summary.includes('esn_state');
+    if (filter === 'gravity_state') return e.summary && e.summary.includes('gravity_state');
+    if (filter === 'cfc_state') return e.summary && e.summary.includes('cfc_state');
+    if (filter === 'pipeline_layer') return e.summary && e.summary.includes('pipeline_layer');
     if (filter === 'HTTP') return e.type === 'http';
     if (filter === 'ERROR') return e.type === 'error';
     return true;

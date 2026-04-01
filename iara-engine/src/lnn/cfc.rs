@@ -95,7 +95,7 @@ pub struct CfcLayer {
     pub weights: CfcWeights,
     pub state: CfcState,
     /// Buffer temporário para correction output [1, hidden_dim]
-    correction_buf: AnyTensor,
+    pub(crate) correction_buf: AnyTensor,
     /// Buffer temporário para f_proj [cfc_dim]
     f_proj_buf: AnyTensor,
     /// Buffer temporário para g_proj [cfc_dim]

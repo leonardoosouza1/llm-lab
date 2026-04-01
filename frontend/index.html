@@ -127,6 +127,38 @@
       aria-labelledby="tab-btn-live"
       tabindex="0"
     >
+      <!-- Subsystem Status Bar -->
+      <div class="glass-panel" style="margin-bottom:12px;padding:0;border-radius:6px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(56,189,248,.08));" aria-label="Subsystem status">
+        <div style="display:flex;gap:12px;align-items:center;padding:10px 16px;flex-wrap:wrap;">
+          <span style="font-size:10px;color:#9ca3af;font-weight:600;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;">Status:</span>
+
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-size:9px;color:#6b7280;font-family:'JetBrains Mono',monospace;">Backend</span>
+            <span id="subsys-backend" style="font-size:10px;padding:2px 8px;border-radius:3px;background:rgba(255,255,255,.08);color:#6b7280;font-family:'JetBrains Mono',monospace;font-weight:600;">unknown</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-size:9px;color:#6b7280;font-family:'JetBrains Mono',monospace;">Quantization</span>
+            <span id="subsys-quant" style="font-size:10px;padding:2px 8px;border-radius:3px;background:rgba(255,255,255,.08);color:#6b7280;font-family:'JetBrains Mono',monospace;font-weight:600;">bf16</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-size:9px;color:#6b7280;font-family:'JetBrains Mono',monospace;">ESN</span>
+            <span id="subsys-esn" style="font-size:10px;padding:2px 8px;border-radius:3px;background:rgba(255,255,255,.08);color:#6b7280;font-family:'JetBrains Mono',monospace;font-weight:600;">off</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-size:9px;color:#6b7280;font-family:'JetBrains Mono',monospace;">Gravity</span>
+            <span id="subsys-gravity" style="font-size:10px;padding:2px 8px;border-radius:3px;background:rgba(255,255,255,.08);color:#6b7280;font-family:'JetBrains Mono',monospace;font-weight:600;">off</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-size:9px;color:#6b7280;font-family:'JetBrains Mono',monospace;">CfC</span>
+            <span id="subsys-cfc" style="font-size:10px;padding:2px 8px;border-radius:3px;background:rgba(255,255,255,.08);color:#6b7280;font-family:'JetBrains Mono',monospace;font-weight:600;">off</span>
+          </div>
+        </div>
+      </div>
+
       <div class="panel-grid-live">
 
         <!-- Model Loader -->
@@ -381,15 +413,19 @@
               <div id="esn-state-norm" style="font-size:20px;font-weight:700;color:#fbbf24;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
-              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">TEMP ATUAL</div>
-              <div id="esn-temperature" style="font-size:20px;font-weight:700;color:#f87171;font-family:'JetBrains Mono',monospace;">—</div>
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">TEMP Δ</div>
+              <div id="esn-temp-delta" style="font-size:20px;font-weight:700;color:#f97316;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
               <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STEP</div>
               <div id="esn-step" style="font-size:20px;font-weight:700;color:#c4b5fd;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
           </div>
-          <canvas id="esn-entropy-canvas" height="60" style="width:100%;display:block;margin-top:4px;" aria-label="ESN entropy over time"></canvas>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px;margin-bottom:4px;">
+            <canvas id="esn-entropy-canvas" height="40" style="width:100%;display:block;" aria-label="ESN entropy sparkline"></canvas>
+            <canvas id="esn-top1-canvas" height="40" style="width:100%;display:block;" aria-label="ESN top1_prob sparkline"></canvas>
+            <canvas id="esn-state-norm-canvas" height="40" style="width:100%;display:block;" aria-label="ESN state_norm sparkline"></canvas>
+          </div>
         </div>
 
         <!-- Semantic Gravity (Fase 2) -->
@@ -404,19 +440,21 @@
           </div>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px 0;">
             <div style="text-align:center">
-              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">THRESHOLD</div>
-              <div id="gravity-threshold" style="font-size:20px;font-weight:700;color:#fbbf24;font-family:'JetBrains Mono',monospace;">—</div>
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">MEAN GRAVITY</div>
+              <div id="gravity-mean" style="font-size:18px;font-weight:700;color:#fbbf24;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
-              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">HISTORY</div>
-              <div id="gravity-history-len" style="font-size:20px;font-weight:700;color:#f97316;font-family:'JetBrains Mono',monospace;">—</div>
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">MAX GRAVITY</div>
+              <div id="gravity-max" style="font-size:18px;font-weight:700;color:#f97316;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
-              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STEP</div>
-              <div id="gravity-step" style="font-size:20px;font-weight:700;color:#c4b5fd;font-family:'JetBrains Mono',monospace;">—</div>
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">HIGH GRAVITY #</div>
+              <div id="gravity-high-count" style="font-size:18px;font-weight:700;color:#fb7185;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
           </div>
-          <canvas id="gravity-threshold-canvas" height="50" style="width:100%;display:block;margin-top:4px;" aria-label="Gravity threshold over time"></canvas>
+          <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:8px;">
+            <canvas id="gravity-threshold-canvas" height="50" style="width:100%;display:block;" aria-label="Gravity threshold and mean over time"></canvas>
+          </div>
         </div>
 
         <!-- CfC Liquid Correction (Fase 2) -->
@@ -429,20 +467,25 @@
             </h2>
             <span id="cfc-badge" style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:#6b7280;font-family:'JetBrains Mono',monospace;">inactive</span>
           </div>
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px 0;">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:12px 0;">
             <div style="text-align:center">
-              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">CFC DIM</div>
-              <div id="cfc-dim" style="font-size:20px;font-weight:700;color:#38bdf8;font-family:'JetBrains Mono',monospace;">—</div>
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">STATE NORM</div>
+              <div id="cfc-state-norm" style="font-size:18px;font-weight:700;color:#38bdf8;font-family:'JetBrains Mono',monospace;">—</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">CORR NORM</div>
+              <div id="cfc-correction-norm" style="font-size:18px;font-weight:700;color:#818cf8;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
               <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">PARAMS</div>
-              <div id="cfc-params" style="font-size:20px;font-weight:700;color:#818cf8;font-family:'JetBrains Mono',monospace;">—</div>
+              <div id="cfc-params" style="font-size:18px;font-weight:700;color:#a78bfa;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
             <div style="text-align:center">
               <div style="font-size:10px;color:#6b7280;font-family:'JetBrains Mono',monospace;margin-bottom:4px;">VRAM</div>
-              <div id="cfc-vram" style="font-size:20px;font-weight:700;color:#34d399;font-family:'JetBrains Mono',monospace;">—</div>
+              <div id="cfc-vram" style="font-size:18px;font-weight:700;color:#34d399;font-family:'JetBrains Mono',monospace;">—</div>
             </div>
           </div>
+          <canvas id="cfc-correction-canvas" height="50" style="width:100%;display:block;margin-top:8px;" aria-label="CfC correction_norm sparkline"></canvas>
         </div>
 
         <!-- Q4 Quantization Status -->
@@ -700,6 +743,10 @@
             <span class="control-label">Filter:</span>
             <button class="filter-btn filter-btn--all filter-btn--active" data-filter="ALL" type="button" aria-pressed="true">ALL</button>
             <button class="filter-btn filter-btn--ws" data-filter="WS" type="button" aria-pressed="false">WS</button>
+            <button class="filter-btn filter-btn--esn" data-filter="esn_state" type="button" aria-pressed="false">ESN</button>
+            <button class="filter-btn filter-btn--gravity" data-filter="gravity_state" type="button" aria-pressed="false">Gravity</button>
+            <button class="filter-btn filter-btn--cfc" data-filter="cfc_state" type="button" aria-pressed="false">CfC</button>
+            <button class="filter-btn filter-btn--pipeline" data-filter="pipeline_layer" type="button" aria-pressed="false">Pipeline</button>
             <button class="filter-btn filter-btn--http" data-filter="HTTP" type="button" aria-pressed="false">HTTP</button>
             <button class="filter-btn filter-btn--error" data-filter="ERROR" type="button" aria-pressed="false">ERROR</button>
             <span class="console-divider" aria-hidden="true"></span>

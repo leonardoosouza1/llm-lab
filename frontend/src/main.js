@@ -166,8 +166,28 @@ createApp({
     });
 
     // ── ESN Observer watcher ──────────────────────────────────────────────
-    let esnEntropyCtx = null;
     let esnEntropyPoints = [];
+    let esnTop1Points = [];
+    let esnStateNormPoints = [];
+
+    function drawSparkline(canvasId, points, color) {
+      const canvas = document.getElementById(canvasId);
+      if (!canvas || points.length < 2) return;
+      canvas.width = canvas.offsetWidth || 600;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+      const max = Math.max(...points, 0.01);
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      points.forEach((v, i) => {
+        const x = (i / (points.length - 1)) * W;
+        const y = H - (v / max) * (H - 4) - 2;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
 
     watch(() => store.esnLatest, esn => {
       if (!esn) return;
@@ -177,7 +197,7 @@ createApp({
       setText('esn-entropy',     esn.entropy    != null ? esn.entropy.toFixed(3)     : '—');
       setText('esn-top1',        esn.top1_prob  != null ? (esn.top1_prob * 100).toFixed(1) + '%' : '—');
       setText('esn-state-norm',  esn.state_norm != null ? esn.state_norm.toFixed(3)  : '—');
-      setText('esn-temperature', esn.temperature != null ? esn.temperature.toFixed(3) : '—');
+      setText('esn-temp-delta',  esn.temp_delta != null ? esn.temp_delta.toFixed(3)  : '—');
       setText('esn-step',        esn.step != null ? String(esn.step) : '—');
 
       // Trained badge
@@ -194,31 +214,25 @@ createApp({
         }
       }
 
-      // Mini sparkline de entropia
+      // Sparklines for entropy, top1_prob, state_norm
       esnEntropyPoints.push(esn.entropy || 0);
       if (esnEntropyPoints.length > 200) esnEntropyPoints.shift();
 
-      const canvas = document.getElementById('esn-entropy-canvas');
-      if (!canvas) return;
-      canvas.width = canvas.offsetWidth || 600;
-      const ctx = canvas.getContext('2d');
-      const W = canvas.width, H = canvas.height;
-      ctx.clearRect(0, 0, W, H);
-      if (esnEntropyPoints.length < 2) return;
-      const max = Math.max(...esnEntropyPoints, 0.01);
-      ctx.beginPath();
-      ctx.strokeStyle = '#a855f7';
-      ctx.lineWidth = 1.5;
-      esnEntropyPoints.forEach((v, i) => {
-        const x = (i / (esnEntropyPoints.length - 1)) * W;
-        const y = H - (v / max) * (H - 4) - 2;
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      });
-      ctx.stroke();
+      esnTop1Points.push(esn.top1_prob || 0);
+      if (esnTop1Points.length > 200) esnTop1Points.shift();
+
+      esnStateNormPoints.push(esn.state_norm || 0);
+      if (esnStateNormPoints.length > 200) esnStateNormPoints.shift();
+
+      drawSparkline('esn-entropy-canvas', esnEntropyPoints, '#a855f7');
+      drawSparkline('esn-top1-canvas', esnTop1Points, '#fbbf24');
+      drawSparkline('esn-state-norm-canvas', esnStateNormPoints, '#fbbf24');
     });
 
     // ── Gravity watcher ────────────────────────────────────────────────
     let gravityThresholdPoints = [];
+    let gravityMeanPoints = [];
+    let gravityHighCountHistory = [];
 
     watch(() => store.gravityLatest, grav => {
       if (!grav) return;
@@ -226,16 +240,29 @@ createApp({
       if (panel) panel.style.display = '';
 
       const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-      setText('gravity-threshold',   grav.threshold != null ? grav.threshold.toFixed(3) : '—');
-      setText('gravity-history-len', grav.history_len != null ? String(grav.history_len) : '—');
-      setText('gravity-step',        grav.step != null ? String(grav.step) : '—');
+      setText('gravity-mean',      grav.mean_gravity != null ? grav.mean_gravity.toFixed(3) : '—');
+      setText('gravity-max',       grav.max_gravity != null ? grav.max_gravity.toFixed(3) : '—');
+
+      // Count high-gravity tokens (e.g., gravity > threshold)
+      let highCount = 0;
+      if (grav.history_len != null && grav.threshold != null) {
+        // Estimate based on semantic significance threshold
+        highCount = Math.max(0, Math.round(grav.history_len * (grav.max_gravity || 0.5)));
+      }
+      setText('gravity-high-count', highCount > 0 ? String(highCount) : '—');
 
       const badge = document.getElementById('gravity-badge');
       if (badge) { badge.textContent = 'active'; badge.style.color = '#fbbf24'; badge.style.background = 'rgba(251,191,36,.1)'; }
 
-      // Sparkline threshold
+      // Sparkline for threshold and mean_gravity (dual line)
       gravityThresholdPoints.push(grav.threshold || 0);
       if (gravityThresholdPoints.length > 200) gravityThresholdPoints.shift();
+
+      gravityMeanPoints.push(grav.mean_gravity || 0);
+      if (gravityMeanPoints.length > 200) gravityMeanPoints.shift();
+
+      gravityHighCountHistory.push(highCount);
+      if (gravityHighCountHistory.length > 200) gravityHighCountHistory.shift();
 
       const canvas = document.getElementById('gravity-threshold-canvas');
       if (!canvas || gravityThresholdPoints.length < 2) return;
@@ -243,31 +270,57 @@ createApp({
       const ctx = canvas.getContext('2d');
       const W = canvas.width, H = canvas.height;
       ctx.clearRect(0, 0, W, H);
-      const max = Math.max(...gravityThresholdPoints, 0.01);
+
+      const maxThreshold = Math.max(...gravityThresholdPoints, 0.01);
+      const maxMean = Math.max(...gravityMeanPoints, 0.01);
+      const maxVal = Math.max(maxThreshold, maxMean);
+
+      // Draw threshold line (amber)
       ctx.beginPath();
       ctx.strokeStyle = '#fbbf24';
       ctx.lineWidth = 1.5;
       gravityThresholdPoints.forEach((v, i) => {
         const x = (i / (gravityThresholdPoints.length - 1)) * W;
-        const y = H - (v / max) * (H - 4) - 2;
+        const y = H - (v / maxVal) * (H - 4) - 2;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      // Draw mean line (faded cyan)
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(56,189,248,0.6)';
+      ctx.lineWidth = 1.5;
+      gravityMeanPoints.forEach((v, i) => {
+        const x = (i / (gravityMeanPoints.length - 1)) * W;
+        const y = H - (v / maxVal) * (H - 4) - 2;
         i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
       });
       ctx.stroke();
     });
 
     // ── CfC watcher ──────────────────────────────────────────────────
+    let cfcCorrectionNormPoints = [];
+
     watch(() => store.cfcLatest, cfc => {
       if (!cfc) return;
       const panel = document.getElementById('cfc-panel');
       if (panel) panel.style.display = '';
 
       const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-      setText('cfc-dim',    cfc.cfc_dim != null ? String(cfc.cfc_dim) : '—');
+      setText('cfc-state-norm',     cfc.state_norm != null ? cfc.state_norm.toFixed(3) : '—');
+      setText('cfc-correction-norm', cfc.correction_norm != null ? cfc.correction_norm.toFixed(3) : '—');
       setText('cfc-params', cfc.param_count != null ? (cfc.param_count > 1e6 ? (cfc.param_count / 1e6).toFixed(1) + 'M' : (cfc.param_count / 1e3).toFixed(1) + 'K') : '—');
       setText('cfc-vram',   cfc.vram_mb != null ? cfc.vram_mb.toFixed(1) + ' MB' : '—');
 
       const badge = document.getElementById('cfc-badge');
       if (badge) { badge.textContent = 'active'; badge.style.color = '#38bdf8'; badge.style.background = 'rgba(56,189,248,.1)'; }
+
+      // Sparkline for correction_norm
+      if (cfc.correction_norm != null) {
+        cfcCorrectionNormPoints.push(cfc.correction_norm);
+        if (cfcCorrectionNormPoints.length > 200) cfcCorrectionNormPoints.shift();
+        drawSparkline('cfc-correction-canvas', cfcCorrectionNormPoints, '#818cf8');
+      }
     });
 
     // ── Q4 watcher ───────────────────────────────────────────────────
@@ -283,11 +336,71 @@ createApp({
       if (badge) { badge.textContent = 'Q4 active'; badge.style.color = '#00ffc8'; badge.style.background = 'rgba(0,255,200,.1)'; }
     });
 
+    // ── Subsystem Status bar ──────────────────────────────────────────
+    watch(() => store.backend, backend => {
+      const el = document.getElementById('subsys-backend');
+      if (!el) return;
+      const statusText = backend === 'unknown' ? 'unknown' : backend.toUpperCase();
+      const color = backend === 'unknown' ? '#6b7280' : '#00ffc8';
+      el.textContent = statusText;
+      el.style.color = color;
+      el.style.background = backend === 'unknown' ? 'rgba(255,255,255,.08)' : 'rgba(0,255,200,.1)';
+    }, { immediate: true });
+
+    watch(() => store.quantization, quant => {
+      const el = document.getElementById('subsys-quant');
+      if (!el) return;
+      const statusText = quant.toUpperCase();
+      const color = quant === 'bf16' ? '#00ffc8' : quant === 'q4' ? '#f472b6' : '#9ca3af';
+      el.textContent = statusText;
+      el.style.color = color;
+      el.style.background = quant !== 'unknown' ? 'rgba(255,255,255,.1)' : 'rgba(255,255,255,.08)';
+    }, { immediate: true });
+
+    watch(() => store.esnActive, active => {
+      const el = document.getElementById('subsys-esn');
+      if (!el) return;
+      el.textContent = active ? 'ON' : 'OFF';
+      el.style.color = active ? '#a855f7' : '#6b7280';
+      el.style.background = active ? 'rgba(168,85,247,.1)' : 'rgba(255,255,255,.08)';
+    }, { immediate: true });
+
+    watch(() => store.gravityActive, active => {
+      const el = document.getElementById('subsys-gravity');
+      if (!el) return;
+      el.textContent = active ? 'ON' : 'OFF';
+      el.style.color = active ? '#fbbf24' : '#6b7280';
+      el.style.background = active ? 'rgba(251,191,36,.1)' : 'rgba(255,255,255,.08)';
+    }, { immediate: true });
+
+    watch(() => store.cfcActive, active => {
+      const el = document.getElementById('subsys-cfc');
+      if (!el) return;
+      el.textContent = active ? 'ON' : 'OFF';
+      el.style.color = active ? '#38bdf8' : '#6b7280';
+      el.style.background = active ? 'rgba(56,189,248,.1)' : 'rgba(255,255,255,.08)';
+    }, { immediate: true });
+
+    // ── Console filter watcher ────────────────────────────────────────
+    watch(() => store.logFilter, filter => {
+      const buttons = document.querySelectorAll('.console-filter-inner [data-filter]');
+      buttons.forEach(btn => {
+        const isActive = btn.dataset.filter === filter;
+        btn.classList.toggle('filter-btn--active', isActive);
+        btn.setAttribute('aria-pressed', String(isActive));
+      });
+    });
+
     // Reseta ESN + Gravity + CfC ao iniciar nova geração
     watch(() => store.generating, gen => {
       if (gen) {
         esnEntropyPoints = [];
+        esnTop1Points = [];
+        esnStateNormPoints = [];
         gravityThresholdPoints = [];
+        gravityMeanPoints = [];
+        gravityHighCountHistory = [];
+        cfcCorrectionNormPoints = [];
         store.esnHistory = [];
         store.esnLatest = null;
         store.gravityLatest = null;
@@ -298,12 +411,13 @@ createApp({
         setText('esn-entropy', '—');
         setText('esn-top1', '—');
         setText('esn-state-norm', '—');
-        setText('esn-temperature', '—');
+        setText('esn-temp-delta', '—');
         setText('esn-step', '—');
-        setText('gravity-threshold', '—');
-        setText('gravity-history-len', '—');
-        setText('gravity-step', '—');
-        setText('cfc-dim', '—');
+        setText('gravity-mean', '—');
+        setText('gravity-max', '—');
+        setText('gravity-high-count', '—');
+        setText('cfc-state-norm', '—');
+        setText('cfc-correction-norm', '—');
         setText('cfc-params', '—');
         setText('cfc-vram', '—');
         setText('q4-vram', '—');

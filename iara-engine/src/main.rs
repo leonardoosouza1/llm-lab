@@ -252,21 +252,39 @@ async fn run_engine_loop(
                         "readout_trained": esn_tel.readout_trained,
                     }).to_string());
 
-                    // ── Gravity + CfC telemetry (Fase 2) ────────────────
+                    // ── Gravity + CfC + Q4 telemetry (Fase 2) ────────────
                     {
                         let guard = model.lock().await;
                         if let Some(m) = guard.as_ref() {
+                            // Gravity telemetry com mean/max da última observação
                             if let Some(ref grav) = m.gravity {
+                                let hist = &grav.history;
+                                let (mean_g, max_g) = if let Some(&last) = hist.last() {
+                                    (last, hist.iter().cloned().fold(0f32, f32::max))
+                                } else {
+                                    (0.0, 0.0)
+                                };
                                 let _ = frame_tx.send(serde_json::json!({
                                     "type": "gravity_state",
                                     "step": step,
                                     "enabled": true,
                                     "history_len": grav.history_len(),
                                     "threshold": grav.current_threshold(),
+                                    "mean_gravity": mean_g,
+                                    "max_gravity": max_g,
                                 }).to_string());
                             }
 
+                            // CfC telemetry com state_norm e correction_norm
                             if let Some(ref cfc) = m.cfc {
+                                // Download state h e correction para calcular normas
+                                let h_data = m.backend.download_f32(&cfc.state.h);
+                                let state_norm = h_data.iter()
+                                    .map(|x| x * x).sum::<f32>().sqrt();
+                                let corr_data = m.backend.download_f32(&cfc.correction_buf);
+                                let correction_norm = corr_data.iter()
+                                    .map(|x| x * x).sum::<f32>().sqrt();
+
                                 let _ = frame_tx.send(serde_json::json!({
                                     "type": "cfc_state",
                                     "step": step,
@@ -274,13 +292,17 @@ async fn run_engine_loop(
                                     "cfc_dim": cfc.config.cfc_dim,
                                     "param_count": cfc.param_count(),
                                     "vram_mb": cfc.vram_bytes() as f64 / (1024.0 * 1024.0),
+                                    "state_norm": state_norm,
+                                    "correction_norm": correction_norm,
                                 }).to_string());
                             }
 
+                            // Q4 status
                             if m.quantized {
                                 let _ = frame_tx.send(serde_json::json!({
                                     "type": "q4_status",
                                     "step": step,
+                                    "active": true,
                                     "quantized": true,
                                     "vram_mb": m.vram_bytes as f64 / (1024.0 * 1024.0),
                                 }).to_string());

@@ -80,9 +80,31 @@ export const wsManager = {
   reset() { this.send({ type: 'reset' }); },
 
   /**
+   * Log a message to the console
+   */
+  _logMessage(type, summary, raw) {
+    const now = new Date();
+    const ts = now.toTimeString().split(' ')[0]; // HH:MM:SS
+    const entry = {
+      id: `${Date.now()}-${Math.random()}`,
+      ts: ts,
+      type: type,
+      summary: summary,
+      raw: raw,
+    };
+    store.logs.push(entry);
+    // Keep log buffer bounded (5000 entries)
+    if (store.logs.length > 5000) store.logs.shift();
+  },
+
+  /**
    * Dispatch messages to the global store
    */
   dispatch(msg) {
+    // Log ALL incoming messages
+    const summary = msg.type + (msg.step !== undefined ? ` #${msg.step}` : '');
+    this._logMessage('ws-in', summary, msg);
+
     switch (msg.type) {
       case 'status':
         store.loadingMsg = msg.message || '';
@@ -124,10 +146,14 @@ export const wsManager = {
         store.modelReady = true;
         store.modelLoading = false;
         store.modelName = msg.name || store.selectedModelName;
+        // Update backend and quantization info if available
+        if (msg.backend) store.backend = msg.backend;
+        if (msg.quantization) store.quantization = msg.quantization;
         break;
 
       case 'esn_state':
         store.esnLatest = msg;
+        store.esnActive = true;
         store.esnHistory.push({
           step:        msg.step,
           entropy:     msg.entropy,
@@ -142,24 +168,29 @@ export const wsManager = {
 
       case 'gravity_state':
         store.gravityLatest = msg;
+        store.gravityActive = true;
         store.gravityHistory.push({
           step:        msg.step,
           history_len: msg.history_len,
           threshold:   msg.threshold,
+          mean_gravity: msg.mean_gravity,
+          max_gravity: msg.max_gravity,
         });
         if (store.gravityHistory.length > 512) store.gravityHistory.shift();
         break;
 
       case 'cfc_state':
         store.cfcLatest = msg;
+        store.cfcActive = true;
         break;
 
       case 'q4_status':
         store.q4Latest = msg;
+        if (msg.active) store.quantization = 'q4';
         break;
 
       default:
-        // console.log('Unhandled WS message type:', msg.type);
+        // Still log unhandled types
         break;
     }
   }

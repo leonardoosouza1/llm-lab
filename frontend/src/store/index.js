@@ -69,4 +69,11 @@ export const store = reactive({
 
   // Q4 Quantization status
   q4Latest: null,        // último frame q4_status
+
+  // Subsystem Status
+  backend: 'unknown',    // 'rocm' | 'opencl' | 'cpu'
+  quantization: 'bf16',  // 'bf16' | 'q4' | 'f32'
+  esnActive: false,
+  gravityActive: false,
+  cfcActive: false,
 });

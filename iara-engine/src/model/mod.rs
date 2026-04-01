@@ -24,7 +24,7 @@ use compute_core::{
 use half::bf16;
 use std::collections::HashMap;
 use std::path::Path;
-use crate::storage::quantized::{QuantizedTensor, quantize_bf16_to_q4, upload_quantized};
+use crate::storage::quantized::{QuantizedTensor, quantize_bf16_to_q4, upload_quantized, QuantizationCpuResult, save_quantized_cache, load_quantized_cache};
 
 // ── Tipos de erro ────────────────────────────────────────────────────────────
 
@@ -481,38 +481,62 @@ impl QwenModel {
             cfg.num_layers, cfg.hidden_size, cfg.vocab_size
         );
 
+        // ── Tentar carregar cache pré-quantizado ──────────────────────────────
+        let group_size = 128usize;
+        let use_cache = if let Ok(Some((cached_tensors, cached_shapes, cached_group_size))) = load_quantized_cache(model_dir) {
+            if cached_group_size == group_size {
+                log::info!("⚡ Cache quantizado encontrado e válido, usando...");
+                Some((cached_tensors, cached_shapes))
+            } else {
+                log::warn!(
+                    "⚠️  Cache com group_size incompatível: {} vs esperado {}, re-quantizando...",
+                    cached_group_size, group_size
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         // ── Mmaps (idêntico ao load()) ────────────────────────────────────────
         let mut shards: HashMap<String, memmap2::Mmap> = HashMap::new();
         let tensor_shard_map: Option<HashMap<String, String>>;
 
-        let index_path = model_dir.join("model.safetensors.index.json");
-        if index_path.exists() {
-            let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-            let weight_map = index["weight_map"].as_object()
-                .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
-            let mut tsm: HashMap<String, String> = HashMap::new();
-            for (k, v) in weight_map {
-                if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
-            }
-            for shard_name in tsm.values() {
-                if shards.contains_key(shard_name) { continue; }
-                let file = std::fs::File::open(model_dir.join(shard_name))?;
+        // Só carrega mmaps se não estamos usando cache
+        let should_load_mmaps = use_cache.is_none();
+
+        if should_load_mmaps {
+            let index_path = model_dir.join("model.safetensors.index.json");
+            if index_path.exists() {
+                let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+                let weight_map = index["weight_map"].as_object()
+                    .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
+                let mut tsm: HashMap<String, String> = HashMap::new();
+                for (k, v) in weight_map {
+                    if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
+                }
+                for shard_name in tsm.values() {
+                    if shards.contains_key(shard_name) { continue; }
+                    let file = std::fs::File::open(model_dir.join(shard_name))?;
+                    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                    shards.insert(shard_name.clone(), mmap);
+                }
+                tensor_shard_map = Some(tsm);
+                log::info!("  → multi-shard ({} shards)", shards.len());
+            } else {
+                let single = model_dir.join("model.safetensors");
+                if !single.exists() {
+                    return Err(ModelError::Model(
+                        "Nenhum safetensors encontrado".into()
+                    ));
+                }
+                let file = std::fs::File::open(&single)?;
                 let mmap = unsafe { memmap2::Mmap::map(&file)? };
-                shards.insert(shard_name.clone(), mmap);
+                log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
+                shards.insert("model.safetensors".to_string(), mmap);
+                tensor_shard_map = None;
             }
-            tensor_shard_map = Some(tsm);
-            log::info!("  → multi-shard ({} shards)", shards.len());
         } else {
-            let single = model_dir.join("model.safetensors");
-            if !single.exists() {
-                return Err(ModelError::Model(
-                    "Nenhum safetensors encontrado".into()
-                ));
-            }
-            let file = std::fs::File::open(&single)?;
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
-            shards.insert("model.safetensors".to_string(), mmap);
             tensor_shard_map = None;
         }
 
@@ -539,9 +563,24 @@ impl QwenModel {
         };
 
         // ── Helpers para quantização ─────────────────────────────────────────
-        let group_size = 128usize;
+        // Armazena tensores quantizados para salvar cache depois
+        let mut quantized_cache: HashMap<String, QuantizationCpuResult> = HashMap::new();
+        let mut quantized_shapes: HashMap<String, [usize; 2]> = HashMap::new();
 
-        let quantize_weight = |name: &str| -> ModelResult<LayerWeight> {
+        let mut quantize_weight = |name: &str| -> ModelResult<LayerWeight> {
+            // Se temos cache, usar dele
+            if let Some((cached_tensors, cached_shapes)) = &use_cache {
+                if let Some(cpu_result) = cached_tensors.get(name) {
+                    if let Some(shape) = cached_shapes.get(name) {
+                        // Upload direto do cache
+                        let quantized = upload_quantized(cpu_result, &[shape[0], shape[1]], group_size, &backend)
+                            .map_err(|e| ModelError::Model(format!("Upload quantizado falhou: {}", e)))?;
+                        return Ok(LayerWeight::Q4(quantized));
+                    }
+                }
+            }
+
+            // Caso contrário, quantizar do zero
             let mmap = find_mmap(name)
                 .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
             let (raw_bytes, shape) = shard_tensor_bytes(mmap, name)?;
@@ -557,6 +596,12 @@ impl QwenModel {
             // Quantizar BF16 → INT4 na CPU
             let cpu_result = quantize_bf16_to_q4(bits, &shape, group_size)
                 .map_err(|e| ModelError::Model(format!("Quantização falhou: {}", e)))?;
+
+            // Armazenar para cache se não estamos usando cache
+            if use_cache.is_none() {
+                quantized_cache.insert(name.to_string(), cpu_result.clone());
+                quantized_shapes.insert(name.to_string(), [shape[0], shape[1]]);
+            }
 
             // Upload para GPU
             let quantized = upload_quantized(&cpu_result, &shape, group_size, &backend)
@@ -691,6 +736,13 @@ impl QwenModel {
         } else {
             None
         };
+
+        // ── Salvar cache de quantização se não estava usando cache ──────────────
+        if use_cache.is_none() && !quantized_cache.is_empty() {
+            if let Err(e) = save_quantized_cache(model_dir, &quantized_cache, &quantized_shapes, group_size) {
+                log::warn!("⚠️  Falha ao salvar cache quantizado: {}", e);
+            }
+        }
 
         log::info!(
             "✅ Qwen carregado (Q4) — memória estimada: {:.2} GB (4x redução vs BF16)",
@@ -932,45 +984,45 @@ impl QwenModel {
             Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
         }
 
-        // ── Gravity scoring (opcional, observação da última camada) ────────────
-        // Calcula importância semântica a partir dos attention scores da última layer.
-        // scratch.scores ainda contém os scores da última iteração do loop.
-        if let Some(ref mut grav) = self.gravity {
-            let last_layer = self.layers.last().unwrap();
-            let seq = last_layer.kv_k.current_len;
-            match grav.compute(
-                &self.backend,
-                &self.scratch.scores,
-                &last_layer.kv_v.data,
-                seq,
-                nh,
-            ) {
-                Ok(_result) => {
-                    log::debug!(
-                        "Gravity: mean={:.3}, max={:.3}, threshold={:.3}, high_tokens={}",
-                        _result.mean_gravity, _result.max_gravity,
-                        _result.effective_threshold, _result.high_gravity_tokens.len(),
-                    );
+        // ── Gravity + CfC (decode-only: n == 1) ──────────────────────────────
+        // Durante o prefill (n > 1) o scratch.scores tem layout [nh, n, seq]
+        // — incompatível com o que gravity e CfC esperam ([nh, seq] e [1, h]).
+        // Ambas as operações só fazem sentido no decode, token a token.
+        if n == 1 {
+            // Gravity: scratch.scores = [nh, 1, seq] → gravity usa como [nh, seq]
+            if let Some(ref mut grav) = self.gravity {
+                let last_layer = self.layers.last().unwrap();
+                let seq = last_layer.kv_k.current_len;
+                match grav.compute(
+                    &self.backend,
+                    &self.scratch.scores,
+                    &last_layer.kv_v.data,
+                    seq,
+                    nh,
+                ) {
+                    Ok(_result) => {
+                        log::debug!(
+                            "Gravity: mean={:.3}, max={:.3}, threshold={:.3}, high_tokens={}",
+                            _result.mean_gravity, _result.max_gravity,
+                            _result.effective_threshold, _result.high_gravity_tokens.len(),
+                        );
+                    }
+                    Err(e) => log::warn!("Gravity score falhou: {}", e),
                 }
-                Err(e) => log::warn!("Gravity score falhou: {}", e),
             }
-        }
 
-        // ── CfC Correction (opcional) ──────────────────────────────────────────
-        // Aplicado após o último transformer block, antes do lm_head.
-        // A correção é somada ao hidden state: x += correction
-        if let Some(cfc) = &mut self.cfc {
-            // Forward da CfC: toma hidden state (último token), retorna correção [1, h]
-            // Usa normed como input pois já é a representação normalizada do último token
-            let correction = cfc.forward(&self.backend, &self.scratch.normed)?;
-            // x += 1.0 * correction (soma element-wise dos últimos n*h floats)
-            self.backend.add_tensors_inplace(
-                &self.scratch.x,
-                correction,
-                n * h,
-                1.0,
-            )?;
-            log::debug!("CfC correction aplicada: {} elementos", n * h);
+            // CfC: correction_buf é [1, h] — exatamente h floats.
+            if let Some(cfc) = &mut self.cfc {
+                let correction = cfc.forward(&self.backend, &self.scratch.normed)?;
+                // Aplica correção apenas no único token: x[0..h] += correction[0..h]
+                self.backend.add_tensors_inplace(
+                    &self.scratch.x,
+                    correction,
+                    h,   // apenas 1 token × hidden_size
+                    1.0,
+                )?;
+                log::debug!("CfC correction aplicada: {} elementos", h);
+            }
         }
 
         // ── Final RMSNorm ─────────────────────────────────────────────────────

@@ -388,10 +388,17 @@ pub async fn load_model_handler(
                 model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                 model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
                 log::info!("✅ Modelo '{}' carregado em {:.1}s", model_name, start.elapsed().as_secs_f32());
+                let backend_name = {
+                    let g = model_arc.lock().await;
+                    g.as_ref().map(|m| m.backend.name().to_string()).unwrap_or_default()
+                };
+                let quant_str = if quantize_on_load { "q4" } else { "bf16" };
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "model_loaded",
                     "name": model_name,
-                    "message": format!("✅ '{}' pronto! ({:.1}s)", model_name, start.elapsed().as_secs_f32())
+                    "message": format!("✅ '{}' pronto! ({:.1}s)", model_name, start.elapsed().as_secs_f32()),
+                    "backend": backend_name,
+                    "quantization": quant_str,
                 }).to_string());
             }
             Err(e) => {

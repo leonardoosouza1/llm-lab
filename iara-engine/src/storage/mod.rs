@@ -12,6 +12,7 @@ pub use quantized::{
     IaraTensorMeta, IaraHeader,
     quantize_bf16_to_q4, upload_quantized, write_iara_file, read_iara_header,
     load_quantized_tensor_from_iara, cpu_result_to_bytes,
+    save_quantized_cache, load_quantized_cache,
 };
 
 // ============================================================================

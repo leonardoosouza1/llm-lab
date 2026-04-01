@@ -67,6 +67,7 @@ pub struct QuantizedTensor {
 
 /// Resultado intermediário da quantização INT4 na CPU.
 /// Pronto para upload via ComputeBackend.
+#[derive(Clone)]
 pub struct QuantizationCpuResult {
     /// Bytes comprimidos INT4: [rows * cols / 2]
     pub packed: Vec<u8>,
@@ -515,6 +516,285 @@ pub fn cpu_result_to_bytes(
     };
 
     (data, meta)
+}
+
+// ── Sistema de cache pré-quantizado ──────────────────────────────────────────
+
+/// Salva mapa de tensores quantizados em cache .iara.
+///
+/// Layout do arquivo:
+/// ```
+/// [4 bytes]   magic "IARA"
+/// [4 bytes]   version (u32 LE)
+/// [4 bytes]   group_size (u32 LE)
+/// [4 bytes]   num_tensors (u32 LE)
+/// [...]       Tensor entries:
+///   Para cada tensor:
+///   [4 bytes]   name_len (u32 LE)
+///   [name_len]  name (UTF-8)
+///   [4 bytes]   rows (u32 LE)
+///   [4 bytes]   cols (u32 LE)
+///   [4 bytes]   packed_len (u32 LE)
+///   [packed_len] packed_data (INT4)
+///   [4 bytes]   scales_len (u32 LE)
+///   [scales_len] scales_data (f32 LE)
+///   [4 bytes]   zeros_len (u32 LE)
+///   [zeros_len]  zeros_data (f32 LE)
+/// ```
+pub fn save_quantized_cache(
+    model_dir: &Path,
+    tensors: &HashMap<String, QuantizationCpuResult>,
+    shapes: &HashMap<String, [usize; 2]>,
+    group_size: usize,
+) -> QuantizationResult<()> {
+    let cache_path = model_dir.join("quantized_cache.iara");
+    let mut file = File::create(&cache_path)?;
+
+    // Magic + version + group_size + tensor count
+    file.write_all(IARA_MAGIC)?;
+    file.write_all(&IARA_VERSION.to_le_bytes())?;
+    file.write_all(&(group_size as u32).to_le_bytes())?;
+    file.write_all(&(tensors.len() as u32).to_le_bytes())?;
+
+    // Salvar cada tensor
+    for (name, cpu_result) in tensors {
+        let shape = shapes
+            .get(name)
+            .ok_or_else(|| QuantizationError::Quantize(
+                format!("Shape não encontrado para tensor '{}'", name),
+            ))?;
+
+        let rows = shape[0] as u32;
+        let cols = shape[1] as u32;
+
+        // Nome do tensor
+        let name_bytes = name.as_bytes();
+        file.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        file.write_all(name_bytes)?;
+
+        // Shape
+        file.write_all(&rows.to_le_bytes())?;
+        file.write_all(&cols.to_le_bytes())?;
+
+        // Packed INT4
+        file.write_all(&(cpu_result.packed.len() as u32).to_le_bytes())?;
+        file.write_all(&cpu_result.packed)?;
+
+        // Scales F32
+        file.write_all(&(cpu_result.scales.len() as u32).to_le_bytes())?;
+        for &s in &cpu_result.scales {
+            file.write_all(&s.to_le_bytes())?;
+        }
+
+        // Zeros F32
+        file.write_all(&(cpu_result.zeros.len() as u32).to_le_bytes())?;
+        for &z in &cpu_result.zeros {
+            file.write_all(&z.to_le_bytes())?;
+        }
+    }
+
+    log::info!(
+        "💾 Cache quantizado salvo: {} ({} tensores)",
+        cache_path.display(),
+        tensors.len()
+    );
+
+    Ok(())
+}
+
+/// Carrega cache quantizado pré-salvo de disco.
+/// Retorna HashMap<tensor_name, QuantizationCpuResult> se encontrado e válido.
+pub fn load_quantized_cache(
+    model_dir: &Path,
+) -> QuantizationResult<Option<(HashMap<String, QuantizationCpuResult>, HashMap<String, [usize; 2]>, usize)>> {
+    let cache_path = model_dir.join("quantized_cache.iara");
+
+    if !cache_path.exists() {
+        log::debug!("⏭️  Cache quantizado não encontrado: {}", cache_path.display());
+        return Ok(None);
+    }
+
+    let data = std::fs::read(&cache_path)?;
+
+    if data.len() < 16 {
+        return Err(QuantizationError::InvalidFormat(
+            "Arquivo cache muito pequeno: < 16 bytes".into(),
+        ));
+    }
+
+    // Magic
+    if &data[0..4] != IARA_MAGIC {
+        return Err(QuantizationError::InvalidFormat(
+            format!(
+                "Magic inválido no cache: {:?} (esperado IARA)",
+                &data[0..4]
+            ),
+        ));
+    }
+
+    // Version
+    let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    if version != IARA_VERSION {
+        return Err(QuantizationError::InvalidFormat(
+            format!(
+                "Version incompatível no cache: {} (esperado {})",
+                version, IARA_VERSION
+            ),
+        ));
+    }
+
+    // Group size
+    let group_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+
+    // Tensor count
+    let num_tensors = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+
+    let mut tensors = HashMap::new();
+    let mut shapes = HashMap::new();
+    let mut pos = 16usize;
+
+    for tensor_idx in 0..num_tensors {
+        // Nome
+        if pos + 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler tensor {}", tensor_idx),
+            ));
+        }
+        let name_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + name_len > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler nome tensor {}", tensor_idx),
+            ));
+        }
+        let name = std::str::from_utf8(&data[pos..pos + name_len])
+            .map_err(|e| QuantizationError::InvalidFormat(format!("UTF-8 inválido no nome: {}", e)))?
+            .to_string();
+        pos += name_len;
+
+        // Shape
+        if pos + 8 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler shape tensor {}", tensor_idx),
+            ));
+        }
+        let rows = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let cols = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        pos += 8;
+
+        // Packed INT4
+        if pos + 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler packed_len tensor '{}'", name),
+            ));
+        }
+        let packed_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + packed_len > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler packed_data tensor '{}'", name),
+            ));
+        }
+        let packed = data[pos..pos + packed_len].to_vec();
+        pos += packed_len;
+
+        // Scales F32
+        if pos + 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler scales_len tensor '{}'", name),
+            ));
+        }
+        let scales_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + scales_len * 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler scales_data tensor '{}'", name),
+            ));
+        }
+        let mut scales = Vec::with_capacity(scales_len);
+        for i in 0..scales_len {
+            let offset = pos + i * 4;
+            let scale = f32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            scales.push(scale);
+        }
+        pos += scales_len * 4;
+
+        // Zeros F32
+        if pos + 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler zeros_len tensor '{}'", name),
+            ));
+        }
+        let zeros_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + zeros_len * 4 > data.len() {
+            return Err(QuantizationError::InvalidFormat(
+                format!("Arquivo truncado ao ler zeros_data tensor '{}'", name),
+            ));
+        }
+        let mut zeros = Vec::with_capacity(zeros_len);
+        for i in 0..zeros_len {
+            let offset = pos + i * 4;
+            let zero = f32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            zeros.push(zero);
+        }
+        pos += zeros_len * 4;
+
+        // Validar consistência de scales/zeros
+        if scales.len() != (rows * cols / group_size) {
+            return Err(QuantizationError::Quantize(
+                format!(
+                    "Tamanho scales inconsistente para '{}': {} vs esperado {}",
+                    name,
+                    scales.len(),
+                    rows * cols / group_size
+                ),
+            ));
+        }
+        if zeros.len() != (rows * cols / group_size) {
+            return Err(QuantizationError::Quantize(
+                format!(
+                    "Tamanho zeros inconsistente para '{}': {} vs esperado {}",
+                    name,
+                    zeros.len(),
+                    rows * cols / group_size
+                ),
+            ));
+        }
+
+        tensors.insert(
+            name.clone(),
+            QuantizationCpuResult {
+                packed,
+                scales,
+                zeros,
+                n_groups_per_row: cols / group_size,
+            },
+        );
+        shapes.insert(name, [rows, cols]);
+    }
+
+    log::info!(
+        "✅ Cache quantizado carregado: {} tensores, group_size={}",
+        tensors.len(),
+        group_size
+    );
+
+    Ok(Some((tensors, shapes, group_size)))
 }
 
 #[cfg(test)]
