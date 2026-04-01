@@ -572,6 +572,18 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn add_tensors_inplace(&self, a: &AnyTensor, b: &AnyTensor, n_elems: usize, alpha: f32) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.add_tensors_inplace(
+                f32_mut_ptr(a),
+                f32_ptr(b),
+                n_elems as i32,
+                alpha,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     // ── Sync and info ─────────────────────────────────────────────────────────
 
     fn sync(&self) -> Result<(), BackendError> {

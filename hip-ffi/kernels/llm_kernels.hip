@@ -389,27 +389,31 @@ __device__ __forceinline__ float fp16_to_f32(unsigned short bits) {
 __launch_bounds__(256, 2)
 extern "C" __global__ void dequant_gemv_q4(
     const unsigned char* __restrict__ packed,   // [N, K/2] — 2 int4 per byte
-    const unsigned short* __restrict__ scales,  // [N, K/group_size] — FP16
-    const unsigned short* __restrict__ zeros,   // [N, K/group_size] — FP16
-    const float* __restrict__ x,                // [K] — input activations
-    float* __restrict__ out,                    // [N] — output
-    int N,           // output dim (rows)
+    const float* __restrict__ scales,           // [N, K/group_size] — F32
+    const float* __restrict__ zeros,            // [N, K/group_size] — F32
+    const float* __restrict__ x,                // [M, K] — input activations
+    float* __restrict__ out,                    // [M, N] — output
+    int M,           // batch dim (tokens)
+    int N,           // output dim (rows of weight matrix)
     int K,           // input dim (hidden, columns)
     int group_size,  // typically 128
     float beta       // 0.0=overwrite, 1.0=accumulate
 ) {
     extern __shared__ float sdata[];  // 256 floats for reduction
 
-    int row = blockIdx.x;           // which output row this block processes
+    int row = blockIdx.x;           // which output row (weight row) this block processes
+    int mi  = blockIdx.y;           // which token in the batch [0..M)
     int tid = (int)threadIdx.x;     // thread index within block
     int bsz = (int)blockDim.x;      // block size = 256
 
-    if (row >= N) return;
+    if (row >= N || mi >= M) return;
 
     // Compute pointers to this row's packed weights, scales, and zeros.
+    int n_groups = (K + group_size - 1) / group_size;
     const unsigned char* packed_row = packed + (size_t)row * (K / 2);
-    const unsigned short* scales_row = scales + (size_t)row * ((K + group_size - 1) / group_size);
-    const unsigned short* zeros_row = zeros + (size_t)row * ((K + group_size - 1) / group_size);
+    const float* scales_row = scales + (size_t)row * n_groups;
+    const float* zeros_row  = zeros  + (size_t)row * n_groups;
+    const float* x_row      = x + (size_t)mi * K;
 
     // Accumulate partial dot product in this thread.
     float local_sum = 0.0f;
@@ -420,10 +424,8 @@ extern "C" __global__ void dequant_gemv_q4(
         unsigned char packed_byte = packed_row[byte_idx];
         int int4_val;
         if (k % 2 == 0) {
-            // Low nibble (4 bits)
             int4_val = (int)(packed_byte & 0x0F);
         } else {
-            // High nibble (4 bits)
             int4_val = (int)((packed_byte >> 4) & 0x0F);
         }
 
@@ -432,16 +434,16 @@ extern "C" __global__ void dequant_gemv_q4(
             int4_val -= 16;
         }
 
-        // Get group index and dequant parameters.
+        // Get group index and dequant parameters (F32 — sem conversão).
         int group_idx = k / group_size;
-        float scale_f32 = fp16_to_f32(scales_row[group_idx]);
-        float zero_f32 = fp16_to_f32(zeros_row[group_idx]);
+        float scale_f32 = scales_row[group_idx];
+        float zero_f32 = zeros_row[group_idx];
 
         // Dequantize: w = scale * (int4_val - zero)
         float w = scale_f32 * ((float)int4_val - zero_f32);
 
         // Accumulate into dot product.
-        local_sum += w * x[k];
+        local_sum += w * x_row[k];
     }
 
     // Write local_sum to shared memory for reduction.
@@ -456,13 +458,14 @@ extern "C" __global__ void dequant_gemv_q4(
         __syncthreads();
     }
 
-    // Thread 0 writes the final result.
+    // Thread 0 writes the final result for this (mi, row).
     if (tid == 0) {
         float result = sdata[0];
+        int out_idx = mi * N + row;
         if (beta == 0.0f) {
-            out[row] = result;
+            out[out_idx] = result;
         } else {
-            out[row] = beta * out[row] + result;
+            out[out_idx] = beta * out[out_idx] + result;
         }
     }
 }
@@ -722,5 +725,25 @@ extern "C" __global__ void kv_cache_quantize_append(
         // Truncate to FP16 by taking upper 16 bits (BF16-like, or use actual F16 if available).
         tok_scales[g] = (unsigned short)(scale_bits >> 16);
         tok_zeros[g] = (unsigned short)(zero_bits >> 16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 14: add_tensors_inplace
+//
+// Element-wise in-place addition: a[i] += alpha * b[i]
+//
+// Grid : (ceil(n / 256), 1, 1)
+// Block: (256, 1, 1)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void add_tensors_inplace(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    int n,
+    float alpha
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        a[i] += alpha * b[i];
     }
 }

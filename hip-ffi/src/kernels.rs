@@ -55,6 +55,7 @@ pub struct GpuKernels {
     fn_cfc_gate_update: hipFunction_t,
     fn_value_norms: hipFunction_t,
     fn_kv_cache_quantize: hipFunction_t,
+    fn_add_tensors: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -89,6 +90,7 @@ impl GpuKernels {
         let fn_cfc_gate_update = get_fn!("cfc_gate_update");
         let fn_value_norms = get_fn!("value_norms");
         let fn_kv_cache_quantize = get_fn!("kv_cache_quantize_append");
+        let fn_add_tensors = get_fn!("add_tensors_inplace");
 
         Ok(Self {
             module,
@@ -105,6 +107,7 @@ impl GpuKernels {
             fn_cfc_gate_update,
             fn_value_norms,
             fn_kv_cache_quantize,
+            fn_add_tensors,
         })
     }
 }
@@ -563,9 +566,10 @@ impl GpuKernels {
         group_size: i32,
         beta: f32,
     ) -> Result<(), HipError> {
-        let bsz = block_size(k as u32, 1024);
-        let grid = (n as u32, 1, 1);
+        let bsz = block_size(k as u32, 256);  // max 256 (kernel __launch_bounds__)
+        let grid = (n as u32, m.max(1) as u32, 1);  // (N rows, M tokens)
         let block = (bsz, 1, 1);
+        let shared_mem = bsz * 4;  // 256 floats × 4 bytes
 
         let mut p_packed = packed;
         let mut p_scales = scales;
@@ -582,7 +586,7 @@ impl GpuKernels {
             self.fn_dequant_gemv_q4,
             grid,
             block,
-            0,
+            shared_mem,
             ptr::null_mut(),
             &mut [
                 &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
@@ -792,6 +796,42 @@ impl GpuKernels {
                 &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
                 &mut p_max_seq as *mut i32 as *mut std::ffi::c_void,
                 &mut p_group_size as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Element-wise in-place addition: a[i] += alpha * b[i] for F32 tensors.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn add_tensors_inplace(
+        &self,
+        a: *mut f32,      // [n] F32 on GPU (modified in-place)
+        b: *const f32,    // [n] F32 on GPU
+        n: i32,
+        alpha: f32,
+    ) -> Result<(), HipError> {
+        let block_x: u32 = 256;
+        let grid_x = ceil_div(n as u32, block_x);
+        let grid = (grid_x, 1, 1);
+        let block = (block_x, 1, 1);
+
+        let mut p_a = a;
+        let mut p_b = b;
+        let mut p_n = n;
+        let mut p_alpha = alpha;
+
+        hip_launch_kernel(
+            self.fn_add_tensors,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_a as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_b as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_alpha as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }

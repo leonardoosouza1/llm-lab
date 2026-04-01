@@ -111,8 +111,8 @@ pub struct GemvQ4Params<'a> {
     pub n: usize,                  // colunas de saída (out_dim)
     pub k: usize,                  // dimensão interna (in_dim)
     pub packed: &'a AnyTensor,     // [n, k/2] Q4 comprimido (2 valores por byte)
-    pub scales: &'a AnyTensor,     // [n, k/group_size] F16 scales por grupo
-    pub zeros: &'a AnyTensor,      // [n, k/group_size] F16 zero-points por grupo
+    pub scales: &'a AnyTensor,     // [n, k/group_size] F32 scales por grupo
+    pub zeros: &'a AnyTensor,      // [n, k/group_size] F32 zero-points por grupo
     pub group_size: usize,         // tipicamente 128
     pub x: &'a AnyTensor,          // [m, k] F32 ativações
     pub out: &'a AnyTensor,        // [m, n] F32 saída

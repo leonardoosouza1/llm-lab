@@ -49,6 +49,10 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn cfc_forward          (&self, p: &CfcForwardParams)         -> Result<(), BackendError>;
     fn kv_cache_quantized_append(&self, p: &KvCacheQuantizedParams) -> Result<(), BackendError>;
 
+    /// Soma dois tensores F32 in-place: a[i] += alpha * b[i]
+    /// Usado para aplicar CfC correction ao hidden state.
+    fn add_tensors_inplace(&self, a: &AnyTensor, b: &AnyTensor, n_elems: usize, alpha: f32) -> Result<(), BackendError>;
+
     // ── Sync e informações ───────────────────────────────────────────────────
 
     /// Sincroniza o device (equivale a hipDeviceSynchronize / clFinish).

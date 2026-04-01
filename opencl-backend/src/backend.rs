@@ -864,6 +864,13 @@ impl ComputeBackend for OpenClBackend {
         ))
     }
 
+    fn add_tensors_inplace(&self, _a: &AnyTensor, _b: &AnyTensor, _n_elems: usize, _alpha: f32) -> Result<(), BackendError> {
+        // Placeholder: add_tensors_inplace não implementado em OpenCL
+        Err(BackendError::Kernel(
+            "OpenCL: add_tensors_inplace não implementado".to_string(),
+        ))
+    }
+
     fn sync(&self) -> Result<(), BackendError> {
         self.ctx
             .queue

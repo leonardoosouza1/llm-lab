@@ -934,15 +934,19 @@ impl QwenModel {
 
         // ── CfC Correction (opcional) ──────────────────────────────────────────
         // Aplicado após o último transformer block, antes do lm_head.
-        // A correção é somada ao hidden state se o CfC estiver habilitado.
+        // A correção é somada ao hidden state: x += correction
         if let Some(cfc) = &mut self.cfc {
-            // Forward da CfC: toma hidden normed, retorna correção [n, h]
-            let _correction = cfc.forward(&self.backend, &self.scratch.normed)?;
-            // Soma correção ao x via uma projeção trivial: x += correction
-            // FIXME: implementação pendente
-            // O kernel cfc_forward deveria retornar a correção somada diretamente em x
-            // ou precisamos de um backend.add_tensors() para fazer x += _correction
-            log::debug!("CfC correction aplicada (kernel de soma pendente)");
+            // Forward da CfC: toma hidden state (último token), retorna correção [1, h]
+            // Usa normed como input pois já é a representação normalizada do último token
+            let correction = cfc.forward(&self.backend, &self.scratch.normed)?;
+            // x += 1.0 * correction (soma element-wise dos últimos n*h floats)
+            self.backend.add_tensors_inplace(
+                &self.scratch.x,
+                correction,
+                n * h,
+                1.0,
+            )?;
+            log::debug!("CfC correction aplicada: {} elementos", n * h);
         }
 
         // ── Final RMSNorm ─────────────────────────────────────────────────────
