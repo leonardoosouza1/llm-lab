@@ -355,14 +355,15 @@ impl ComputeBackend for RocmBackend {
 
     fn gravity_score(&self, p: &GravityScoreParams) -> Result<(), BackendError> {
         // Calcula importância semântica: gravity(i) = média(attn_score(i) * ||v(i)||₂)
-        // Primeiro calcula normas dos value vectors
+        // Passo 1: calcula normas L2 dos value vectors do cache V
+        // value_norms kernel: (v_cache, norms_out, seq_len, n_kv_heads, head_dim)
         unsafe {
             self.kernels.value_norms(
-                f32_ptr(p.value_norms), // Na verdade é os values; será sobrescrito com norms
-                f32_mut_ptr(p.value_norms),
-                p.n_heads as i32,
+                f32_ptr(p.v_cache),           // [seq_len, n_kv_heads * head_dim] — input
+                f32_mut_ptr(p.value_norms),   // [n_kv_heads, seq_len] — output
                 p.seq_len as i32,
-                256, // Assuming head_dim = 256 (típico para Qwen)
+                p.n_kv_heads as i32,
+                p.head_dim as i32,
             )
         }
         .map_err(|e| BackendError::Kernel(format!("value_norms: {e}")))?;

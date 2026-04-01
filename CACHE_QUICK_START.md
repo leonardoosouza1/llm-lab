@@ -126,10 +126,13 @@ For each tensor:
 | Metric | Value |
 |--------|-------|
 | First load time | ~60-120s (quantization + IO) |
-| Cached load time | ~10-15s (IO + GPU upload) |
-| Speedup | 5-10x faster |
+| Cached load time | ~20-40s (IO + GPU upload, no CPU quantization) |
+| Speedup | ~3-5x faster (CPU quantization step skipped) |
 | Cache file size | ~1 GB |
 | Tensors cached | ~252 (7 per layer × 36 layers) |
+
+> Mmaps are still loaded on cache hits (for non-quantized weights: norms, embeddings, lm_head).
+> The speedup comes from skipping BF16→INT4 CPU quantization, not from skipping I/O.
 
 ## Error Handling
 

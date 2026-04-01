@@ -91,18 +91,21 @@ load_quantized_cache(model_dir) → Ok(Some((cached_tensors, cached_shapes, 128)
   ↓
 Validate group_size matches
   ↓
-should_load_mmaps = false
-Skip mmap loading (fast!)
+Load safetensors via mmap (for non-quantized weights: norms, lm_head, embeddings, biases)
   ↓
-quantize_weight() closure called for each weight
+quantize_weight() closure called for each Q4 weight
   - Check cache for weight name
-  - Found? upload_quantized(cached_result, ...) → GPU
+  - Found? upload_quantized(cached_result, ...) → GPU (skip expensive BF16→INT4 CPU step)
   - Not found? (shouldn't happen) quantize from zero
   ↓
 No cache saving (already cached)
   ↓
-Model ready, 5-10x faster than first load
+Model ready, ~3-5x faster than first load (quantization CPU step skipped)
 ```
+
+> **Note:** Mmaps are always loaded because non-quantized tensors (layer norms, embeddings,
+> lm_head, attention biases) are not in the Q4 cache and must still be read from safetensors.
+> The speedup comes from skipping the expensive BF16→INT4 CPU quantization, not from skipping I/O.
 
 ## Code Changes
 
@@ -157,14 +160,11 @@ let use_cache = if let Ok(Some((cached_tensors, cached_shapes, cached_group_size
 };
 ```
 
-#### Conditional Mmap Loading
+#### Mmap Loading (Always Required)
 ```rust
-let should_load_mmaps = use_cache.is_none();
-
-if should_load_mmaps {
-    // Load safetensors via mmap (only if not using cache)
-    ...
-}
+// Always load mmaps: non-quantized weights (norms, lm_head, embeddings, biases)
+// still require safetensors regardless of Q4 cache availability.
+// ... load index.json / single-shard as before
 ```
 
 #### Modified `quantize_weight` Closure

@@ -123,9 +123,12 @@ pub struct GemvQ4Params<'a> {
 /// gravity(i) = média(attn_score(i) * ||value_vec(i)||₂) sobre heads
 pub struct GravityScoreParams<'a> {
     pub attn_weights: &'a AnyTensor,  // [n_heads, seq_len] F32 (após softmax)
-    pub value_norms: &'a AnyTensor,   // [n_heads, seq_len] F32 (normas L2 dos V)
+    pub v_cache: &'a AnyTensor,       // [max_seq_len, n_kv_heads * head_dim] F32 (V cache)
+    pub value_norms: &'a AnyTensor,   // [n_kv_heads, max_seq_len] F32 (buffer de saída para norms)
     pub gravity_out: &'a AnyTensor,   // [seq_len] F32 (média sobre heads)
     pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
     pub seq_len: usize,
 }
 

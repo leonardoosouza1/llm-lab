@@ -498,45 +498,41 @@ impl QwenModel {
             None
         };
 
-        // ── Mmaps (idêntico ao load()) ────────────────────────────────────────
+        // ── Mmaps ────────────────────────────────────────────────────────────
+        // Sempre carregamos mmaps: pesos não-quantizados (norms, lm_head, biases,
+        // embeddings) precisam de safetensors independente do cache Q4.
+        // O cache Q4 otimiza a quantização CPU (BF16→INT4), não a leitura de pesos.
         let mut shards: HashMap<String, memmap2::Mmap> = HashMap::new();
         let tensor_shard_map: Option<HashMap<String, String>>;
 
-        // Só carrega mmaps se não estamos usando cache
-        let should_load_mmaps = use_cache.is_none();
-
-        if should_load_mmaps {
-            let index_path = model_dir.join("model.safetensors.index.json");
-            if index_path.exists() {
-                let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-                let weight_map = index["weight_map"].as_object()
-                    .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
-                let mut tsm: HashMap<String, String> = HashMap::new();
-                for (k, v) in weight_map {
-                    if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
-                }
-                for shard_name in tsm.values() {
-                    if shards.contains_key(shard_name) { continue; }
-                    let file = std::fs::File::open(model_dir.join(shard_name))?;
-                    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-                    shards.insert(shard_name.clone(), mmap);
-                }
-                tensor_shard_map = Some(tsm);
-                log::info!("  → multi-shard ({} shards)", shards.len());
-            } else {
-                let single = model_dir.join("model.safetensors");
-                if !single.exists() {
-                    return Err(ModelError::Model(
-                        "Nenhum safetensors encontrado".into()
-                    ));
-                }
-                let file = std::fs::File::open(&single)?;
-                let mmap = unsafe { memmap2::Mmap::map(&file)? };
-                log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
-                shards.insert("model.safetensors".to_string(), mmap);
-                tensor_shard_map = None;
+        let index_path = model_dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+            let weight_map = index["weight_map"].as_object()
+                .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
+            let mut tsm: HashMap<String, String> = HashMap::new();
+            for (k, v) in weight_map {
+                if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
             }
+            for shard_name in tsm.values() {
+                if shards.contains_key(shard_name) { continue; }
+                let file = std::fs::File::open(model_dir.join(shard_name))?;
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                shards.insert(shard_name.clone(), mmap);
+            }
+            tensor_shard_map = Some(tsm);
+            log::info!("  → multi-shard ({} shards)", shards.len());
         } else {
+            let single = model_dir.join("model.safetensors");
+            if !single.exists() {
+                return Err(ModelError::Model(
+                    "Nenhum safetensors encontrado".into()
+                ));
+            }
+            let file = std::fs::File::open(&single)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
+            shards.insert("model.safetensors".to_string(), mmap);
             tensor_shard_map = None;
         }
 

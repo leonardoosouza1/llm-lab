@@ -66,7 +66,7 @@ pub struct GravitySystem {
     pub(crate) history: Vec<f32>,
     pub(crate) max_seq_len: usize,
     pub(crate) n_kv_heads: usize,
-    _head_dim: usize,
+    head_dim: usize,
 }
 
 impl GravitySystem {
@@ -93,7 +93,7 @@ impl GravitySystem {
             history: Vec::new(),
             max_seq_len,
             n_kv_heads,
-            _head_dim: head_dim,
+            head_dim,
         }
     }
 
@@ -113,18 +113,22 @@ impl GravitySystem {
         &mut self,
         backend: &Arc<dyn ComputeBackend>,
         attn_weights: &AnyTensor,
-        _v_cache: &AnyTensor,
+        v_cache: &AnyTensor,
         seq_len: usize,
         n_heads: usize,
     ) -> Result<GravityResult, compute_core::BackendError> {
         // Calcula pesos de gravidade via backend (kernel specializado)
         // O kernel computa:
-        //   gravity_out[t] = Σ_h (attn_weights[h, t] * ||V[h, t]||₂) / n_heads
+        //   1. value_norms[h, t] = ||V[h, t]||₂  (via value_norms kernel)
+        //   2. gravity_out[t] = Σ_h (attn_weights[h, t] * value_norms[h, t]) / n_heads
         let params = GravityScoreParams {
             attn_weights,
+            v_cache,
             value_norms: &self.vnorm_buf,
             gravity_out: &self.gravity_buf,
             n_heads,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
             seq_len,
         };
         backend.gravity_score(&params)?;

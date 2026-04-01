@@ -429,18 +429,17 @@ extern "C" __global__ void dequant_gemv_q4(
             int4_val = (int)((packed_byte >> 4) & 0x0F);
         }
 
-        // Sign-extend 4-bit value to signed int (-8 to 7).
-        if (int4_val >= 8) {
-            int4_val -= 16;
-        }
+        // Asymmetric quantization [0, 15] — no sign extension needed.
+        // Encoding: q = round((val - min) / scale), scale = (max-min)/15, zero = min_val
+        // Decoding: val = q * scale + zero
 
         // Get group index and dequant parameters (F32 — sem conversão).
         int group_idx = k / group_size;
         float scale_f32 = scales_row[group_idx];
         float zero_f32 = zeros_row[group_idx];
 
-        // Dequantize: w = scale * (int4_val - zero)
-        float w = scale_f32 * ((float)int4_val - zero_f32);
+        // Dequantize: w = scale * q + zero  (where zero = min_val)
+        float w = scale_f32 * (float)int4_val + zero_f32;
 
         // Accumulate into dot product.
         local_sum += w * x_row[k];
