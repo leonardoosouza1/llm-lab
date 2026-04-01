@@ -426,7 +426,7 @@ async fn execute_inference(
     top_k: usize,
     top_p: f32,
     max_tokens: usize,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Validação de modelo carregado
     {
         let guard = state.qwen_model.lock().await;

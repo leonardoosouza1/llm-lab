@@ -23,7 +23,7 @@ mod telemetry; // Adiciona o módulo de telemetria
 mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, debug_trace_handler,
-                            models_handler, load_model_handler, health_handler};
+                            models_handler, load_model_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
 use crate::model::QwenModel;
@@ -131,8 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_headers(Any);
 
     let app = Router::new()
-        .merge(telemetry_routes) // Merge telemetry routes
-        .route("/health",                 get(health_handler))
+        .merge(telemetry_routes) // Merge telemetry routes (inclui /health)
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
         .route("/api/generate",           post(generate_handler))
@@ -253,14 +252,41 @@ async fn run_engine_loop(
                         "readout_trained": esn_tel.readout_trained,
                     }).to_string());
 
-                    // Broadcast Gravity/CfC telemetry se habilitado (Fase 2)
-                    // TODO: Integrar com GravitySystem e CfcLayer quando disponíveis
-                    // let _ = frame_tx.send(serde_json::json!({
-                    //     "type": "gravity_telemetry",
-                    //     "step": step,
-                    //     "attractor_distance": ...,
-                    //     "stability_index": ...,
-                    // }).to_string());
+                    // ── Gravity + CfC telemetry (Fase 2) ────────────────
+                    {
+                        let guard = model.lock().await;
+                        if let Some(m) = guard.as_ref() {
+                            if let Some(ref grav) = m.gravity {
+                                let _ = frame_tx.send(serde_json::json!({
+                                    "type": "gravity_state",
+                                    "step": step,
+                                    "enabled": true,
+                                    "history_len": grav.history_len(),
+                                    "threshold": grav.current_threshold(),
+                                }).to_string());
+                            }
+
+                            if let Some(ref cfc) = m.cfc {
+                                let _ = frame_tx.send(serde_json::json!({
+                                    "type": "cfc_state",
+                                    "step": step,
+                                    "enabled": true,
+                                    "cfc_dim": cfc.config.cfc_dim,
+                                    "param_count": cfc.param_count(),
+                                    "vram_mb": cfc.vram_bytes() as f64 / (1024.0 * 1024.0),
+                                }).to_string());
+                            }
+
+                            if m.quantized {
+                                let _ = frame_tx.send(serde_json::json!({
+                                    "type": "q4_status",
+                                    "step": step,
+                                    "quantized": true,
+                                    "vram_mb": m.vram_bytes as f64 / (1024.0 * 1024.0),
+                                }).to_string());
+                            }
+                        }
+                    }
 
                     for trace in &gen_step.layer_traces {
                         let msg = serde_json::json!({

@@ -335,11 +335,39 @@ extern "C" __global__ void f32_to_bf16(
 
 // ---------------------------------------------------------------------------
 // Helper: FP16 (stored as uint16_t) → float
-// FP16 (half-precision) to F32 conversion using HIP's built-in support.
+// IEEE 754 half-precision: 1 sign + 5 exponent + 10 mantissa.
+// Conversão portável via manipulação de bits — sem inline asm.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float fp16_to_f32(unsigned short bits) {
+    unsigned int sign = (unsigned int)(bits >> 15) << 31;
+    unsigned int exp  = (bits >> 10) & 0x1F;
+    unsigned int mant = bits & 0x3FF;
+
+    unsigned int f32_bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            // ±0
+            f32_bits = sign;
+        } else {
+            // Subnormal FP16 → normal F32
+            exp = 1;
+            while ((mant & 0x400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+            f32_bits = sign | ((127 - 15 + exp) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        // Inf / NaN
+        f32_bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        // Normal
+        f32_bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+
     float f;
-    asm("v_cvt_f32_f16 %0, %1" : "=f"(f) : "r"((unsigned int)bits));
+    __builtin_memcpy(&f, &f32_bits, sizeof(f));
     return f;
 }
 

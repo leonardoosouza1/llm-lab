@@ -201,6 +201,24 @@ impl GravitySystem {
         (self.config.base_threshold * ratio).clamp(0.1, 0.9)
     }
 
+    /// Número de observações no histórico.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Threshold efetivo (baseado na última média, ou base_threshold se vazio).
+    pub fn current_threshold(&self) -> f32 {
+        if self.history.len() < 3 {
+            self.config.base_threshold
+        } else {
+            let window_size = self.history.len().min(10);
+            let historical_mean: f32 = self.history.iter().rev()
+                .take(window_size).sum::<f32>() / window_size as f32;
+            (self.config.base_threshold * (historical_mean / (historical_mean + 1e-6)))
+                .clamp(0.1, 0.9)
+        }
+    }
+
     /// Reset para nova geração.
     ///
     /// Deve ser chamado no início de cada geração de tokens,
