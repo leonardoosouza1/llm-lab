@@ -59,13 +59,13 @@ pub struct GravityResult {
 pub struct GravitySystem {
     pub config: GravityConfig,
     /// Buffer GPU para scores de gravidade [max_seq_len].
-    gravity_buf: AnyTensor,
+    pub(crate) gravity_buf: AnyTensor,
     /// Buffer GPU para normas dos value vectors [n_kv_heads, max_seq_len].
-    vnorm_buf: AnyTensor,
+    pub(crate) vnorm_buf: AnyTensor,
     /// Histórico de gravidade média (para adaptação do threshold).
-    history: Vec<f32>,
-    max_seq_len: usize,
-    n_kv_heads: usize,
+    pub(crate) history: Vec<f32>,
+    pub(crate) max_seq_len: usize,
+    pub(crate) n_kv_heads: usize,
     _head_dim: usize,
 }
 

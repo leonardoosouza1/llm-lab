@@ -932,6 +932,30 @@ impl QwenModel {
             Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
         }
 
+        // ── Gravity scoring (opcional, observação da última camada) ────────────
+        // Calcula importância semântica a partir dos attention scores da última layer.
+        // scratch.scores ainda contém os scores da última iteração do loop.
+        if let Some(ref mut grav) = self.gravity {
+            let last_layer = self.layers.last().unwrap();
+            let seq = last_layer.kv_k.current_len;
+            match grav.compute(
+                &self.backend,
+                &self.scratch.scores,
+                &last_layer.kv_v.data,
+                seq,
+                nh,
+            ) {
+                Ok(_result) => {
+                    log::debug!(
+                        "Gravity: mean={:.3}, max={:.3}, threshold={:.3}, high_tokens={}",
+                        _result.mean_gravity, _result.max_gravity,
+                        _result.effective_threshold, _result.high_gravity_tokens.len(),
+                    );
+                }
+                Err(e) => log::warn!("Gravity score falhou: {}", e),
+            }
+        }
+
         // ── CfC Correction (opcional) ──────────────────────────────────────────
         // Aplicado após o último transformer block, antes do lm_head.
         // A correção é somada ao hidden state: x += correction
