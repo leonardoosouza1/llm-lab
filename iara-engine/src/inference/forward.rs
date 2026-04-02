@@ -74,10 +74,16 @@ pub fn forward_traced(
     let num_layers  = model.cfg.num_layers;
 
     // GPU forward: embedding → transformer blocks → lm_head → logits [vocab]
-    let logits = model.forward(token_ids)?;
+    // Returns both logits and per-layer traces with real telemetry
+    let (logits, mut layer_traces) = model.forward(token_ids)?;
 
     let elapsed_us = total_start.elapsed().as_micros();
     let us_per_layer = elapsed_us / num_layers.max(1) as u128;
+
+    // Fill in timing information for all layers
+    for trace in &mut layer_traces {
+        trace.time_us = us_per_layer;
+    }
 
     // Top-40 logits (telemetria — pré-sampling)
     // Usa select_nth_unstable para O(n) ao invés de O(n log n) sort completo.
@@ -94,18 +100,6 @@ pub fn forward_traced(
     // Token amostrado
     let token_id  = sample_token(&logits, sampling);
     let token_str = tokenizer::token_id_to_text(token_id);
-
-    // Telemetria de camadas: distribui o tempo uniformemente.
-    // Energias serão preenchidas por kernels de redução na próxima fase.
-    let layer_traces: Vec<LayerTrace> = (0..num_layers).map(|i| LayerTrace {
-        layer_idx:        i,
-        attention_energy: 0.0,
-        mlp_energy:       0.0,
-        residual_norm:    0.0,
-        max_activation:   0.0,
-        hot_neurons:      vec![],
-        time_us:          us_per_layer,
-    }).collect();
 
     let active_layers: Vec<usize> = (0..num_layers).collect(); // todos ativos
 

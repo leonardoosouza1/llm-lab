@@ -180,7 +180,9 @@ async fn run_engine_loop(
                     "message": format!("Processando: '{}'", &text[..text.len().min(30)])
                 }).to_string());
 
-                let tokens = crate::tokenizer::tokenize(&text);
+                // Formato Q/A para modelo BASE: "Q: {pergunta}\nA:" para perguntas,
+                // passthrough para completions diretas (ex: "1+1=").
+                let tokens = crate::tokenizer::tokenize_qa(&text);
                 let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
 
                 if prompt_ids.is_empty() { continue; }
@@ -200,17 +202,25 @@ async fn run_engine_loop(
 
                 // Prefill sequencial: tokens 0..n-2 apenas populam o KV cache.
                 // Garante atenção causal sem máscara explícita.
+                let mut prefill_ok = true;
                 if prompt_ids.len() > 1 {
                     let mut guard = model.lock().await;
                     if let Some(m) = guard.as_mut() {
                         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
                             if let Err(e) = m.forward(&[tok]) {
                                 log::error!("Prefill error: {}", e);
+                                let _ = frame_tx.send(serde_json::json!({
+                                    "type": "status",
+                                    "message": format!("❌ Erro no prefill: {}", e)
+                                }).to_string());
+                                prefill_ok = false;
                                 break;
                             }
+                            // Discard logits and traces from prefill
                         }
                     }
                 }
+                if !prefill_ok { continue; }
 
                 // Decode: começa com o último token do prompt, gera até MAX_STEPS tokens novos.
                 let mut decode_token = match prompt_ids.last() {
@@ -227,7 +237,14 @@ async fn run_engine_loop(
                         };
                         match forward_traced(m, &[decode_token], &sampling) {
                             Ok(s) => s,
-                            Err(e) => { log::error!("Forward error: {}", e); break; }
+                            Err(e) => {
+                                log::error!("Forward error step {}: {}", step, e);
+                                let _ = frame_tx.send(serde_json::json!({
+                                    "type": "status",
+                                    "message": format!("❌ Erro no forward pass (step {}): {}", step, e)
+                                }).to_string());
+                                break;
+                            }
                         }
                     };
                     decode_token = gen_step.token_id;

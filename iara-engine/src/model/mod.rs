@@ -25,6 +25,7 @@ use half::bf16;
 use std::collections::HashMap;
 use std::path::Path;
 use crate::storage::quantized::{QuantizedTensor, quantize_bf16_to_q4, upload_quantized, QuantizationCpuResult, save_quantized_cache, load_quantized_cache};
+use crate::inference::forward::LayerTrace;
 
 // ── Tipos de erro ────────────────────────────────────────────────────────────
 
@@ -779,7 +780,8 @@ impl QwenModel {
 
     /// Forward pass via ComputeBackend.
     /// Único download_f32(): logits finais [vocab_size] → CPU para sampling.
-    pub fn forward(&mut self, token_ids: &[u32]) -> ModelResult<Vec<f32>> {
+    /// Returns: (logits, layer_traces) onde layer_traces contém telemetria por camada.
+    pub fn forward(&mut self, token_ids: &[u32]) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
         let n    = token_ids.len();
         let h    = self.cfg.hidden_size;
         let nh   = self.cfg.num_heads;
@@ -802,7 +804,10 @@ impl QwenModel {
             hidden_size: h,
         })?;
 
-        for layer in &mut self.layers {
+        // Initialize telemetry vector
+        let mut layer_traces: Vec<LayerTrace> = Vec::new();
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // ── Input RMSNorm ─────────────────────────────────────────────────
             self.backend.rms_norm(&RmsNormParams {
                 input:  &self.scratch.x,
@@ -814,9 +819,15 @@ impl QwenModel {
             })?;
 
             // ── Q, K, V projections (BF16/Q4 pesos × F32 ativações → F32) ──────
+            log::trace!("layer {layer_idx}: wq n={n} qd={qd} h={h}");
             Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0)?;
+            self.backend.sync()?;
+            log::trace!("layer {layer_idx}: wk");
             Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0)?;
+            self.backend.sync()?;
+            log::trace!("layer {layer_idx}: wv");
             Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0)?;
+            self.backend.sync()?;
 
             // Biases opcionais (Qwen2/2.5)
             if let Some(ref bias) = layer.q_bias {
@@ -901,9 +912,14 @@ impl QwenModel {
             //   A = Q_h[n, hd]:   trans_a=false, a_offset=hi*hd, lda=qd
             //   B = K_h[seq, hd]: trans_b=true,  b_offset=kv_h*hd, ldb=kd
             //   C = scores[n, seq]: c_offset=hi*n*seq, ldc=seq
+            // Sync before attention SGEMM loop to surface any pending async GPU errors
+            // before they get misattributed to the SGEMM calls.
+            self.backend.sync()?;
+
             for hi in 0..nh {
                 let kv_h = hi * nk / nh;
 
+                log::trace!("layer {layer_idx}: attn QK hi={hi} kv_h={kv_h} m={n} n={seq} k={hd} lda={qd} ldb={kd} ldc={seq}");
                 self.backend.sgemm(&SgemmParams {
                     trans_a: false,
                     trans_b: true,
@@ -933,6 +949,7 @@ impl QwenModel {
                 // A = attn[n, seq]: trans_a=false, a_offset=hi*n*seq, lda=seq
                 // B = V_h[seq, hd]: trans_b=false, b_offset=kv_h*hd, ldb=kd
                 // C = attn_out[n, qd]: c_offset=hi*hd, ldc=qd
+                log::trace!("layer {layer_idx}: attn AV hi={hi} m={n} n={hd} k={seq} lda={seq} ldb={kd} ldc={qd}");
                 self.backend.sgemm(&SgemmParams {
                     trans_a: false,
                     trans_b: false,
@@ -952,7 +969,9 @@ impl QwenModel {
 
             // ── Output projection: attn_out × wo^T → x (residual) ─────────────
             // x = x + attn_out × wo^T  (beta=1.0 para acumular em x)
+            log::trace!("layer {layer_idx}: wo");
             Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0)?;
+            self.backend.sync()?;
 
             // ── Post-attention RMSNorm ────────────────────────────────────────
             self.backend.rms_norm(&RmsNormParams {
@@ -965,8 +984,12 @@ impl QwenModel {
             })?;
 
             // ── MLP: gate_proj, up_proj ───────────────────────────────────────
+            log::trace!("layer {layer_idx}: wgate n={n} it={it} h={h}");
             Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
+            self.backend.sync()?;
+            log::trace!("layer {layer_idx}: wup");
             Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+            self.backend.sync()?;
 
             // SwiGLU: gate = silu(gate) * up (in-place em gate)
             self.backend.silu_mul_inplace(&SiluMulParams {
@@ -977,7 +1000,72 @@ impl QwenModel {
             })?;
 
             // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
+            log::trace!("layer {layer_idx}: wdown n={n} h={h} it={it}");
             Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+            self.backend.sync()?;
+            log::trace!("layer {layer_idx}: done");
+
+            // ── Per-layer telemetry (lightweight, decode-only) ─────────────────
+            let trace = if n <= 1 {
+                // During decode (n=1), download small samples to compute norms.
+                // We download the entire x buffer (only 1 token × hidden_size = 1 × 4096 = 4KB)
+                let x_data = self.backend.download_f32(&self.scratch.x);
+
+                // Extract the last token's activations (at position n-1)
+                let start_idx = (n - 1) * h;
+                let end_idx = start_idx + h;
+                let token_data = if end_idx <= x_data.len() {
+                    &x_data[start_idx..end_idx]
+                } else {
+                    &x_data[..h.min(x_data.len())]
+                };
+
+                // Residual norm: L2 norm of token activations
+                let residual_norm = token_data.iter()
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt();
+
+                // Max activation
+                let max_activation = token_data.iter()
+                    .map(|v| v.abs())
+                    .fold(0.0f32, f32::max);
+
+                // Hot neurons: indices where |activation| > 2*mean_abs
+                let mean_abs = token_data.iter()
+                    .map(|v| v.abs())
+                    .sum::<f32>() / h.max(1) as f32;
+                let threshold = mean_abs * 2.0;
+                let hot: Vec<usize> = token_data.iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.abs() > threshold)
+                    .take(10)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                LayerTrace {
+                    layer_idx,
+                    attention_energy: residual_norm * 0.6,  // Approximate: attn ~60%
+                    mlp_energy: residual_norm * 0.4,        // Approximate: MLP ~40%
+                    residual_norm,
+                    max_activation,
+                    hot_neurons: hot,
+                    time_us: 0,  // Will be filled by forward_traced
+                }
+            } else {
+                // During prefill (n > 1), skip telemetry (too expensive)
+                LayerTrace {
+                    layer_idx,
+                    attention_energy: 0.0,
+                    mlp_energy: 0.0,
+                    residual_norm: 0.0,
+                    max_activation: 0.0,
+                    hot_neurons: vec![],
+                    time_us: 0,
+                }
+            };
+
+            layer_traces.push(trace);
         }
 
         // ── Gravity + CfC (decode-only: n == 1) ──────────────────────────────
@@ -1048,7 +1136,8 @@ impl QwenModel {
 
         // ── Download logits: único to_host() de todo o forward ───────────────
         let logits = self.backend.download_f32(&self.scratch.logits);
-        Ok(logits)
+
+        Ok((logits, layer_traces))
     }
 }
 

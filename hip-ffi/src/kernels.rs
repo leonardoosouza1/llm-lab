@@ -655,8 +655,8 @@ impl GpuKernels {
     // Kernel 10: value_norms
     //
     // Calcula norma L2 dos value vectors por token/head: ||v[h,i,:]||₂
-    // Grid : (1, 1, 1)  — um kernel, loop interno sobre heads × seq
-    // Block: (256, 1, 1)
+    // Grid : (n_kv_heads, seq_len, 1)  — um bloco por (head, token)
+    // Block: (min(head_dim, 256), 1, 1)
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Compute L2 norms of value vectors for gravity scoring.
@@ -665,33 +665,34 @@ impl GpuKernels {
     /// All GPU pointers must be valid device allocations of the correct size.
     pub unsafe fn value_norms(
         &self,
-        values: *const f32,  // [n_heads, seq_len, head_dim] F32
-        norms_out: *mut f32, // [n_heads, seq_len] F32 saída
-        n_heads: i32,
+        values: *const f32,  // [seq_len, n_kv_heads * head_dim] F32
+        norms_out: *mut f32, // [n_kv_heads, seq_len] F32 saída
         seq_len: i32,
+        n_kv_heads: i32,
         head_dim: i32,
     ) -> Result<(), HipError> {
-        let block_x: u32 = 256;
-        let grid = (1, 1, 1);
+        let block_x: u32 = (head_dim as u32).min(256);
+        let grid = (n_kv_heads as u32, seq_len as u32, 1);
         let block = (block_x, 1, 1);
+        let shared_bytes = block_x * std::mem::size_of::<f32>() as u32;
 
         let mut p_values = values;
         let mut p_norms_out = norms_out;
-        let mut p_n_heads = n_heads;
         let mut p_seq_len = seq_len;
+        let mut p_n_kv_heads = n_kv_heads;
         let mut p_head_dim = head_dim;
 
         hip_launch_kernel(
             self.fn_value_norms,
             grid,
             block,
-            0,
+            shared_bytes,
             ptr::null_mut(),
             &mut [
                 &mut p_values as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_norms_out as *mut *mut f32 as *mut std::ffi::c_void,
-                &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
                 &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_kv_heads as *mut i32 as *mut std::ffi::c_void,
                 &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
             ],
         )

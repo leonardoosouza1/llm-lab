@@ -108,6 +108,10 @@ export const wsManager = {
     switch (msg.type) {
       case 'status':
         store.loadingMsg = msg.message || '';
+        // Detecta conclusão ou erro da geração via WS para resetar store.generating
+        if (msg.message && (msg.message.includes('Geração completa') || msg.message.startsWith('❌'))) {
+          store.generating = false;
+        }
         break;
 
       case 'layers':
@@ -130,13 +134,54 @@ export const wsManager = {
           phase: msg.phase,
           total_layers: msg.total_layers,
         };
+        // Actualiza contagem real de camadas para evitar hardcode de 36
+        if (msg.total_layers && msg.total_layers > 0) {
+          store.numLayers = msg.total_layers;
+        }
         break;
 
-      case 'pipeline_result':
+      case 'pipeline_result': {
         store.topTokens = msg.top_tokens || [];
         store.pipelineComplete = true;
-        // The UI will react via watchers in main.js
+        // Atualiza texto gerado em tempo real (streaming WS)
+        if (msg.generated_so_far) {
+          store.responseText = msg.generated_so_far;
+        }
+        // Métricas de performance
+        if (msg.total_time_ms) {
+          store.totalDurationMs = msg.total_time_ms;
+        }
+        store.evalCount = (msg.step || 0) + 1;
+        if (store.evalCount > 0 && store.totalDurationMs > 0) {
+          store.tokensPerSec = store.evalCount / (store.totalDurationMs / 1000);
+        }
+
+        // Constrói trace token-by-token para aba Trace
+        const avgLayerEnergy = Object.keys(store.layerData).length > 0
+          ? Object.values(store.layerData).reduce((s, l) => s + (l.attention_energy || 0) + (l.mlp_energy || 0), 0)
+            / Object.keys(store.layerData).length
+          : 0;
+        const topLogit = msg.top_tokens && msg.top_tokens[0] ? msg.top_tokens[0].score : null;
+        const topProb  = msg.top_tokens && msg.top_tokens[0] ? Math.exp(topLogit || 0) : null; // approx
+        const esnEnt   = store.esnLatest ? store.esnLatest.entropy : null;
+        const isAnomaly = avgLayerEnergy > 0
+          && store.traceTokens.length > 2
+          && avgLayerEnergy > (store.traceTokens.slice(-3).reduce((s, t) => s + (t.energy || 0), 0) / 3) * 2.5;
+
+        store.traceTokens.push({
+          step:      msg.step || 0,
+          token:     msg.token_str || '',
+          energy:    avgLayerEnergy,
+          top_logit: topLogit,
+          prob:      topProb,
+          ms_token:  msg.total_time_ms || 0,
+          entropy:   esnEnt,
+          anomaly:   isAnomaly,
+        });
+        // Mantém no máximo 512 tokens no trace
+        if (store.traceTokens.length > 512) store.traceTokens.shift();
         break;
+      }
 
       case 'brain_map':
         store.brainMap = msg;

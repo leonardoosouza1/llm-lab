@@ -112,11 +112,12 @@ pub fn sgemm_strided(
     c: *mut f32,
     ldc: i32,
 ) -> Result<(), HipError> {
-    // Row-major A[m,k]×B[k,n] = C[m,n]
-    // Col-major equiv: B^T[n,k] × A^T[k,m] = C^T[n,m]
-    // → swap A↔B and flip trans
-    let ta = if trans_b { hipblasOperation_t_HIPBLAS_OP_N } else { hipblasOperation_t_HIPBLAS_OP_T };
-    let tb = if trans_a { hipblasOperation_t_HIPBLAS_OP_N } else { hipblasOperation_t_HIPBLAS_OP_T };
+    // Row-major C[m,n] = op(A) × op(B)  →  col-major: C^T = op(B)^T × op(A)^T
+    // We swap A↔B in the BLAS call. The transpose flags map DIRECTLY:
+    //   row-major trans_b=true  →  BLAS ta = OP_T  (transpose the B data)
+    //   row-major trans_a=true  →  BLAS tb = OP_T  (transpose the A data)
+    let ta = if trans_b { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
+    let tb = if trans_a { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
     unsafe {
         blas_check(hipblasGemmEx_v2(
             handle.handle,

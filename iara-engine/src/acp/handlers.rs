@@ -465,9 +465,10 @@ async fn execute_inference(
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-            model
+            let _ = model
                 .forward(&[tok])
                 .map_err(|e| format!("Prefill error: {}", e))?;
+            // Discard logits and traces from prefill
         }
     }
 

@@ -473,7 +473,8 @@ async fn generate_internal(
         top_p: req.top_p,
     };
 
-    let tokens = crate::tokenizer::tokenize(&req.prompt);
+    // Formato Q/A para modelo BASE: wrapa perguntas em "Q: ...\nA:".
+    let tokens = crate::tokenizer::tokenize_qa(&req.prompt);
     let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
     let prompt_eval_count = prompt_ids.len() as u32;
     let mut generated_text = String::new();
@@ -499,8 +500,9 @@ async fn generate_internal(
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-            model.forward(&[tok])
+            let _ = model.forward(&[tok])
                 .map_err(|e| format!("Prefill error: {}", e))?;
+            // Discard logits and traces from prefill
         }
     }
 

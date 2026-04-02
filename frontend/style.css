@@ -1646,6 +1646,19 @@ textarea {
   to   { transform: rotate(360deg); }
 }
 
+/* Spinner inline para botão Generate */
+.spinner-inline {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--accent-blue);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
 /* ── 17. LOADING / SKELETON ───────────────────────────────────────────────── */
 
 .loading-dots::after {

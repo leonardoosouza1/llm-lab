@@ -50,7 +50,7 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams) -> u32 {
     if params.top_k > 0 && params.top_k < probs.len() {
         let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
         // select_nth_unstable: O(n) — coloca o K-ésimo maior na posição top_k-1
-        indexed.select_nth_unstable_by(params.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.select_nth_unstable_by(params.top_k - 1, |a, b| b.1.total_cmp(&a.1));
         let kth_prob = indexed[params.top_k - 1].1;
         for p in probs.iter_mut() {
             if *p < kth_prob { *p = 0.0; }
@@ -60,7 +60,7 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams) -> u32 {
     // ── 5. Filtro Top-P (nucleus) ─────────────────────────────────────────
     if params.top_p < 1.0 {
         let mut order: Vec<usize> = (0..probs.len()).collect();
-        order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
         let mut cumulative = 0.0f32;
         let mut cutoff = false;
         for &idx in &order {
@@ -87,17 +87,19 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams) -> u32 {
 #[inline]
 fn argmax(logits: &[f32]) -> u32 {
     logits.iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
 }
 
 #[inline]
 fn softmax_inplace(x: &mut [f32]) {
+    // Substitui NaN por -inf para não contaminar o resultado
+    for v in x.iter_mut() { if v.is_nan() { *v = f32::NEG_INFINITY; } }
     let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in x.iter_mut() { *v = (*v - max).exp(); sum += *v; }
-    for v in x.iter_mut() { *v /= sum; }
+    if sum > 0.0 { for v in x.iter_mut() { *v /= sum; } }
 }
 
 // ── Testes ────────────────────────────────────────────────────────────────────

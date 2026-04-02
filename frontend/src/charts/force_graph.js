@@ -45,8 +45,9 @@ export function initForceGraph() {
   feMerge.append('feMergeNode').attr('in', 'coloredBlur');
   feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
 
-  // Nodes: 36 transformer layers
-  _forceNodes = Array.from({ length: 36 }, (_, i) => ({
+  // Nodes: N transformer layers (dinâmico)
+  const numL = store.numLayers || 28;
+  _forceNodes = Array.from({ length: numL }, (_, i) => ({
     id: i,
     label: `L${i}`,
     radius: 10,
@@ -55,7 +56,7 @@ export function initForceGraph() {
   }));
 
   // Links: sequential residual stream
-  _forceLinks = Array.from({ length: 35 }, (_, i) => ({
+  _forceLinks = Array.from({ length: numL - 1 }, (_, i) => ({
     source: i,
     target: i + 1,
     strength: 0.5,

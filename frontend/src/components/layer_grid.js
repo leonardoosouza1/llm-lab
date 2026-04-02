@@ -10,7 +10,8 @@ export function renderLayerGrid() {
   if (!container) return;
 
   const data = store.layerData;
-  const layers = Array.from({ length: 36 }, (_, i) => ({
+  const numL = store.numLayers || 28;
+  const layers = Array.from({ length: numL }, (_, i) => ({
     idx: i,
     ...(data[i] || {
       attention_energy: 0,
@@ -103,10 +104,11 @@ export function renderLayerHeatmapCells() {
   const container = el('layer-heatmap-cells');
   if (!container) return;
 
+  const numL2 = store.numLayers || 28;
   // Create cells if not yet populated
-  if (container.children.length !== 36) {
+  if (container.children.length !== numL2) {
     container.innerHTML = '';
-    for (let i = 0; i < 36; i++) {
+    for (let i = 0; i < numL2; i++) {
       const cell = document.createElement('div');
       cell.className = 'heatmap-cell';
       cell.dataset.idx = i;
@@ -127,8 +129,9 @@ export function renderLayerHeatmapCells() {
   }
 
   const cells = container.querySelectorAll('.heatmap-cell');
+  const numL3 = store.numLayers || 28;
   const maxE = Math.max(
-    ...Array.from({ length: 36 }, (_, i) => (store.layerData[i] || {}).attention_energy || 0),
+    ...Array.from({ length: numL3 }, (_, i) => (store.layerData[i] || {}).attention_energy || 0),
     1
   );
 

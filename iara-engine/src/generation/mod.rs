@@ -55,7 +55,7 @@ pub async fn generate_response(
 
     for i in 0..max_new_tokens {
         let input = if i == 0 { tokens.as_slice() } else { &tokens[tokens.len() - 1..] };
-        let logits = model.forward(input)
+        let (logits, _traces) = model.forward(input)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         // ── ESN: observa logits do token atual ───────────────────────────

@@ -11,6 +11,8 @@ import {
 import { bindNewLayoutEvents } from './dom/legacy_updates.js';
 import { renderLayerGrid } from './components/layer_grid.js';
 import { renderTracePanel } from './charts/energy_chart.js';
+import { renderConsoleLogs, renderJsonInspector, setConsoleAutoScroll } from './components/log_console.js';
+import { initForceGraph, updateForceGraph } from './charts/force_graph.js';
 
 const { watch, createApp, nextTick } = Vue;
 
@@ -28,7 +30,9 @@ function switchTab(tab) {
   if (panel) panel.classList.remove('hidden');
 
   if (tab === 'layers') renderLayerGrid();
-  if (tab === 'trace' && store.trace) renderTracePanel();
+  if (tab === 'graph')  { initForceGraph(); updateForceGraph(store.layerData); }
+  if (tab === 'trace')  renderTraceFromTokens();
+  if (tab === 'console') renderConsoleLogs();
 }
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -391,9 +395,20 @@ createApp({
       });
     });
 
-    // Reseta ESN + Gravity + CfC ao iniciar nova geração
+    // Reseta ESN + Gravity + CfC ao iniciar nova geração + gerencia UI
     watch(() => store.generating, gen => {
+      const sendBtn = document.getElementById('send-btn');
+      const evalStats = document.getElementById('eval-stats');
+
       if (gen) {
+        // Desabilita botão e mostra estado de geração
+        if (sendBtn) {
+          sendBtn.disabled = true;
+          sendBtn.innerHTML = '<span class="spinner-inline" aria-hidden="true"></span> Gerando...';
+        }
+        if (evalStats) evalStats.textContent = 'Gerando...';
+
+        // Reset dados de telemetria
         esnEntropyPoints = [];
         esnTop1Points = [];
         esnStateNormPoints = [];
@@ -421,6 +436,196 @@ createApp({
         setText('cfc-params', '—');
         setText('cfc-vram', '—');
         setText('q4-vram', '—');
+      } else {
+        // Geração finalizada: reabilita botão
+        if (sendBtn) {
+          sendBtn.disabled = false;
+          sendBtn.innerHTML = '<span aria-hidden="true">▶</span> Generate';
+        }
+        // Atualiza métricas
+        if (evalStats && store.evalCount > 0) {
+          const tps = store.tokensPerSec > 0 ? store.tokensPerSec.toFixed(1) : '?';
+          evalStats.textContent = `${store.evalCount} tokens · ${store.totalDurationMs.toFixed(0)}ms · ${tps} t/s`;
+        }
+      }
+    });
+
+    // Mostra painel Gravity quando subsistema ativa
+    watch(() => store.gravityActive, active => {
+      const panel = document.getElementById('gravity-panel');
+      if (panel) panel.style.display = active ? 'flex' : 'none';
+    });
+
+    // Mostra painel CfC quando subsistema ativa
+    watch(() => store.cfcActive, active => {
+      const panel = document.getElementById('cfc-panel');
+      if (panel) panel.style.display = active ? 'flex' : 'none';
+    });
+
+    // ── Console watcher — renderiza log-list quando store.logs cresce ────────
+    let _consoleRenderPending = false;
+    watch(() => store.logs.length, () => {
+      if (store.activeTab !== 'console') return;
+      if (_consoleRenderPending) return;
+      _consoleRenderPending = true;
+      requestAnimationFrame(() => { renderConsoleLogs(); _consoleRenderPending = false; });
+    });
+
+    watch(() => store.logFilter, () => {
+      if (store.activeTab === 'console') renderConsoleLogs();
+    });
+
+    // ── Graph watcher — atualiza D3 force graph com dados reais das camadas ──
+    watch(() => store.layerData, data => {
+      if (store.activeTab === 'graph') updateForceGraph(data);
+    }, { deep: true });
+
+    // ── Trace tab — renderiza token timeline a partir de store.traceTokens ───
+    function renderTraceFromTokens() {
+      const tbody = document.getElementById('token-timeline-body');
+      if (!tbody) return;
+
+      const tokens = store.traceTokens;
+      tbody.innerHTML = '';
+      tokens.forEach(function(t) {
+        const tr = document.createElement('tr');
+        if (t.anomaly) tr.style.background = 'rgba(255,68,102,0.08)';
+        const probStr = t.prob != null ? (Math.min(1, Math.max(0, t.prob)) * 100).toFixed(1) + '%' : '—';
+        const entStr  = t.entropy != null ? t.entropy.toFixed(3) : '—';
+        const logStr  = t.top_logit != null ? t.top_logit.toFixed(2) : '—';
+        const msStr   = t.ms_token != null ? t.ms_token.toFixed(0) : '—';
+        tr.innerHTML = `
+          <td style="padding:4px 8px;color:#6b7fa3">${t.step}${t.anomaly ? ' <span style="color:#ff4466">⚠</span>' : ''}</td>
+          <td style="padding:4px 8px;color:#00ffc8;font-family:monospace">${escapeHtml(t.token)}</td>
+          <td style="padding:4px 8px;color:#6b7fa3;font-family:monospace">${t.token_id != null ? t.token_id : '—'}</td>
+          <td style="padding:4px 8px;color:#a855f7;font-family:monospace">${logStr}</td>
+          <td style="padding:4px 8px;color:#fbbf24;font-family:monospace">${probStr}</td>
+          <td style="padding:4px 8px;color:#38bdf8;font-family:monospace">${msStr}</td>
+          <td style="padding:4px 8px;color:#34d399;font-family:monospace">${entStr}</td>
+          <td style="padding:4px 8px">${t.anomaly ? '<span style="color:#ff4466;font-weight:700">SPIKE</span>' : ''}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // Energy chart from traceTokens
+      const energyCanvas = document.getElementById('energy-chart-canvas');
+      if (energyCanvas && tokens.length > 1 && typeof Chart !== 'undefined') {
+        const labels = tokens.map(t => `s${t.step}`);
+        const energyData = tokens.map(t => t.energy || 0);
+        if (window._traceEnergyChart) {
+          window._traceEnergyChart.data.labels = labels;
+          window._traceEnergyChart.data.datasets[0].data = energyData;
+          window._traceEnergyChart.update('none');
+        } else {
+          window._traceEnergyChart = new Chart(energyCanvas.getContext('2d'), {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [{
+                label: 'Avg Layer Energy',
+                data: energyData,
+                borderColor: '#00ffc8',
+                backgroundColor: 'rgba(0,255,200,0.08)',
+                fill: true,
+                tension: 0.4,
+                pointRadius: tokens.map(t => t.anomaly ? 5 : 2),
+                pointBackgroundColor: tokens.map(t => t.anomaly ? '#ff4466' : '#00ffc8'),
+              }],
+            },
+            options: {
+              responsive: true, maintainAspectRatio: false,
+              animation: false,
+              scales: {
+                x: { ticks: { color: '#6b7fa3', maxTicksLimit: 20 }, grid: { color: '#1a2035' } },
+                y: { ticks: { color: '#6b7fa3' }, grid: { color: '#1a2035' } },
+              },
+              plugins: { legend: { labels: { color: '#6b7fa3' } } },
+            },
+          });
+        }
+      }
+
+      // Resonance score = entropy-weighted coherence (simple heuristic)
+      if (tokens.length > 0) {
+        const avgEnt = tokens.reduce((s, t) => s + (t.entropy || 1), 0) / tokens.length;
+        const score = Math.max(0, Math.min(1, 1 - (avgEnt / 5)));
+        const bar = document.getElementById('resonance-score');
+        const val = document.getElementById('resonance-value');
+        if (bar) { bar.value = score * 100; }
+        if (val)  { val.textContent = score.toFixed(2); }
+      }
+
+      // Anomaly list
+      const anomalies = tokens.filter(t => t.anomaly);
+      const anomalyList = document.getElementById('anomaly-list');
+      const anomalyCount = document.getElementById('anomaly-count-trace');
+      if (anomalyCount) anomalyCount.textContent = anomalies.length;
+      if (anomalyList) {
+        if (anomalies.length === 0) {
+          anomalyList.innerHTML = '<div class="anomaly-empty">No anomalies detected</div>';
+        } else {
+          anomalyList.innerHTML = anomalies.map(a =>
+            `<div style="background:rgba(255,68,102,0.06);border:1px solid rgba(255,68,102,0.2);border-radius:8px;padding:10px 14px;margin-bottom:8px">
+              <span style="background:#ff4466;color:#000;font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;margin-right:8px">SPIKE</span>
+              <span style="color:#6b7fa3;font-size:11px">step ${a.step}</span>
+              <p style="color:#e8e8f0;font-size:12px;margin-top:6px">Energy spike detected: ${(a.energy || 0).toFixed(3)} (token: <code>${escapeHtml(a.token)}</code>)</p>
+            </div>`
+          ).join('');
+        }
+      }
+    }
+
+    watch(() => store.traceTokens.length, () => {
+      if (store.activeTab === 'trace') renderTraceFromTokens();
+    });
+
+    // Reseta traceTokens ao iniciar nova geração
+    watch(() => store.generating, gen => {
+      if (gen) {
+        store.traceTokens = [];
+        store.layerData = {};
+        if (window._traceEnergyChart) {
+          window._traceEnergyChart.data.labels = [];
+          window._traceEnergyChart.data.datasets[0].data = [];
+          window._traceEnergyChart.update('none');
+        }
+      }
+    });
+
+    // Console — wire up buttons
+    const clearBtn = document.getElementById('console-clear-btn');
+    if (clearBtn) clearBtn.addEventListener('click', () => { store.logs = []; renderConsoleLogs(); });
+
+    const pauseBtn = document.getElementById('console-pause-btn');
+    if (pauseBtn) pauseBtn.addEventListener('click', function() {
+      const paused = this.getAttribute('aria-pressed') === 'true';
+      this.setAttribute('aria-pressed', String(!paused));
+      this.classList.toggle('ctrl-btn--active', !paused);
+      setConsoleAutoScroll(paused); // toggle: if was paused, resume
+    });
+
+    const copyBtn = document.getElementById('inspector-copy-btn');
+    if (copyBtn) copyBtn.addEventListener('click', () => {
+      const pre = document.getElementById('json-inspector');
+      if (pre && navigator.clipboard) navigator.clipboard.writeText(pre.textContent);
+    });
+
+    const consoleSearch = document.getElementById('console-search');
+    if (consoleSearch) consoleSearch.addEventListener('input', () => renderConsoleLogs());
+
+    const filterBtns = document.querySelectorAll('.console-filter-inner [data-filter]');
+    filterBtns.forEach(btn => btn.addEventListener('click', () => {
+      store.logFilter = btn.dataset.filter;
+    }));
+
+    // Graph tab — controls wiring
+    const graphResetBtn = document.getElementById('graph-reset-btn');
+    if (graphResetBtn) graphResetBtn.addEventListener('click', () => {
+      const svg = document.getElementById('force-graph-svg');
+      if (svg && typeof d3 !== 'undefined') {
+        d3.select(svg).transition().duration(500).call(
+          d3.zoom().transform, d3.zoomIdentity
+        );
       }
     });
 

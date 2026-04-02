@@ -76,4 +76,10 @@ export const store = reactive({
   esnActive: false,
   gravityActive: false,
   cfcActive: false,
+
+  // Dynamic model info (set from pipeline_layer.total_layers)
+  numLayers: 28,
+
+  // Trace tab — token-by-token timeline built from pipeline_result
+  traceTokens: [],  // [{step, token, energy, top_logit, prob, ms_token, entropy, anomaly}]
 });

@@ -230,8 +230,16 @@ export function bindNewLayoutEvents(wsManager, api) {
     promptInput.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        wsManager.resonate(store.prompt.trim());
+        const text = store.prompt.trim();
+        if (!text) return;
+        store.generating = true;
+        store.responseText = '';
+        store.pipelineComplete = false;
         store.layerData = {};
+        store.esnHistory = [];
+        store.gravityHistory = [];
+        store.topTokens = [];
+        wsManager.resonate(text);
       }
     });
   }
@@ -243,8 +251,13 @@ export function bindNewLayoutEvents(wsManager, api) {
       const text = (promptInput ? promptInput.value : store.prompt).trim();
       if (!text) return;
       store.prompt = text;
-      store.layerData = {};
+      store.generating = true;
+      store.responseText = '';
       store.pipelineComplete = false;
+      store.layerData = {};
+      store.esnHistory = [];
+      store.gravityHistory = [];
+      store.topTokens = [];
       wsManager.resonate(text);
     });
   }

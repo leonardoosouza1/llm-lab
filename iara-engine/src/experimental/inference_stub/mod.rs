@@ -28,7 +28,7 @@ impl InferenceEngine {
         for i in 0..max_new_tokens {
             // Prefill no primeiro passo, decode a partir do segundo
             let input = if i == 0 { tokens.as_slice() } else { &tokens[tokens.len() - 1..] };
-            let logits = model.forward(input)?;
+            let (logits, _traces) = model.forward(input)?;
 
             // Greedy argmax
             let next_id = logits.iter().enumerate()
