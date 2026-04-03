@@ -95,6 +95,8 @@ impl GpuKernels {
         let fn_kv_cache_quantize = get_fn!("kv_cache_quantize_append");
         let fn_add_tensors = get_fn!("add_tensors_inplace");
         let fn_fused_norm_bias_rope = get_fn!("fused_norm_bias_rope");
+        let fn_kv_cache_int8_quantize_append = get_fn!("kv_cache_int8_quantize_append");
+        let fn_kv_cache_int8_dequantize = get_fn!("kv_cache_int8_dequantize");
 
         Ok(Self {
             module,
@@ -113,6 +115,8 @@ impl GpuKernels {
             fn_kv_cache_quantize,
             fn_add_tensors,
             fn_fused_norm_bias_rope,
+            fn_kv_cache_int8_quantize_append,
+            fn_kv_cache_int8_dequantize,
         })
     }
 }
@@ -892,6 +896,121 @@ impl GpuKernels {
                 &mut p_theta as *mut f32 as *mut std::ffi::c_void,
                 &mut p_eps as *mut f32 as *mut std::ffi::c_void,
                 &mut p_has_bias as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Kernel 16: kv_cache_int8_quantize_append
+    //
+    // Quantize F32 K/V values to INT8 with per-head absolute-max scaling.
+    // Appends quantized values to the INT8 KV cache at insert_pos.
+    //
+    // Grid : (n_new_tokens * n_kv_heads, 1, 1)
+    // Block: (256, 1, 1)
+    // Shared: 256 * sizeof(f32) bytes (for parallel reduction)
+    // -------------------------------------------------------------------------
+
+    /// Quantize and append F32 K/V values to INT8 KV cache with per-head scales.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn kv_cache_int8_quantize_append(
+        &self,
+        cache_q: *mut i8,          // [max_seq, kv_dim] INT8 on GPU
+        cache_scales: *mut f32,    // [max_seq, n_kv_heads] F32 on GPU
+        new_kv: *const f32,        // [n_new_tokens, kv_dim] F32 on GPU
+        insert_pos: i32,
+        n_new_tokens: i32,
+        kv_dim: i32,
+        head_dim: i32,
+        n_kv_heads: i32,
+        max_seq: i32,
+    ) -> Result<(), HipError> {
+        let num_blocks = (n_new_tokens as u32) * (n_kv_heads as u32);
+        let shared_bytes = 256 * std::mem::size_of::<f32>() as u32;
+
+        let grid = (num_blocks, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_cache_q = cache_q;
+        let mut p_cache_scales = cache_scales;
+        let mut p_new_kv = new_kv;
+        let mut p_insert_pos = insert_pos;
+        let mut p_n_new_tokens = n_new_tokens;
+        let mut p_kv_dim = kv_dim;
+        let mut p_head_dim = head_dim;
+        let mut p_n_kv_heads = n_kv_heads;
+        let mut p_max_seq = max_seq;
+
+        hip_launch_kernel(
+            self.fn_kv_cache_int8_quantize_append,
+            grid,
+            block,
+            shared_bytes,
+            ptr::null_mut(),
+            &mut [
+                &mut p_cache_q as *mut *mut i8 as *mut std::ffi::c_void,
+                &mut p_cache_scales as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_new_kv as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_insert_pos as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_new_tokens as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_kv_heads as *mut i32 as *mut std::ffi::c_void,
+                &mut p_max_seq as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Kernel 17: kv_cache_int8_dequantize
+    //
+    // Dequantize INT8 KV cache back to F32 for attention computation.
+    //
+    // Grid : (seq_len, n_kv_heads, 1)
+    // Block: (256, 1, 1)
+    // -------------------------------------------------------------------------
+
+    /// Dequantize INT8 KV cache to F32 for attention computation.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn kv_cache_int8_dequantize(
+        &self,
+        cache_q: *const i8,        // [max_seq, kv_dim] INT8 on GPU
+        cache_scales: *const f32,  // [max_seq, n_kv_heads] F32 on GPU
+        output: *mut f32,          // [seq_len, kv_dim] F32 on GPU
+        seq_len: i32,
+        kv_dim: i32,
+        head_dim: i32,
+        n_kv_heads: i32,
+    ) -> Result<(), HipError> {
+        let grid = (seq_len as u32, n_kv_heads as u32, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_cache_q = cache_q;
+        let mut p_cache_scales = cache_scales;
+        let mut p_output = output;
+        let mut p_seq_len = seq_len;
+        let mut p_kv_dim = kv_dim;
+        let mut p_head_dim = head_dim;
+        let mut p_n_kv_heads = n_kv_heads;
+
+        hip_launch_kernel(
+            self.fn_kv_cache_int8_dequantize,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_cache_q as *mut *const i8 as *mut std::ffi::c_void,
+                &mut p_cache_scales as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_output as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_kv_heads as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }

@@ -5,6 +5,7 @@ use compute_core::{
         AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params,
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
+        KvCacheInt8AppendParams, KvCacheInt8ReadParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -654,5 +655,39 @@ impl ComputeBackend for RocmBackend {
 
     fn mem_info(&self) -> Option<(usize, usize)> {
         hip_ffi::safe::hip_mem_info().ok()
+    }
+
+    fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError> {
+        // Quantize F32 K/V to INT8 and append to cache
+        unsafe {
+            self.kernels.kv_cache_int8_quantize_append(
+                u8_mut_ptr(p.cache_q) as *mut i8,
+                f32_mut_ptr(p.cache_scales),
+                f32_ptr(p.new_kv),
+                p.insert_pos as i32,
+                p.n_new_tokens as i32,
+                p.kv_dim as i32,
+                p.head_dim as i32,
+                p.n_kv_heads as i32,
+                p.max_seq as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError> {
+        // Dequantize INT8 K/V cache to F32 for attention
+        unsafe {
+            self.kernels.kv_cache_int8_dequantize(
+                u8_ptr(p.cache_q) as *const i8,
+                f32_ptr(p.cache_scales),
+                f32_mut_ptr(p.output),
+                p.seq_len as i32,
+                p.kv_dim as i32,
+                p.head_dim as i32,
+                p.n_kv_heads as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 }

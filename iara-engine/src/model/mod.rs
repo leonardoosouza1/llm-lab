@@ -149,6 +149,9 @@ pub struct ForwardScratchpad {
     pub up:       AnyTensor,  // [max_seq, inter]
     pub scores:   AnyTensor,  // [n_heads * max_seq, max_seq] — scores de atenção
     pub logits:   AnyTensor,  // [vocab_size]
+    /// Buffers para dequantização INT8 (se modo INT8 está ativo)
+    pub kv_k_deq: Option<AnyTensor>,  // [max_seq, kv_dim] F32 — dequant temp
+    pub kv_v_deq: Option<AnyTensor>,  // [max_seq, kv_dim] F32 — dequant temp
 }
 
 impl ForwardScratchpad {
@@ -160,6 +163,19 @@ impl ForwardScratchpad {
         let it = cfg.intermediate_size;
         let nh = cfg.num_heads;
         let v  = cfg.vocab_size;
+
+        let mode = kv_cache::KvCacheMode::detect();
+        let (kv_k_deq, kv_v_deq) = match mode {
+            kv_cache::KvCacheMode::F32 => (None, None),
+            kv_cache::KvCacheMode::Int8 => {
+                // Aloca buffers para dequantização INT8 → F32 durante atenção
+                (
+                    Some(backend.alloc_f32(&[ms, kd])),
+                    Some(backend.alloc_f32(&[ms, kd])),
+                )
+            }
+        };
+
         Self {
             x:        backend.alloc_f32(&[ms, h]),
             normed:   backend.alloc_f32(&[ms, h]),
@@ -171,6 +187,8 @@ impl ForwardScratchpad {
             up:       backend.alloc_f32(&[ms, it]),
             scores:   backend.alloc_f32(&[nh * ms, ms]),
             logits:   backend.alloc_f32(&[v]),
+            kv_k_deq,
+            kv_v_deq,
         }
     }
 }
@@ -490,8 +508,8 @@ impl CausalLM {
                 },
                 input_norm_w:    gpu_f32(&in_w),
                 post_attn_norm_w: gpu_f32(&pa_w),
-                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim),
-                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim),
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
             });
         }
 
@@ -786,9 +804,15 @@ impl CausalLM {
                 },
                 input_norm_w:     gpu_f32(&in_w),
                 post_attn_norm_w: gpu_f32(&pa_w),
-                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim),
-                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim),
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
             });
+        }
+
+        // Log KV-cache mode
+        match kv_cache::KvCacheMode::detect() {
+            kv_cache::KvCacheMode::F32 => log::info!("  → KV-cache: F32 (precisão total)"),
+            kv_cache::KvCacheMode::Int8 => log::info!("  → KV-cache: INT8 (4x menos VRAM)"),
         }
 
         // Log QK norm detection
@@ -1045,27 +1069,104 @@ impl CausalLM {
             })?;
 
             // ── Append K, V ao KV-cache ───────────────────────────────────────
-            self.backend.copy_to_kv_cache(&KvCacheParams {
-                cache:        &layer.kv_k.data,
-                new_kv:       &self.scratch.k,
-                insert_pos:   pos_start,
-                n_new_tokens: n,
-                kv_dim:       kd,
-                max_seq:      self.cfg.max_seq_len,
-            })?;
+            match layer.kv_k.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    self.backend.copy_to_kv_cache(&KvCacheParams {
+                        cache:        &layer.kv_k.data,
+                        new_kv:       &self.scratch.k,
+                        insert_pos:   pos_start,
+                        n_new_tokens: n,
+                        kv_dim:       kd,
+                        max_seq:      self.cfg.max_seq_len,
+                    })?;
+                },
+                kv_cache::KvCacheMode::Int8 => {
+                    let scales = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but no scales allocated".into()))?;
+                    self.backend.kv_cache_int8_append(&compute_core::KvCacheInt8AppendParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.k,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                },
+            }
             layer.kv_k.current_len += n;
 
-            self.backend.copy_to_kv_cache(&KvCacheParams {
-                cache:        &layer.kv_v.data,
-                new_kv:       &self.scratch.v,
-                insert_pos:   pos_start,
-                n_new_tokens: n,
-                kv_dim:       kd,
-                max_seq:      self.cfg.max_seq_len,
-            })?;
+            match layer.kv_v.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    self.backend.copy_to_kv_cache(&KvCacheParams {
+                        cache:        &layer.kv_v.data,
+                        new_kv:       &self.scratch.v,
+                        insert_pos:   pos_start,
+                        n_new_tokens: n,
+                        kv_dim:       kd,
+                        max_seq:      self.cfg.max_seq_len,
+                    })?;
+                },
+                kv_cache::KvCacheMode::Int8 => {
+                    let scales = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but no scales allocated".into()))?;
+                    self.backend.kv_cache_int8_append(&compute_core::KvCacheInt8AppendParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.v,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                },
+            }
             layer.kv_v.current_len += n;
 
             let seq = layer.kv_k.current_len;
+
+            // ── Dequantize KV cache if INT8 mode ───────────────────────────────
+            let (kv_k_use, kv_v_use) = match layer.kv_k.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    (&layer.kv_k.data, &layer.kv_v.data)
+                },
+                kv_cache::KvCacheMode::Int8 => {
+                    let kv_k_deq = self.scratch.kv_k_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_k_deq not allocated".into()))?;
+                    let kv_v_deq = self.scratch.kv_v_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_v_deq not allocated".into()))?;
+
+                    let scales_k = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_k scales not allocated".into()))?;
+                    self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales_k,
+                        output: kv_k_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    let scales_v = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_v scales not allocated".into()))?;
+                    self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales_v,
+                        output: kv_v_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    (kv_k_deq, kv_v_deq)
+                },
+            };
 
             // ── Attention: Q × K^T → softmax → × V ───────────────────────────
             // T7: Batched attention with GQA fallback
@@ -1097,7 +1198,7 @@ impl CausalLM {
                     a: &self.scratch.q,
                     lda: hd,      // leading dim of Q sub-block [n, hd]
                     stride_a: hd,  // stride between Q heads: next head starts at +hd
-                    b: &layer.kv_k.data,
+                    b: kv_k_use,
                     ldb: hd,      // leading dim of K sub-block [seq, hd]
                     stride_b: hd,  // stride between K heads (MHA: uniform)
                     c: &self.scratch.scores,
@@ -1129,7 +1230,7 @@ impl CausalLM {
                     a: &self.scratch.scores,
                     lda: seq,     // leading dim of scores sub-block [n, seq]
                     stride_a: n * seq,  // stride between score heads
-                    b: &layer.kv_v.data,
+                    b: kv_v_use,
                     ldb: hd,      // leading dim of V sub-block [seq, hd]
                     stride_b: hd,  // stride between V heads (MHA: uniform)
                     c: &self.scratch.attn_out,
@@ -1156,7 +1257,7 @@ impl CausalLM {
                         a: &self.scratch.q,
                         lda: qd,
                         a_offset: hi * hd,
-                        b: &layer.kv_k.data,
+                        b: kv_k_use,
                         ldb: kd,
                         b_offset: kv_h * hd,
                         c: &self.scratch.scores,
