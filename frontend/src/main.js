@@ -353,6 +353,10 @@ createApp({
       saveSession();
     }, { immediate: true });
 
+    watch(() => store.backend, b => {
+      setText('backend-url', b || '—');
+    }, { immediate: true });
+
     // Resposta gerada
     watch(() => store.responseText, text => {
       const el = document.getElementById('response-text');
@@ -387,6 +391,14 @@ createApp({
 
     watch(() => store.anomalyCount, n => {
       setText('anomaly-count', n);
+    });
+
+    // Footer: latency and token count
+    watch(() => store.totalDurationMs, ms => {
+      setText('gen-latency', ms > 0 ? `${ms.toFixed(0)}ms` : '—');
+    });
+    watch(() => store.evalCount, n => {
+      setText('gen-tokens', n > 0 ? String(n) : '—');
     });
 
     watch(() => [store.evalCount, store.totalDurationMs, store.tokensPerSec], () => {
@@ -614,12 +626,7 @@ createApp({
       })
     );
 
-    // ── Graph controls ────────────────────────────────────────────────────
-    document.getElementById('graph-reset-btn')?.addEventListener('click', () => {
-      if (typeof d3 === 'undefined') return;
-      const svg = document.getElementById('force-graph-svg');
-      if (svg) d3.select(svg).call(d3.zoom().transform, d3.zoomIdentity);
-    });
+    // Graph controls now handled internally by force_graph.js bindControls()
 
     console.log('✅ IARA Dashboard v3 iniciado');
   },

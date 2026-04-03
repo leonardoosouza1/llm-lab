@@ -199,21 +199,37 @@ pub fn train_esn_readout(esn: &EsnObserver, reward: &RewardSignal) -> Option<Vec
     }
 
     // Resolve (H^T H + λI) w = H^T y via Cholesky
-    match solve_positive_definite(&hth, &hty, r) {
-        Some(w) => {
+    // Tenta com regularização crescente se a matriz for singular
+    let lambdas = [ESN_RIDGE_LAMBDA, 1e-3, 1e-2, 1e-1];
+    let mut result: Option<Vec<f32>> = None;
+
+    for (attempt, &lambda) in lambdas.iter().enumerate() {
+        // Na primeira tentativa já temos λ aplicado; nas demais, incrementamos a diagonal
+        if attempt > 0 {
+            let extra = lambda - lambdas[attempt - 1];
+            for i in 0..r {
+                hth[i * r + i] += extra;
+            }
+            log::debug!("ESN Cholesky retry #{} com λ={:.0e}", attempt, lambda);
+        }
+
+        if let Some(w) = solve_positive_definite(&hth, &hty, r) {
             log::info!(
-                "ESN readout treinado: {} steps, mean_reward={:.4}, ||w||={:.4}",
+                "ESN readout treinado: {} steps, mean_reward={:.4}, ||w||={:.4}, λ={:.0e}",
                 n,
                 reward.mean_reward,
-                w.iter().map(|x| x * x).sum::<f32>().sqrt()
+                w.iter().map(|x| x * x).sum::<f32>().sqrt(),
+                lambda,
             );
-            Some(w)
-        }
-        None => {
-            log::warn!("ESN ridge regression falhou (Cholesky singular)");
-            None
+            result = Some(w);
+            break;
         }
     }
+
+    if result.is_none() {
+        log::warn!("ESN ridge regression falhou após {} tentativas (reservatório degenerado)", lambdas.len());
+    }
+    result
 }
 
 /// Resolve Ax = b via Cholesky (A simétrica positiva-definida).

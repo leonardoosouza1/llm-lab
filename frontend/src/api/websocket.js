@@ -155,6 +155,11 @@ export const wsManager = {
         if (store.evalCount > 0 && store.totalDurationMs > 0) {
           store.tokensPerSec = store.evalCount / (store.totalDurationMs / 1000);
         }
+        // Compute ms/layer from layer telemetry
+        const layerTimes = Object.values(store.layerData).map(l => l.time_us || 0).filter(t => t > 0);
+        if (layerTimes.length > 0) {
+          store.msPerLayer = (layerTimes.reduce((a, b) => a + b, 0) / layerTimes.length) / 1000;
+        }
 
         // Constrói trace token-by-token para aba Trace
         const avgLayerEnergy = Object.keys(store.layerData).length > 0

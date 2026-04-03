@@ -569,45 +569,40 @@
       aria-labelledby="tab-btn-graph"
       tabindex="0"
     >
-      <div class="graph-controls glass-panel" aria-label="Force graph controls">
+      <div class="graph-controls glass-panel" aria-label="Neural topology controls">
         <div class="layers-controls-inner">
-          <span class="control-label">Forces:</span>
-          <button class="ctrl-btn ctrl-btn--active" data-force="charge" type="button" aria-pressed="true">Charge</button>
+          <span class="control-label">Connections:</span>
           <button class="ctrl-btn ctrl-btn--active" data-force="links" type="button" aria-pressed="true">Links</button>
-          <button class="ctrl-btn ctrl-btn--active" data-force="center" type="button" aria-pressed="true">Center</button>
-          <button class="ctrl-btn" data-force="collision" type="button" aria-pressed="false">Collision</button>
           <span class="layers-divider" aria-hidden="true"></span>
-          <span class="control-label">Node color:</span>
+          <span class="control-label">Color by:</span>
           <button class="ctrl-btn ctrl-btn--active" data-color="attention" type="button" aria-pressed="true">Attention</button>
-          <button class="ctrl-btn" data-color="layer" type="button" aria-pressed="false">Layer</button>
           <button class="ctrl-btn" data-color="activation" type="button" aria-pressed="false">Activation</button>
+          <button class="ctrl-btn" data-color="energy" type="button" aria-pressed="false">Energy</button>
           <span class="layers-divider" aria-hidden="true"></span>
           <button class="ctrl-btn" id="graph-reset-btn" type="button">Reset View</button>
           <button class="ctrl-btn" id="graph-freeze-btn" type="button" aria-pressed="false">Freeze</button>
         </div>
       </div>
 
-      <div class="graph-svg-container glass-panel">
+      <div class="graph-svg-container glass-panel" style="position:relative">
         <svg
           id="force-graph-svg"
           width="100%"
           height="100%"
           role="img"
-          aria-label="D3 force-directed graph of transformer attention heads and layers"
-        >
-          <defs>
-            <filter id="glow-filter" x="-50%" y="-50%" width="200%" height="200%">
-              <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
-              <feMerge>
-                <feMergeNode in="coloredBlur"/>
-                <feMergeNode in="SourceGraphic"/>
-              </feMerge>
-            </filter>
-          </defs>
-          <g id="graph-links-group"></g>
-          <g id="graph-nodes-group"></g>
-          <g id="graph-labels-group"></g>
-        </svg>
+          aria-label="Neural network topology visualization of transformer layers"
+        ></svg>
+        <!-- Legend overlay -->
+        <div style="position:absolute;bottom:12px;left:12px;background:rgba(10,28,26,0.85);border:1px solid #1a3a35;border-radius:4px;padding:8px 12px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#668f8c;pointer-events:none">
+          <div style="margin-bottom:4px;color:#b2d8d8;font-weight:600">Legend</div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap">
+            <span><span style="display:inline-block;width:10px;height:10px;background:#00ffb0;border-radius:2px;margin-right:4px;vertical-align:middle"></span>Embed</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:#00e6ff;border-radius:2px;margin-right:4px;vertical-align:middle"></span>Norm</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:#b080ff;border-radius:2px;margin-right:4px;vertical-align:middle"></span>LM Head</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:#ff7700;border-radius:2px;margin-right:4px;vertical-align:middle"></span>Hot Layer</span>
+          </div>
+          <div style="margin-top:4px;color:#4a7a75">Hover layers for details · Scroll to zoom · Drag to pan</div>
+        </div>
       </div>
     </section>
 
@@ -837,18 +832,28 @@
     </div>
     <div class="status-bar-sep" aria-hidden="true"></div>
     <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">Latency</span>
+      <span id="gen-latency" class="statusbar-value" aria-label="Generation latency">—</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item">
+      <span class="statusbar-label" aria-hidden="true">Tokens</span>
+      <span id="gen-tokens" class="statusbar-value" aria-label="Token count">—</span>
+    </div>
+    <div class="status-bar-sep" aria-hidden="true"></div>
+    <div class="status-bar-item">
       <span class="statusbar-label" aria-hidden="true">Model</span>
-      <span id="active-model" class="statusbar-value statusbar-value--accent" aria-label="Active model name">qwen3-8b</span>
+      <span id="active-model" class="statusbar-value statusbar-value--accent" aria-label="Active model name">—</span>
     </div>
     <div class="status-bar-sep" aria-hidden="true"></div>
     <div class="status-bar-item">
       <span class="statusbar-label" aria-hidden="true">Backend</span>
-      <span id="backend-url" class="statusbar-value" aria-label="Backend connection URL">ws://localhost:8080</span>
+      <span id="backend-url" class="statusbar-value" aria-label="Backend type">—</span>
     </div>
     <div class="status-bar-sep" aria-hidden="true"></div>
     <div class="status-bar-item statusbar-right">
       <span class="statusbar-label" aria-hidden="true">IARA</span>
-      <span class="statusbar-version">v2.0</span>
+      <span class="statusbar-version">v3.0</span>
     </div>
   </footer>
 
