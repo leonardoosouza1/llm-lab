@@ -88,7 +88,8 @@ impl GpuKernels {
         let fn_softmax_rows = get_fn!("softmax_rows");
         let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
         let fn_f32_to_bf16 = get_fn!("f32_to_bf16");
-        let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4");
+        // TODO: revert to "dequant_gemv_q4" when optimized kernel is validated
+        let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4_naive");
         let fn_gravity_score = get_fn!("gravity_score");
         let fn_cfc_gate_update = get_fn!("cfc_gate_update");
         let fn_value_norms = get_fn!("value_norms");

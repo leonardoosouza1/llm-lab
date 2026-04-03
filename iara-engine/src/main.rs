@@ -11,6 +11,7 @@ mod hardware;
 mod inference;
 mod lnn;
 mod model;
+mod speculative; // Speculative decoding framework
 mod storage;
 mod tokenizer;
 mod transport;
@@ -66,6 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let enable_cfc = std::env::var("IARA_CFC")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    let enable_speculative = std::env::var("IARA_SPECULATIVE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     if quantize_on_load {
         log::info!("🔧 Quantização Q4 habilitada ao carregar modelos (IARA_QUANTIZE=1)");
@@ -73,9 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if enable_cfc {
         log::info!("🔧 Cascade Feedback Control (CfC) habilitado (IARA_CFC=1)");
     }
+    if enable_speculative {
+        log::info!("🔧 Speculative decoding habilitado (IARA_SPECULATIVE=1)");
+    }
 
     // 3. Shared state — no model loaded at startup
     let qwen_model:    Arc<Mutex<Option<CausalLM>>> = Arc::new(Mutex::new(None));
+    let draft_model:   Arc<Mutex<Option<CausalLM>>> = Arc::new(Mutex::new(None));
     let model_ready    = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let model_loading  = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let last_trace     = Arc::new(Mutex::new(None));
@@ -115,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Axum HTTP server (port 3000) — starts immediately, no model loaded yet
     let app_state = AppState {
         qwen_model:    qwen_model.clone(),
+        draft_model:   draft_model.clone(),
         last_trace:    last_trace.clone(),
         model_ready:   model_ready.clone(),
         model_loading: model_loading.clone(),
@@ -125,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         acp_store:     Arc::new(acp_store),
         quantize_on_load,
         enable_cfc,
+        enable_speculative,
     };
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
     let cors = CorsLayer::new()

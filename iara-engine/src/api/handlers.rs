@@ -32,6 +32,9 @@ use compute_core::ComputeBackend;
 #[derive(Clone)]
 pub struct AppState {
     pub qwen_model:    Arc<Mutex<Option<CausalLM>>>,
+    /// Draft model for speculative decoding (optional, if IARA_SPECULATIVE=1)
+    #[allow(dead_code)]
+    pub draft_model:   Arc<Mutex<Option<CausalLM>>>,
     pub last_trace:    Arc<Mutex<Option<BrainTrace>>>,
     pub model_ready:   Arc<std::sync::atomic::AtomicBool>,
     pub model_loading: Arc<std::sync::atomic::AtomicBool>,
@@ -46,6 +49,9 @@ pub struct AppState {
     pub quantize_on_load: bool,
     /// Habilita Cascade Feedback Control (CfC) para modularização de camadas
     pub enable_cfc: bool,
+    /// Habilita speculative decoding (env: IARA_SPECULATIVE)
+    #[allow(dead_code)]
+    pub enable_speculative: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ use compute_core::{
     AddBiasParams, AnyTensor, BackendError, ComputeBackend, DType,
     EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, KvCacheParams, LayerNormParams, RmsNormParams,
     RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
+    KvCacheInt8AppendParams, KvCacheInt8ReadParams,
 };
 
 use crate::context::OclContext;
@@ -890,6 +891,18 @@ impl ComputeBackend for OpenClBackend {
 
     fn fused_norm_bias_rope(&self, _p: &FusedNormBiasRopeParams) -> Result<(), BackendError> {
         Err(BackendError::Kernel("fused_norm_bias_rope not yet implemented".into()))
+    }
+
+    fn kv_cache_int8_append(&self, _p: &KvCacheInt8AppendParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "OpenCL: kv_cache_int8_append não implementado".to_string(),
+        ))
+    }
+
+    fn kv_cache_int8_read(&self, _p: &KvCacheInt8ReadParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "OpenCL: kv_cache_int8_read não implementado".to_string(),
+        ))
     }
 
     fn sync(&self) -> Result<(), BackendError> {

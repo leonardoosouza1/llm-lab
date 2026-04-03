@@ -40,9 +40,11 @@ pub struct GpuKvCache {
     pub max_seq_len: usize,
     #[allow(dead_code)]
     pub kv_dim: usize,
-    /// Número de heads (necessário para INT8)
+    /// Número de heads (necessário para INT8 quantize/dequant)
+    #[allow(dead_code)]
     pub n_kv_heads: usize,
-    /// Dimensão por head (necessário para INT8)
+    /// Dimensão por head (necessário para INT8 quantize/dequant)
+    #[allow(dead_code)]
     pub head_dim: usize,
     /// Linhas válidas (tokens já escritos no cache).
     pub current_len: usize,
