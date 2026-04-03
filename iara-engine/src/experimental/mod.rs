@@ -6,11 +6,11 @@
 // ou main.rs depende deles.
 //
 // Para o path de inferência ativo, veja:
-//   src/model.rs        — QwenModel, carga de pesos, forward CPU
-//   src/qwen/           — forward_traced, sampling
-//   src/kv_cache.rs     — BoundedKvCache
+//   src/model.rs        — CausalLM, carga de pesos, forward GPU
+//   src/inference/      — forward_traced, sampling
+//   src/model/kv_cache.rs — GpuKvCache
 //   src/api/            — HTTP handlers
-//   src/websocket.rs    — servidor WS
+//   src/transport.rs    — servidor WS
 // ============================================================================
 
 pub mod actuator;

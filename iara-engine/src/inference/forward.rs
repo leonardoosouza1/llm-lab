@@ -7,7 +7,7 @@
 // kernels de redução HIP (fase futura).
 // ============================================================================
 
-use crate::model::{QwenModel, ModelResult};
+use crate::model::{CausalLM, ModelResult};
 use crate::inference::sampling::{SamplingParams, sample_token};
 use crate::tokenizer;
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,7 @@ pub struct ActivationPattern {
 /// Toda computação é executada em GPU via hipBLAS + kernels HIP.
 /// O único to_host() é dos logits finais para sampling.
 pub fn forward_traced(
-    model: &mut QwenModel,
+    model: &mut CausalLM,
     token_ids: &[u32],
     sampling: &SamplingParams,
 ) -> ModelResult<GenerationStep> {

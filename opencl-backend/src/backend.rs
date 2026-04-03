@@ -29,7 +29,7 @@ use opencl3::types::{cl_float, cl_int, cl_mem, cl_uint, cl_ushort, CL_BLOCKING};
 
 use compute_core::{
     AddBiasParams, AnyTensor, BackendError, ComputeBackend, DType,
-    EmbedParams, GemmBf16Params, KvCacheParams, RmsNormParams,
+    EmbedParams, GeluMulParams, GemmBf16Params, KvCacheParams, LayerNormParams, RmsNormParams,
     RopeParams, SgemmParams, SiluMulParams, SoftmaxParams,
 };
 
@@ -617,6 +617,12 @@ impl ComputeBackend for OpenClBackend {
         Ok(())
     }
 
+    fn layer_norm(&self, _p: &LayerNormParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "LayerNorm not yet implemented — use RMSNorm models (Qwen, Llama, Mistral)".into(),
+        ))
+    }
+
     fn rope_inplace(&self, p: &RopeParams) -> Result<(), BackendError> {
         let t_buf = Self::f32_buf(p.tensor);
         let n_heads = p.n_heads as cl_int;
@@ -747,6 +753,12 @@ impl ComputeBackend for OpenClBackend {
                 .map_err(|e| BackendError::Kernel(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn gelu_mul_inplace(&self, _p: &GeluMulParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "GELU activation not yet implemented — use SiLU models (Qwen, Llama, Mistral)".into(),
+        ))
     }
 
     fn copy_to_kv_cache(&self, p: &KvCacheParams) -> Result<(), BackendError> {

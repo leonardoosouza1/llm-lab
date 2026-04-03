@@ -58,6 +58,27 @@ pub struct RmsNormParams<'a> {
     pub eps: f32,
 }
 
+/// LayerNorm: out = (input - mean) / sqrt(variance + eps) * weight + bias
+/// Usado por Phi, StableLM, Falcon (em vez de RMSNorm)
+pub struct LayerNormParams<'a> {
+    pub input: &'a AnyTensor,   // [n_tokens, hidden] F32
+    pub weight: &'a AnyTensor,  // [hidden] F32
+    pub bias: &'a AnyTensor,    // [hidden] F32
+    pub output: &'a AnyTensor,  // [n_tokens, hidden] F32 (pode ser == input para in-place)
+    pub n_tokens: usize,
+    pub hidden_size: usize,
+    pub eps: f32,
+}
+
+/// GELU activation: gate = gelu(gate) * up (in-place em gate)
+/// Usado por Phi, Gemma, Falcon (em vez de SiLU/SwiGLU)
+pub struct GeluMulParams<'a> {
+    pub gate: &'a AnyTensor,    // [n_tokens, intermediate] F32 (modificado in-place)
+    pub up: &'a AnyTensor,      // [n_tokens, intermediate] F32 (só leitura)
+    pub n_tokens: usize,
+    pub intermediate_size: usize,
+}
+
 /// Rotary Position Embeddings (in-place)
 pub struct RopeParams<'a> {
     pub tensor: &'a AnyTensor,  // [n_tokens, n_heads, head_dim] F32 (modificado in-place)

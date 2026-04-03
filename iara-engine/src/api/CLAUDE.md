@@ -60,7 +60,7 @@
    c. Libera lock
    d. Appenda token_str ao generated_text
    e. Adiciona step ao BrainTrace
-   f. Se EOS (151645): break
+   f. Se EOS (via arch.eos_token_ids): break
 5. Finaliza BrainTrace → last_trace
 6. Retorna GenerateResponse
 ```
@@ -80,7 +80,7 @@ ficam em fila atrás do Mutex.
    a. Ticker: log a cada 5s enquanto carregando
    b. load_tokenizer(&model_path)
    c. ModelCfg::from_config_json(&config.json)
-   d. QwenModel::load(&model_path, cfg)
+   d. CausalLM::load(&model_path, cfg, arch, backend)
    e. lock → Some(model), model_ready=true, model_loading=false
    f. frame_tx.send({"type":"model_loaded",...})
 6. Retorna 202 Accepted imediatamente
@@ -93,7 +93,7 @@ VLMs são carregados como decoder de texto apenas (vision encoder ignorado).
 Exibidos com badge `🖼 VLM` no frontend.
 
 ## Gotchas
-- **EOS hardcoded**: token 151645 (`<|im_end|>` Qwen3). Outros modelos podem ter EOS diferente.
+- **EOS dinâmico**: carregado de `generation_config.json` via `arch.eos_token_ids`. Suporta múltiplos tokens EOS.
 - **Sem streaming HTTP real**: `stream: bool` existe mas não implementa SSE — o response sempre é retornado completo.
 - **Lock durante forward**: toda a geração segura o mutex. UI fica responsiva via WS broadcast.
 - **config.json aninhado**: VLMs têm params em `text_config`, não na raiz. Leitura verifica ambos.

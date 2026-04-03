@@ -1,7 +1,8 @@
 # IARA LLM Engine — Visão Geral do Sistema
 
 ## O que é isso
-Motor de inferência nativo para modelos Qwen3 com arquitetura de backend dinâmica.
+Motor de inferência universal para modelos LLM open-source com arquitetura de backend dinâmica.
+Suporta múltiplas famílias de modelos (Qwen, Llama, Mistral, Phi, Gemma, etc.) via auto-detecção.
 Zero frameworks (sem PyTorch, sem candle). Carrega safetensors direto em VRAM via backend de compute.
 Expõe HTTP REST (porta 3000) + WebSocket (porta 8080) com painel Vue3 em tempo real.
 
@@ -85,11 +86,11 @@ cargo run -p iara-engine --no-default-features --features opencl
 ```
 
 ## Invariantes críticas
-1. **Apenas um modelo por vez** — `Arc<Mutex<Option<QwenModel>>>`
+1. **Apenas um modelo por vez** — `Arc<Mutex<Option<CausalLM>>>`
 2. **Pesos em BF16 no device** — `upload_bf16()` via backend; sem conversão intermediária para F32
 3. **KV-cache limitado** — janela deslizante de 4096 tokens (cap em `ModelCfg::from_config_json`)
 4. **RoPE aplicado antes do cache** — K rotacionado antes de `copy_to_kv_cache`, Q por chamada
-5. **reset_cache() obrigatório** — no início de cada geração nova (`QwenModel::reset_cache()`)
+5. **reset_cache() obrigatório** — no início de cada geração nova (`CausalLM::reset_cache()`)
 6. **Backend via trait** — `iara-engine` nunca importa `hip-ffi` ou `opencl-backend` diretamente
 
 ## Gotchas

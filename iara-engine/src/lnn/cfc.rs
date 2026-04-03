@@ -96,10 +96,10 @@ pub struct CfcLayer {
     pub state: CfcState,
     /// Buffer temporário para correction output [1, hidden_dim]
     pub(crate) correction_buf: AnyTensor,
-    /// Buffer temporário para f_proj [cfc_dim]
-    f_proj_buf: AnyTensor,
-    /// Buffer temporário para g_proj [cfc_dim]
-    g_proj_buf: AnyTensor,
+    /// Buffer temporário para f_proj [cfc_dim] — acessível para recording de ativações
+    pub f_proj_buf: AnyTensor,
+    /// Buffer temporário para g_proj [cfc_dim] — acessível para recording de ativações
+    pub g_proj_buf: AnyTensor,
 }
 
 impl CfcLayer {

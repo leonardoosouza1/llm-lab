@@ -451,7 +451,14 @@ async fn execute_inference(
 
     let mut generated_text = String::new();
 
-    const EOS_TOKEN: u32 = 151645;
+    // Extract EOS token IDs from model architecture
+    let eos_ids = {
+        let guard = state.qwen_model.lock().await;
+        match guard.as_ref() {
+            Some(m) => m.arch.eos_token_ids.clone(),
+            None => return Err("Model not loaded".into()),
+        }
+    };
 
     // Reset KV cache — evita estado antigo
     {
@@ -487,7 +494,7 @@ async fn execute_inference(
         generated_text.push_str(&gen_step.token_str);
 
         // Stop conditions: EOS ou token especial
-        if decode_token == EOS_TOKEN || decode_token == 151643 {
+        if eos_ids.contains(&decode_token) {
             break;
         }
     }

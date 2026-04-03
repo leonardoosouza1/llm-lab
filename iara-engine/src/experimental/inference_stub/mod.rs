@@ -3,16 +3,16 @@
 // ============================================================================
 
 use crate::tokenizer;
-use crate::model::{QwenModel, ModelResult};
+use crate::model::{CausalLM, ModelResult};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct InferenceEngine {
-    pub model: Arc<Mutex<QwenModel>>,
+    pub model: Arc<Mutex<CausalLM>>,
 }
 
 impl InferenceEngine {
-    pub fn new(model: Arc<Mutex<QwenModel>>) -> Self {
+    pub fn new(model: Arc<Mutex<CausalLM>>) -> Self {
         Self { model }
     }
 

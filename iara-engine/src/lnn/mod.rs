@@ -10,10 +10,13 @@
 //   → Aplica correção adaptativa via neurônio líquido (CfC)
 //   → Integra-se ao loop de geração entre as camadas do transformer
 //
-// Roadmap:
-//   Fase 1 — ESN observador (implementado)
-//   Fase 2 — Gravity + CfC (este módulo)
-//   Fase 3 — Treinamento online do readout W_out por reinforcement signal
+// Fase 3: Treinamento Online (IMPLEMENTADO)
+//   → ESN readout (W_out) treinado via ridge regression após cada geração
+//   → CfC weights treinados via backprop manual + SGD (CPU-side)
+//   → Reward signal: entropia, confiança, diversidade léxica, repetição
+//   → Persistência: save/load pesos treinados em JSON
+//
+// Roadmap restante:
 //   Fase 4 — LNN como memória episódica (estado persistente entre gerações)
 //   Fase 5 — Dual pipeline: LNN + LLM em paralelo via UMA zero-copy
 // ============================================================================
@@ -21,6 +24,7 @@
 pub mod esn;
 pub mod gravity;
 pub mod cfc;
+pub mod train;
 
 #[allow(unused_imports)]
 pub use esn::EsnObserver;
@@ -28,3 +32,5 @@ pub use esn::EsnObserver;
 pub use gravity::{GravitySystem, GravityConfig, GravityResult, GravityTelemetry};
 #[allow(unused_imports)]
 pub use cfc::{CfcLayer, CfcConfig, CfcTelemetry};
+#[allow(unused_imports)]
+pub use train::{LnnTrainer, LnnTrainResult, LnnTrainTelemetry, RewardSignal};

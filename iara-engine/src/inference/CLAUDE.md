@@ -15,7 +15,7 @@
 **Assinatura:**
 ```rust
 pub fn forward_traced(
-    model: &mut QwenModel,
+    model: &mut CausalLM,
     token_ids: &[u32],
     sampling: &SamplingParams,
 ) -> ModelResult<GenerationStep>

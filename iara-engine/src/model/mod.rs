@@ -1,14 +1,20 @@
 // ============================================================================
-// model/mod.rs — Pipeline Nativo Qwen: GPU via ComputeBackend
+// model/mod.rs — Pipeline Universal de Inferência: GPU via ComputeBackend
 // ============================================================================
+// Suporta múltiplas famílias de modelos (Qwen, Llama, Mistral, Phi, Gemma, etc.)
+// via detecção automática de arquitetura a partir de config.json.
+//
 // Todas as operações no device (GPU ou CPU-backend):
 //   - Pesos: AnyTensor BF16 (metade da memória)
 //   - Ativações: AnyTensor F32 (scratchpad pré-alocado, zero-alloc no forward)
 //   - KV-cache: GpuKvCache (AnyTensor F32 pré-alocado, append via backend)
 //   - Projeções: gemm_bf16_f32 (BF16 pesos × F32 ativações → F32 saída)
-//   - Norm/RoPE/SwiGLU/Softmax: kernels via ComputeBackend
+//   - Norm/RoPE/Activation/Softmax: kernels via ComputeBackend
 //   - Único download_f32(): logits finais [vocab_size] por token gerado
 // ============================================================================
+
+pub mod architecture;
+pub use architecture::{ModelArchitecture, NormType, Activation, MlpType, TensorNameMap};
 
 mod kv_cache;
 pub(crate) use kv_cache::GpuKvCache;
@@ -18,8 +24,9 @@ pub(crate) use kv_cache::BoundedKvCache;
 use std::sync::Arc;
 use compute_core::{
     ComputeBackend, AnyTensor,
-    GemmBf16Params, SgemmParams, EmbedParams, RmsNormParams,
-    RopeParams, SoftmaxParams, SiluMulParams, KvCacheParams, AddBiasParams, GemvQ4Params,
+    GemmBf16Params, SgemmParams, EmbedParams, RmsNormParams, LayerNormParams,
+    RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
+    AddBiasParams, GemvQ4Params,
 };
 use half::bf16;
 use std::collections::HashMap;
@@ -60,7 +67,7 @@ pub struct ModelCfg {
 }
 
 impl ModelCfg {
-    /// Lê parâmetros do config.json. Suporta Qwen2, Qwen2.5, Qwen3, Llama, Mistral.
+    /// Lê parâmetros do config.json. Suporta qualquer modelo causal LM com campos padrão.
     pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(config_path)?;
         let v: serde_json::Value = serde_json::from_str(&content)?;
@@ -70,12 +77,12 @@ impl ModelCfg {
             .and_then(|s| s.as_str())
             .unwrap_or("unknown");
 
-        let supported = ["Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM",
-                         "MistralForCausalLM", "Qwen2_5ForCausalLM"];
-        if !supported.iter().any(|s| arch.contains(s.trim_end_matches("ForCausalLM"))
-                                  || *s == arch) {
+        // Verificação básica: deve ser um modelo causal LM (ou ter hidden_size)
+        if !arch.contains("CausalLM") && !arch.contains("ForCausalLM")
+            && !v["hidden_size"].is_number() && !v["text_config"]["hidden_size"].is_number()
+        {
             return Err(format!(
-                "Arquitetura '{}' não suportada. Apenas causal LM (Qwen3, Llama, Mistral).",
+                "Arquitetura '{}' não parece ser um CausalLM. Verifique config.json.",
                 arch
             ).into());
         }
@@ -183,7 +190,7 @@ pub enum LayerWeight {
 // ── Camada Transformer ────────────────────────────────────────────────────────
 
 /// Pesos e estado de uma camada Qwen — tensores no device via AnyTensor ou QuantizedTensor.
-pub struct QwenLayer {
+pub struct TransformerLayer {
     // Pesos matriciais: BF16 ou Q4 conforme modo
     pub wq:    LayerWeight,   // BF16 ou Q4
     pub wk:    LayerWeight,   // BF16 ou Q4
@@ -196,6 +203,9 @@ pub struct QwenLayer {
     pub q_bias: Option<AnyTensor>,  // F32 opcional
     pub k_bias: Option<AnyTensor>,  // F32 opcional
     pub v_bias: Option<AnyTensor>,  // F32 opcional
+    // QK Norm weights (Qwen3 aplica RMSNorm per-head em Q e K antes do RoPE)
+    pub q_norm_w: Option<AnyTensor>,  // F32 [head_dim] — Qwen3 only
+    pub k_norm_w: Option<AnyTensor>,  // F32 [head_dim] — Qwen3 only
     // Norm weights no device (pequenos, mas evita round-trip host→device por token)
     pub input_norm_w:    AnyTensor, // F32
     pub post_attn_norm_w: AnyTensor, // F32
@@ -206,31 +216,31 @@ pub struct QwenLayer {
 
 // ── Modelo completo ───────────────────────────────────────────────────────────
 
-pub struct QwenModel {
+pub struct CausalLM {
     pub embed:   AnyTensor,     // BF16 [vocab, hidden] — sempre (sensível a quantização)
-    pub layers:  Vec<QwenLayer>,
+    pub layers:  Vec<TransformerLayer>,
     pub norm_w:  AnyTensor,     // F32 [hidden]
+    pub norm_b:  Option<AnyTensor>, // F32 [hidden] — bias (LayerNorm only)
     pub lm_head: AnyTensor,     // BF16 [vocab, hidden] — sempre (sensível a quantização)
     pub cfg:     ModelCfg,
+    /// Descritor da arquitetura (família, norm, ativação, tensor map, EOS tokens)
+    pub arch: ModelArchitecture,
     /// Bytes estimados no device: pesos BF16/Q4 + scratchpad + KV-cache.
     pub vram_bytes: usize,
     pub backend: Arc<dyn ComputeBackend>,
     pub scratch: ForwardScratchpad,
     // ────────────────────────────────────────────────────────────────────────
-    // Novos campos para CfC e Gravity (quantização + correção adaptativa)
+    // Campos para CfC e Gravity (quantização + correção adaptativa)
     // ────────────────────────────────────────────────────────────────────────
     /// CfC Liquid Correction Layer (opcional).
-    /// Se None, a correção está desabilitada (sem custo extra).
     pub cfc: Option<crate::lnn::cfc::CfcLayer>,
     /// Sistema de Gravidade Semântica (opcional).
-    /// Usado para detectar tokens críticos que requerem CfC correction.
     pub gravity: Option<crate::lnn::gravity::GravitySystem>,
     /// Flag: se true, pesos estão em Q4 (quantizados INT4).
-    /// Se false, pesos são BF16 (padrão).
     pub quantized: bool,
 }
 
-impl QwenModel {
+impl CausalLM {
     /// Helper: faz projeção com pesos BF16 ou Q4 quantizados.
     /// Despacha para backend.gemm_bf16_f32 ou backend.gemv_q4 conforme necessário.
     fn project(
@@ -276,11 +286,67 @@ impl QwenModel {
         Ok(())
     }
 
+    /// Aplica normalização baseada no tipo da arquitetura (RMSNorm ou LayerNorm).
+    /// `norm_bias` é obrigatório para LayerNorm, ignorado para RMSNorm.
+    fn apply_norm(
+        backend: &Arc<dyn ComputeBackend>,
+        norm_type: NormType,
+        input: &AnyTensor,
+        weight: &AnyTensor,
+        bias: Option<&AnyTensor>,
+        output: &AnyTensor,
+        n_tokens: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> ModelResult<()> {
+        match norm_type {
+            NormType::RMSNorm => {
+                backend.rms_norm(&RmsNormParams {
+                    input, weight, output, n_tokens, hidden_size, eps,
+                })?;
+            }
+            NormType::LayerNorm => {
+                let bias = bias.ok_or_else(|| ModelError::Model(
+                    "LayerNorm requer bias, mas nenhum foi carregado".into()
+                ))?;
+                backend.layer_norm(&LayerNormParams {
+                    input, weight, bias, output, n_tokens, hidden_size, eps,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Aplica ativação + multiplicação baseada no tipo da arquitetura (SiLU ou GELU).
+    fn apply_activation(
+        backend: &Arc<dyn ComputeBackend>,
+        activation: Activation,
+        gate: &AnyTensor,
+        up: &AnyTensor,
+        n_tokens: usize,
+        intermediate_size: usize,
+    ) -> ModelResult<()> {
+        match activation {
+            Activation::SiLU => {
+                backend.silu_mul_inplace(&SiluMulParams {
+                    gate, up, n_tokens, intermediate_size,
+                })?;
+            }
+            Activation::GELU => {
+                backend.gelu_mul_inplace(&GeluMulParams {
+                    gate, up, n_tokens, intermediate_size,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Carrega pesos do diretório. Suporta single-shard e multi-shard.
-    pub fn load(model_dir: &Path, cfg: ModelCfg, backend: Arc<dyn ComputeBackend>) -> ModelResult<Self> {
+    /// Usa ModelArchitecture para determinar nomes de tensores e variantes.
+    pub fn load(model_dir: &Path, cfg: ModelCfg, arch: ModelArchitecture, backend: Arc<dyn ComputeBackend>) -> ModelResult<Self> {
         log::info!(
-            "⏳ Carregando Qwen: {} camadas, hidden={}, vocab={}",
-            cfg.num_layers, cfg.hidden_size, cfg.vocab_size
+            "⏳ Carregando modelo [{}]: {} camadas, hidden={}, vocab={}",
+            arch.family, cfg.num_layers, cfg.hidden_size, cfg.vocab_size
         );
 
         // ── Mmaps ───────────────────────────────────────────────────────────
@@ -364,9 +430,12 @@ impl QwenModel {
             backend.upload_f32(data, &[data.len()])
         };
 
+        // ── Nomes de tensores (via architecture descriptor) ─────────────────
+        let tmap = &arch.tensor_map;
+
         // ── Embedding ────────────────────────────────────────────────────────
         log::info!("  → embed_tokens");
-        let embed = gpu("model.embed_tokens.weight")?;
+        let embed = gpu(&tmap.embed)?;
 
         // ── Camadas ──────────────────────────────────────────────────────────
         let kv_dim  = cfg.num_kv_heads * cfg.head_dim;
@@ -375,32 +444,51 @@ impl QwenModel {
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             if i % 8 == 0 { log::info!("  → layers {}/{}", i, cfg.num_layers); }
-            let p = format!("model.layers.{}", i);
 
-            let (in_w, _)  = load_f32(&format!("{}.input_layernorm.weight", p))?;
-            let (pa_w, _)  = load_f32(&format!("{}.post_attention_layernorm.weight", p))?;
+            let (in_w, _)  = load_f32(&tmap.layer_tensor(i, &tmap.input_norm))?;
+            let (pa_w, _)  = load_f32(&tmap.layer_tensor(i, &tmap.post_attn_norm))?;
 
-            let qbn = format!("{}.self_attn.q_proj.bias", p);
-            let kbn = format!("{}.self_attn.k_proj.bias", p);
-            let vbn = format!("{}.self_attn.v_proj.bias", p);
+            // Tensor names for optional fields
+            let qbn = tmap.layer_tensor_opt(i, &tmap.attn_q_bias);
+            let kbn = tmap.layer_tensor_opt(i, &tmap.attn_k_bias);
+            let vbn = tmap.layer_tensor_opt(i, &tmap.attn_v_bias);
+            let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
+            let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
 
-            layers.push(QwenLayer {
-                wq:    LayerWeight::Bf16(gpu(&format!("{}.self_attn.q_proj.weight", p))?),
-                wk:    LayerWeight::Bf16(gpu(&format!("{}.self_attn.k_proj.weight", p))?),
-                wv:    LayerWeight::Bf16(gpu(&format!("{}.self_attn.v_proj.weight", p))?),
-                wo:    LayerWeight::Bf16(gpu(&format!("{}.self_attn.o_proj.weight", p))?),
-                wgate: LayerWeight::Bf16(gpu(&format!("{}.mlp.gate_proj.weight", p))?),
-                wup:   LayerWeight::Bf16(gpu(&format!("{}.mlp.up_proj.weight", p))?),
-                wdown: LayerWeight::Bf16(gpu(&format!("{}.mlp.down_proj.weight", p))?),
-                q_bias: if tensor_exists(&qbn) {
-                    Some(gpu_f32(&load_f32(&qbn)?.0))
-                } else { None },
-                k_bias: if tensor_exists(&kbn) {
-                    Some(gpu_f32(&load_f32(&kbn)?.0))
-                } else { None },
-                v_bias: if tensor_exists(&vbn) {
-                    Some(gpu_f32(&load_f32(&vbn)?.0))
-                } else { None },
+            layers.push(TransformerLayer {
+                wq:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_q))?),
+                wk:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_k))?),
+                wv:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_v))?),
+                wo:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_o))?),
+                wgate: LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_gate))?),
+                wup:   LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_up))?),
+                wdown: LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_down))?),
+                q_bias: match &qbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                k_bias: match &kbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                v_bias: match &vbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                q_norm_w: match &qnn {
+                    Some(name) if tensor_exists(name) => {
+                        log::debug!("  → q_norm layer {}", i);
+                        Some(gpu_f32(&load_f32(name)?.0))
+                    },
+                    _ => None,
+                },
+                k_norm_w: match &knn {
+                    Some(name) if tensor_exists(name) => {
+                        log::debug!("  → k_norm layer {}", i);
+                        Some(gpu_f32(&load_f32(name)?.0))
+                    },
+                    _ => None,
+                },
                 input_norm_w:    gpu_f32(&in_w),
                 post_attn_norm_w: gpu_f32(&pa_w),
                 kv_k: GpuKvCache::new(&backend, max_seq, kv_dim),
@@ -408,14 +496,25 @@ impl QwenModel {
             });
         }
 
-        let (nw, _) = load_f32("model.norm.weight")?;
+        // Log QK norm detection
+        if layers.first().map_or(false, |l| l.q_norm_w.is_some()) {
+            log::info!("  → QK Normalization detectada: q_norm + k_norm em todas as camadas");
+        }
+
+        let (nw, _) = load_f32(&tmap.final_norm)?;
         let norm_w = gpu_f32(&nw);
 
-        let lm_head = if tensor_exists("lm_head.weight") {
-            gpu("lm_head.weight")?
+        // Norm bias (para LayerNorm)
+        let norm_b = match &tmap.final_norm_bias {
+            Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+            _ => None,
+        };
+
+        let lm_head = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+            gpu(&tmap.lm_head)?
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            gpu("model.embed_tokens.weight")?
+            gpu(&tmap.embed)?
         };
 
         // ── Contabilidade de VRAM/memória ────────────────────────────────────
@@ -446,7 +545,7 @@ impl QwenModel {
             vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
         }
 
-        log::info!("✅ Qwen carregado — memória estimada: {:.2} GB", vram_bytes as f64 / 1e9);
+        log::info!("✅ Modelo [{}] carregado — memória estimada: {:.2} GB", arch.family, vram_bytes as f64 / 1e9);
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
 
@@ -454,8 +553,10 @@ impl QwenModel {
             embed,
             layers,
             norm_w,
+            norm_b,
             lm_head,
             cfg,
+            arch,
             vram_bytes,
             backend,
             scratch,
@@ -471,6 +572,7 @@ impl QwenModel {
     pub fn load_quantized(
         model_dir: &Path,
         cfg: ModelCfg,
+        arch: ModelArchitecture,
         backend: Arc<dyn ComputeBackend>,
         enable_cfc: bool,
     ) -> ModelResult<Self> {
@@ -478,8 +580,8 @@ impl QwenModel {
         use crate::lnn::gravity::{GravityConfig, GravitySystem};
 
         log::info!(
-            "⏳ Carregando Qwen com quantização Q4: {} camadas, hidden={}, vocab={}",
-            cfg.num_layers, cfg.hidden_size, cfg.vocab_size
+            "⏳ Carregando modelo [{}] com quantização Q4: {} camadas, hidden={}, vocab={}",
+            arch.family, cfg.num_layers, cfg.hidden_size, cfg.vocab_size
         );
 
         // ── Tentar carregar cache pré-quantizado ──────────────────────────────
@@ -625,9 +727,12 @@ impl QwenModel {
             backend.upload_f32(data, &[data.len()])
         };
 
+        // ── Nomes de tensores (via architecture descriptor) ─────────────────
+        let tmap = &arch.tensor_map;
+
         // ── Embedding (BF16) ─────────────────────────────────────────────────
         log::info!("  → embed_tokens (BF16)");
-        let embed = gpu_bf16("model.embed_tokens.weight")?;
+        let embed = gpu_bf16(&tmap.embed)?;
 
         // ── Camadas (Q4 quantizadas) ─────────────────────────────────────────
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
@@ -636,32 +741,50 @@ impl QwenModel {
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             if i % 8 == 0 { log::info!("  → layers {}/{} (Q4)", i, cfg.num_layers); }
-            let p = format!("model.layers.{}", i);
 
-            let (in_w, _) = load_f32(&format!("{}.input_layernorm.weight", p))?;
-            let (pa_w, _) = load_f32(&format!("{}.post_attention_layernorm.weight", p))?;
+            let (in_w, _) = load_f32(&tmap.layer_tensor(i, &tmap.input_norm))?;
+            let (pa_w, _) = load_f32(&tmap.layer_tensor(i, &tmap.post_attn_norm))?;
 
-            let qbn = format!("{}.self_attn.q_proj.bias", p);
-            let kbn = format!("{}.self_attn.k_proj.bias", p);
-            let vbn = format!("{}.self_attn.v_proj.bias", p);
+            let qbn = tmap.layer_tensor_opt(i, &tmap.attn_q_bias);
+            let kbn = tmap.layer_tensor_opt(i, &tmap.attn_k_bias);
+            let vbn = tmap.layer_tensor_opt(i, &tmap.attn_v_bias);
+            let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
+            let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
 
-            layers.push(QwenLayer {
-                wq:    quantize_weight(&format!("{}.self_attn.q_proj.weight", p))?,
-                wk:    quantize_weight(&format!("{}.self_attn.k_proj.weight", p))?,
-                wv:    quantize_weight(&format!("{}.self_attn.v_proj.weight", p))?,
-                wo:    quantize_weight(&format!("{}.self_attn.o_proj.weight", p))?,
-                wgate: quantize_weight(&format!("{}.mlp.gate_proj.weight", p))?,
-                wup:   quantize_weight(&format!("{}.mlp.up_proj.weight", p))?,
-                wdown: quantize_weight(&format!("{}.mlp.down_proj.weight", p))?,
-                q_bias: if tensor_exists(&qbn) {
-                    Some(gpu_f32(&load_f32(&qbn)?.0))
-                } else { None },
-                k_bias: if tensor_exists(&kbn) {
-                    Some(gpu_f32(&load_f32(&kbn)?.0))
-                } else { None },
-                v_bias: if tensor_exists(&vbn) {
-                    Some(gpu_f32(&load_f32(&vbn)?.0))
-                } else { None },
+            layers.push(TransformerLayer {
+                wq:    quantize_weight(&tmap.layer_tensor(i, &tmap.attn_q))?,
+                wk:    quantize_weight(&tmap.layer_tensor(i, &tmap.attn_k))?,
+                wv:    quantize_weight(&tmap.layer_tensor(i, &tmap.attn_v))?,
+                wo:    quantize_weight(&tmap.layer_tensor(i, &tmap.attn_o))?,
+                wgate: quantize_weight(&tmap.layer_tensor(i, &tmap.mlp_gate))?,
+                wup:   quantize_weight(&tmap.layer_tensor(i, &tmap.mlp_up))?,
+                wdown: quantize_weight(&tmap.layer_tensor(i, &tmap.mlp_down))?,
+                q_bias: match &qbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                k_bias: match &kbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                v_bias: match &vbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                q_norm_w: match &qnn {
+                    Some(name) if tensor_exists(name) => {
+                        log::debug!("  → q_norm layer {}", i);
+                        Some(gpu_f32(&load_f32(name)?.0))
+                    },
+                    _ => None,
+                },
+                k_norm_w: match &knn {
+                    Some(name) if tensor_exists(name) => {
+                        log::debug!("  → k_norm layer {}", i);
+                        Some(gpu_f32(&load_f32(name)?.0))
+                    },
+                    _ => None,
+                },
                 input_norm_w:     gpu_f32(&in_w),
                 post_attn_norm_w: gpu_f32(&pa_w),
                 kv_k: GpuKvCache::new(&backend, max_seq, kv_dim),
@@ -669,15 +792,26 @@ impl QwenModel {
             });
         }
 
-        let (nw, _) = load_f32("model.norm.weight")?;
+        // Log QK norm detection
+        if layers.first().map_or(false, |l| l.q_norm_w.is_some()) {
+            log::info!("  → QK Normalization detectada: q_norm + k_norm em todas as camadas");
+        }
+
+        let (nw, _) = load_f32(&tmap.final_norm)?;
         let norm_w = gpu_f32(&nw);
 
+        // Norm bias (para LayerNorm)
+        let norm_b = match &tmap.final_norm_bias {
+            Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+            _ => None,
+        };
+
         // lm_head em BF16 (não quantizar)
-        let lm_head = if tensor_exists("lm_head.weight") {
-            gpu_bf16("lm_head.weight")?
+        let lm_head = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+            gpu_bf16(&tmap.lm_head)?
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            gpu_bf16("model.embed_tokens.weight")?
+            gpu_bf16(&tmap.embed)?
         };
 
         // ── Contabilidade de VRAM (com quantização) ──────────────────────────
@@ -742,8 +876,8 @@ impl QwenModel {
         }
 
         log::info!(
-            "✅ Qwen carregado (Q4) — memória estimada: {:.2} GB (4x redução vs BF16)",
-            vram_bytes as f64 / 1e9
+            "✅ Modelo [{}] carregado (Q4) — memória estimada: {:.2} GB (4x redução vs BF16)",
+            arch.family, vram_bytes as f64 / 1e9
         );
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
@@ -752,8 +886,10 @@ impl QwenModel {
             embed,
             layers,
             norm_w,
+            norm_b,
             lm_head,
             cfg,
+            arch,
             vram_bytes,
             backend,
             scratch,
@@ -807,16 +943,16 @@ impl QwenModel {
         // Initialize telemetry vector
         let mut layer_traces: Vec<LayerTrace> = Vec::new();
 
+        let norm_type = self.arch.norm_type;
+        let activation = self.arch.activation;
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // ── Input RMSNorm ─────────────────────────────────────────────────
-            self.backend.rms_norm(&RmsNormParams {
-                input:  &self.scratch.x,
-                weight: &layer.input_norm_w,
-                output: &self.scratch.normed,
-                n_tokens: n,
-                hidden_size: h,
-                eps,
-            })?;
+            // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
+            Self::apply_norm(
+                &self.backend, norm_type,
+                &self.scratch.x, &layer.input_norm_w, None,
+                &self.scratch.normed, n, h, eps,
+            )?;
 
             // ── Q, K, V projections (BF16/Q4 pesos × F32 ativações → F32) ──────
             log::trace!("layer {layer_idx}: wq n={n} qd={qd} h={h}");
@@ -852,6 +988,34 @@ impl QwenModel {
                     bias,
                     n_tokens: n,
                     dim: kd,
+                })?;
+            }
+
+            // ── QK Normalization (Qwen3) ─────────────────────────────────────
+            // Aplica RMSNorm per-head em Q e K antes do RoPE.
+            // Q: [n, qd] → tratado como [n * nh, hd] → RMSNorm com peso [hd]
+            // K: [n, kd] → tratado como [n * nk, hd] → RMSNorm com peso [hd]
+            //
+            // In-place: o kernel HIP faz read→reduce→write com __syncthreads,
+            // cada thread block processa um "token" (= uma cabeça), logo é safe.
+            if let Some(ref qnw) = layer.q_norm_w {
+                self.backend.rms_norm(&RmsNormParams {
+                    input:  &self.scratch.q,
+                    weight: qnw,
+                    output: &self.scratch.q, // in-place
+                    n_tokens: n * nh,        // cada "token" = 1 head
+                    hidden_size: hd,
+                    eps,
+                })?;
+            }
+            if let Some(ref knw) = layer.k_norm_w {
+                self.backend.rms_norm(&RmsNormParams {
+                    input:  &self.scratch.k,
+                    weight: knw,
+                    output: &self.scratch.k, // in-place
+                    n_tokens: n * nk,        // cada "token" = 1 kv head
+                    hidden_size: hd,
+                    eps,
                 })?;
             }
 
@@ -973,15 +1137,12 @@ impl QwenModel {
             Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0)?;
             self.backend.sync()?;
 
-            // ── Post-attention RMSNorm ────────────────────────────────────────
-            self.backend.rms_norm(&RmsNormParams {
-                input:  &self.scratch.x,
-                weight: &layer.post_attn_norm_w,
-                output: &self.scratch.normed,
-                n_tokens: n,
-                hidden_size: h,
-                eps,
-            })?;
+            // ── Post-attention Normalization ───────────────────────────────────
+            Self::apply_norm(
+                &self.backend, norm_type,
+                &self.scratch.x, &layer.post_attn_norm_w, None,
+                &self.scratch.normed, n, h, eps,
+            )?;
 
             // ── MLP: gate_proj, up_proj ───────────────────────────────────────
             log::trace!("layer {layer_idx}: wgate n={n} it={it} h={h}");
@@ -991,13 +1152,11 @@ impl QwenModel {
             Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
             self.backend.sync()?;
 
-            // SwiGLU: gate = silu(gate) * up (in-place em gate)
-            self.backend.silu_mul_inplace(&SiluMulParams {
-                gate: &self.scratch.gate,
-                up:   &self.scratch.up,
-                n_tokens: n,
-                intermediate_size: it,
-            })?;
+            // Activation: gate = activation(gate) * up (SiLU/SwiGLU ou GELU conforme arquitetura)
+            Self::apply_activation(
+                &self.backend, activation,
+                &self.scratch.gate, &self.scratch.up, n, it,
+            )?;
 
             // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
             log::trace!("layer {layer_idx}: wdown n={n} h={h} it={it}");
@@ -1109,15 +1268,12 @@ impl QwenModel {
             }
         }
 
-        // ── Final RMSNorm ─────────────────────────────────────────────────────
-        self.backend.rms_norm(&RmsNormParams {
-            input:  &self.scratch.x,
-            weight: &self.norm_w,
-            output: &self.scratch.normed,
-            n_tokens: n,
-            hidden_size: h,
-            eps,
-        })?;
+        // ── Final Normalization ──────────────────────────────────────────────
+        Self::apply_norm(
+            &self.backend, norm_type,
+            &self.scratch.x, &self.norm_w, self.norm_b.as_ref(),
+            &self.scratch.normed, n, h, eps,
+        )?;
 
         // ── lm_head (apenas o último token) ──────────────────────────────────
         // lm_head SEMPRE em BF16 (não quantizável — muito sensível)

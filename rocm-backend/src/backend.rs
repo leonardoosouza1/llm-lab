@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use compute_core::{
     params::{
-        AddBiasParams, CfcForwardParams, EmbedParams, GemmBf16Params, GemvQ4Params,
-        GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, RmsNormParams, RopeParams,
-        SgemmParams, SiluMulParams, SoftmaxParams,
+        AddBiasParams, CfcForwardParams, EmbedParams, GeluMulParams, GemmBf16Params, GemvQ4Params,
+        GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
+        RopeParams, SgemmParams, SiluMulParams, SoftmaxParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -274,6 +274,12 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn layer_norm(&self, _p: &LayerNormParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "LayerNorm not yet implemented — use RMSNorm models (Qwen, Llama, Mistral)".into(),
+        ))
+    }
+
     fn rope_inplace(&self, p: &RopeParams) -> Result<(), BackendError> {
         unsafe {
             self.kernels.rope_inplace(
@@ -307,6 +313,12 @@ impl ComputeBackend for RocmBackend {
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gelu_mul_inplace(&self, _p: &GeluMulParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel(
+            "GELU activation not yet implemented — use SiLU models (Qwen, Llama, Mistral)".into(),
+        ))
     }
 
     fn copy_to_kv_cache(&self, p: &KvCacheParams) -> Result<(), BackendError> {

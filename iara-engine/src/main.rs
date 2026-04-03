@@ -23,10 +23,12 @@ mod telemetry; // Adiciona o módulo de telemetria
 mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, debug_trace_handler,
-                            models_handler, load_model_handler};
+                            models_handler, load_model_handler,
+                            train_lnn_handler, lnn_status_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
-use crate::model::QwenModel;
+use crate::lnn::train::LnnTrainer;
+use crate::model::CausalLM;
 use crate::inference::{forward_traced, SamplingParams};
 use crate::transport::{start_ws_server, EngineCommand};
 use std::path::PathBuf;
@@ -73,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Shared state — no model loaded at startup
-    let qwen_model:    Arc<Mutex<Option<QwenModel>>> = Arc::new(Mutex::new(None));
+    let qwen_model:    Arc<Mutex<Option<CausalLM>>> = Arc::new(Mutex::new(None));
     let model_ready    = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let model_loading  = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let last_trace     = Arc::new(Mutex::new(None));
@@ -135,6 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
         .route("/api/generate",           post(generate_handler))
+        .route("/api/train-lnn",          post(train_lnn_handler))
+        .route("/api/lnn/status",         get(lnn_status_handler))
         .route("/api/debug/last-trace",   get(debug_trace_handler))
         .nest("/acp/v1", acp::acp_router())
         .fallback_service(ServeDir::new(&frontend_dir))
@@ -153,13 +157,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Engine loop: receives EngineCommand from WS, calls forward_traced, broadcasts results.
 async fn run_engine_loop(
-    model: Arc<Mutex<Option<QwenModel>>>,
+    model: Arc<Mutex<Option<CausalLM>>>,
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
     frame_tx: broadcast::Sender<String>,
 ) {
-    const EOS: u32 = 151645;
     const MAX_STEPS: usize = 256;
     const ESN_SEED: u64 = 0xDEAD_BEEF_1337_4242;
+
+    // ── LNN Trainer: persiste entre gerações ─────────────────────────
+    // Inicializado lazy na primeira geração com CfC habilitado.
+    let mut lnn_trainer: Option<LnnTrainer> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -194,7 +201,17 @@ async fn run_engine_loop(
                 }
 
                 let mut generated_text = String::new();
+                let mut generated_token_ids: Vec<u32> = Vec::new();
                 let mut sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
+
+                // Extract EOS token IDs from model architecture
+                let eos_ids = {
+                    let guard = model.lock().await;
+                    match guard.as_ref() {
+                        Some(m) => m.arch.eos_token_ids.clone(),
+                        None => continue,
+                    }
+                };
 
                 // ── ESN Fase 1: observador do stream de tokens ────────────
                 let mut esn = EsnObserver::new(ESN_SEED);
@@ -249,6 +266,17 @@ async fn run_engine_loop(
                     };
                     decode_token = gen_step.token_id;
 
+                    // Não acumula tokens especiais/EOS no texto visível
+                    if eos_ids.contains(&decode_token) {
+                        let _ = frame_tx.send(serde_json::json!({
+                            "type": "status",
+                            "message": format!("Geração completa: {} tokens", generated_text.split_whitespace().count())
+                        }).to_string());
+                        break;
+                    }
+
+                    generated_token_ids.push(decode_token);
+
                     // ── ESN: observa logits e modula sampling ─────────────
                     // top_logits são os 40 maiores scores (pre-softmax)
                     // A ESN computa entropia e top1_prob a partir deles (aproximação)
@@ -301,6 +329,29 @@ async fn run_engine_loop(
                                 let corr_data = m.backend.download_f32(&cfc.correction_buf);
                                 let correction_norm = corr_data.iter()
                                     .map(|x| x * x).sum::<f32>().sqrt();
+
+                                // Record CfC activations para treinamento
+                                // (f_gate e g_candidate extraídos dos buffers internos)
+                                if let Some(ref mut trainer) = lnn_trainer {
+                                    let f_data = m.backend.download_f32(&cfc.f_proj_buf);
+                                    let g_data = m.backend.download_f32(&cfc.g_proj_buf);
+                                    // f_proj → sigmoid = f_gate
+                                    let f_gate: Vec<f32> = f_data.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+                                    // g_proj → tanh = g_candidate
+                                    let g_cand: Vec<f32> = g_data.iter().map(|x| x.tanh()).collect();
+                                    // x (hidden state que entrou no CfC) — usar h_prev como proxy
+                                    // h_prev foi o estado antes do forward
+                                    let reward_est = esn_tel.top1_prob; // reward instantâneo
+                                    trainer.record_cfc_activation(
+                                        corr_data.clone(),  // x placeholder (will be normed hidden)
+                                        h_data.clone(),     // h_new (post-update)
+                                        h_data.clone(),     // h_new
+                                        corr_data.clone(),  // correction
+                                        f_gate,
+                                        g_cand,
+                                        reward_est,
+                                    );
+                                }
 
                                 let _ = frame_tx.send(serde_json::json!({
                                     "type": "cfc_state",
@@ -367,13 +418,78 @@ async fn run_engine_loop(
                     });
                     let _ = frame_tx.send(result.to_string());
 
-                    if decode_token == EOS || decode_token == 151643 { break; }
+                    if eos_ids.contains(&decode_token) { break; }
                 }
 
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
                     "message": format!("Geração completa: {} tokens", generated_text.split_whitespace().count())
                 }).to_string());
+
+                // ── LNN Training: treina após cada geração ───────────────
+                // Inicializa trainer lazy se necessário
+                {
+                    let mut guard = model.lock().await;
+                    if let Some(m) = guard.as_mut() {
+                        // Inicializa trainer na primeira geração
+                        if lnn_trainer.is_none() {
+                            let cfc_cfg = m.cfc.as_ref().map(|c| &c.config);
+                            lnn_trainer = Some(LnnTrainer::new(cfc_cfg));
+                            log::info!("LNN Trainer inicializado (CfC: {})", cfc_cfg.is_some());
+                        }
+
+                        if let Some(ref mut trainer) = lnn_trainer {
+                            let train_result = trainer.train_after_generation(
+                                &mut esn,
+                                m.cfc.as_mut(),
+                                &m.backend,
+                                &generated_token_ids,
+                            );
+
+                            // Broadcast training telemetry
+                            let _ = frame_tx.send(serde_json::json!({
+                                "type": "lnn_train",
+                                "generation": train_result.generation,
+                                "reward": {
+                                    "mean": train_result.reward.mean_reward,
+                                    "entropy": train_result.reward.mean_entropy,
+                                    "diversity": train_result.reward.lexical_diversity,
+                                    "repetition": train_result.reward.repetition_score,
+                                },
+                                "esn_trained": train_result.esn_trained,
+                                "esn_readout_active": esn.telemetry().readout_trained,
+                                "cfc_trained": train_result.cfc_trained.as_ref().map(|r| serde_json::json!({
+                                    "epoch": r.epoch,
+                                    "loss": r.loss,
+                                    "grad_norm": r.grad_norm_post_clip,
+                                    "lr": r.lr,
+                                })),
+                            }).to_string());
+
+                            // Broadcast training telemetry geral
+                            let tel = trainer.telemetry();
+                            let _ = frame_tx.send(serde_json::json!({
+                                "type": "lnn_train_status",
+                                "enabled": tel.enabled,
+                                "generations": tel.generation_count,
+                                "mean_reward": tel.mean_reward,
+                                "recent_reward": tel.recent_reward,
+                                "reward_trend": tel.reward_trend,
+                                "esn_auto": tel.esn_auto,
+                                "cfc_auto": tel.cfc_auto,
+                                "cfc": tel.cfc_telemetry,
+                            }).to_string());
+
+                            log::info!(
+                                "LNN Training completo: gen #{}, reward={:.4}, ESN trained={}, CfC trained={}",
+                                train_result.generation,
+                                train_result.reward.mean_reward,
+                                train_result.esn_trained,
+                                train_result.cfc_trained.is_some()
+                            );
+                        }
+                    }
+                }
             }
 
             EngineCommand::ListLayers => {

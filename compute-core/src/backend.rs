@@ -39,9 +39,11 @@ pub trait ComputeBackend: Send + Sync + 'static {
 
     fn embed_lookup         (&self, p: &EmbedParams)              -> Result<(), BackendError>;
     fn rms_norm             (&self, p: &RmsNormParams)            -> Result<(), BackendError>;
+    fn layer_norm           (&self, p: &LayerNormParams)          -> Result<(), BackendError>;
     fn rope_inplace         (&self, p: &RopeParams)               -> Result<(), BackendError>;
     fn softmax_rows         (&self, p: &SoftmaxParams)            -> Result<(), BackendError>;
     fn silu_mul_inplace     (&self, p: &SiluMulParams)            -> Result<(), BackendError>;
+    fn gelu_mul_inplace     (&self, p: &GeluMulParams)            -> Result<(), BackendError>;
     fn copy_to_kv_cache     (&self, p: &KvCacheParams)            -> Result<(), BackendError>;
     fn add_bias_inplace     (&self, p: &AddBiasParams)            -> Result<(), BackendError>;
     fn gemv_q4              (&self, p: &GemvQ4Params)             -> Result<(), BackendError>;

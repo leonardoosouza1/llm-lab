@@ -16,7 +16,7 @@
 
 use crate::lnn::EsnObserver;
 use crate::tokenizer;
-use crate::model::QwenModel;
+use crate::model::CausalLM;
 use crate::inference::{SamplingParams, sample_token};
 use tokio::sync::broadcast;
 use serde::Serialize;
@@ -36,7 +36,7 @@ pub struct GenerationUpdate {
 /// Gera resposta com streaming, telemetria de logits e ESN fase 1.
 pub async fn generate_response(
     prompt: &str,
-    model: &mut QwenModel,
+    model: &mut CausalLM,
     frame_tx: &broadcast::Sender<String>,
     max_new_tokens: usize,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
