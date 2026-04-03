@@ -134,6 +134,61 @@ pub fn sgemm_strided(
     }
 }
 
+/// Strided batched F32 GEMM: perform m×n×k GEMMs with fixed strides.
+///
+/// Computes (row-major): C[b, m, n] = alpha × op(A[b, m, k]) × op(B[b, k, n]) + beta × C[b, m, n]
+/// where b is the batch index (0 to batch_count-1).
+///
+/// - stride_a: offset (in elements) between A[b] and A[b+1]
+/// - stride_b: offset (in elements) between B[b] and B[b+1]
+/// - stride_c: offset (in elements) between C[b] and C[b+1]
+/// - trans_a=false: A is [m, k], lda ≥ k
+/// - trans_a=true:  A is [k, m], lda ≥ m  (A gets transposed)
+/// - trans_b=false: B is [k, n], ldb ≥ n
+/// - trans_b=true:  B is [n, k], ldb ≥ k  (B gets transposed)
+///
+/// Used for multi-head attention: all 32 attention heads in a single BLAS call.
+pub fn sgemm_strided_batched(
+    handle: &BlasHandle,
+    trans_a: bool,
+    trans_b: bool,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    beta: f32,
+    a: *const f32,
+    lda: i32,
+    stride_a: i64,
+    b: *const f32,
+    ldb: i32,
+    stride_b: i64,
+    c: *mut f32,
+    ldc: i32,
+    stride_c: i64,
+    batch_count: i32,
+) -> Result<(), HipError> {
+    // Row-major C[b, m, n] = op(A[b]) × op(B[b])  →  col-major: C^T = op(B)^T × op(A)^T
+    // We swap A↔B in the BLAS call. The transpose flags map DIRECTLY:
+    //   row-major trans_b=true  →  BLAS ta = OP_T  (transpose the B data)
+    //   row-major trans_a=true  →  BLAS tb = OP_T  (transpose the A data)
+    let ta = if trans_b { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
+    let tb = if trans_a { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
+    unsafe {
+        blas_check(hipblasSgemmStridedBatched(
+            handle.handle,
+            ta, tb,
+            n, m, k,
+            &alpha as *const f32,
+            b, ldb, stride_b,
+            a, lda, stride_a,
+            &beta as *const f32,
+            c, ldc, stride_c,
+            batch_count,
+        ))
+    }
+}
+
 /// Pure F32 GEMM for small ops (biases, scratchpad).
 /// C[m, n] = alpha × A[m, k] × B^T[n, k] + beta × C[m, n]
 pub fn sgemm(

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use compute_core::ComputeBackend;
 
 pub struct HardwareManager {
+    #[allow(dead_code)]
     pub device_id: i32,
     pub gpu_name: String,
     pub backend: Arc<dyn ComputeBackend>,

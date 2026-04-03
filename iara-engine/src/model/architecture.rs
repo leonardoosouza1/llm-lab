@@ -164,10 +164,13 @@ pub struct ModelArchitecture {
     /// Função de ativação do MLP (SiLU ou GELU)
     pub activation: Activation,
     /// Estrutura do MLP
+    #[allow(dead_code)]
     pub mlp_type: MlpType,
     /// Se o modelo aplica RMSNorm per-head em Q e K antes do RoPE (Qwen3)
+    #[allow(dead_code)]
     pub has_qk_norm: bool,
     /// Se as projeções Q/K/V têm bias (Qwen2/2.5)
+    #[allow(dead_code)]
     pub has_qkv_bias: bool,
     /// Se lm_head compartilha pesos com embed_tokens
     pub tie_word_embeddings: bool,
@@ -420,8 +423,4 @@ impl ModelArchitecture {
         }
     }
 
-    /// Verifica se um token é EOS para este modelo.
-    pub fn is_eos(&self, token_id: u32) -> bool {
-        self.eos_token_ids.contains(&token_id)
-    }
 }

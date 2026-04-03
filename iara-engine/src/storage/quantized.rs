@@ -32,12 +32,6 @@ pub enum QuantizationError {
 
     #[error("Invalid IARA format: {0}")]
     InvalidFormat(String),
-
-    #[error("Backend error: {0}")]
-    Backend(String),
-
-    #[error("Shape mismatch: expected {expected}, got {actual}")]
-    ShapeMismatch { expected: String, actual: String },
 }
 
 pub type QuantizationResult<T> = std::result::Result<T, QuantizationError>;
@@ -285,115 +279,9 @@ pub struct IaraTensorMeta {
     pub zeros_len: usize,
 }
 
-/// Header de um arquivo .iara
-#[derive(Clone, Serialize, Deserialize)]
-pub struct IaraHeader {
-    pub model_type: String,
-    pub quantization: String,
-    pub group_size: usize,
-    pub tensors: HashMap<String, IaraTensorMeta>,
-}
-
 /// Magic bytes do formato .iara
 const IARA_MAGIC: &[u8; 4] = b"IARA";
 const IARA_VERSION: u32 = 1;
-
-/// Escreve arquivo .iara com pesos pré-quantizados.
-///
-/// Layout:
-/// ```
-/// [4 bytes]   magic "IARA"
-/// [4 bytes]   version (u32 LE)
-/// [4 bytes]   header_len (u32 LE)
-/// [header_len] JSON header com metadados por tensor
-/// [...]        tensor data (packed Q4 + scales + zeros, concatenados)
-/// ```
-pub fn write_iara_file(
-    path: &Path,
-    header: &IaraHeader,
-    data: &[u8],
-) -> QuantizationResult<()> {
-    let mut file = File::create(path)?;
-
-    // Magic + version
-    file.write_all(IARA_MAGIC)?;
-    file.write_all(&IARA_VERSION.to_le_bytes())?;
-
-    // Header JSON
-    let header_json = serde_json::to_string(header)?;
-    let header_bytes = header_json.as_bytes();
-    file.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
-    file.write_all(header_bytes)?;
-
-    // Data
-    file.write_all(data)?;
-
-    log::info!(
-        "💾 .iara escrito: {} | {} tensores | {:.2} GB",
-        path.display(),
-        header.tensors.len(),
-        data.len() as f64 / 1e9
-    );
-
-    Ok(())
-}
-
-/// Lê header de um arquivo .iara (já mapeado em memória).
-pub fn read_iara_header(mmap: &[u8]) -> QuantizationResult<(IaraHeader, usize)> {
-    if mmap.len() < 12 {
-        return Err(QuantizationError::InvalidFormat(
-            "Arquivo muito pequeno: < 12 bytes".into(),
-        ));
-    }
-
-    // Magic
-    if &mmap[0..4] != IARA_MAGIC {
-        return Err(QuantizationError::InvalidFormat(
-            format!(
-                "Magic inválido: {:?} (esperado IARA)",
-                &mmap[0..4]
-            ),
-        ));
-    }
-
-    // Version
-    let version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
-    if version != IARA_VERSION {
-        return Err(QuantizationError::InvalidFormat(
-            format!(
-                "Version incompatível: {} (esperado {})",
-                version, IARA_VERSION
-            ),
-        ));
-    }
-
-    // Header length
-    let header_len = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
-    let header_end = 12 + header_len;
-
-    if mmap.len() < header_end {
-        return Err(QuantizationError::InvalidFormat(
-            format!(
-                "Arquivo truncado: esperava {} bytes, tem {} bytes",
-                header_end,
-                mmap.len()
-            ),
-        ));
-    }
-
-    let header_json = std::str::from_utf8(&mmap[12..header_end])
-        .map_err(|e| QuantizationError::InvalidFormat(format!("UTF-8 inválido: {}", e)))?;
-
-    let header: IaraHeader = serde_json::from_str(header_json)?;
-
-    log::info!(
-        "📖 .iara header lido: {} tensores, group_size={}",
-        header.tensors.len(),
-        header.group_size
-    );
-
-    Ok((header, header_end))
-}
 
 /// Carrega tensor quantizado de memmap .iara.
 #[allow(dead_code)]
@@ -471,51 +359,6 @@ pub fn load_quantized_tensor_from_iara(
         shape: [rows, cols],
         group_size,
     })
-}
-
-// ── Helper: converter QuantizationCpuResult para bytes para arquivo .iara ─────
-
-/// Converte resultado de quantização em bytes para escrita em .iara.
-/// Retorna (bytes concatenados, metadados com offsets).
-pub fn cpu_result_to_bytes(
-    result: &QuantizationCpuResult,
-    shape: &[usize],
-) -> (Vec<u8>, IaraTensorMeta) {
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let mut data = Vec::new();
-
-    // Packed INT4
-    let packed_offset = 0;
-    let packed_len = result.packed.len();
-    data.extend_from_slice(&result.packed);
-
-    // Scales F32
-    let scales_offset = data.len();
-    let scales_len = result.scales.len() * 4;
-    for &s in &result.scales {
-        data.extend_from_slice(&s.to_le_bytes());
-    }
-
-    // Zeros F32
-    let zeros_offset = data.len();
-    let zeros_len = result.zeros.len() * 4;
-    for &z in &result.zeros {
-        data.extend_from_slice(&z.to_le_bytes());
-    }
-
-    let meta = IaraTensorMeta {
-        shape: [rows, cols],
-        packed_offset,
-        packed_len,
-        scales_offset,
-        scales_len,
-        zeros_offset,
-        zeros_len,
-    };
-
-    (data, meta)
 }
 
 // ── Sistema de cache pré-quantizado ──────────────────────────────────────────

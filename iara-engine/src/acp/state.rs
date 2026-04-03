@@ -73,25 +73,12 @@ impl AcpRunStore {
         }
     }
 
-    /// Adiciona um evento a uma run
-    pub async fn add_event(&self, run_id: &str, event: RunEvent) {
-        let mut runs = self.runs.lock().await;
-        if let Some(store) = runs.get_mut(run_id) {
-            store.events.push(event);
-        }
-    }
-
     /// Lista todos os eventos de uma run
     pub async fn get_events(&self, run_id: &str) -> Vec<RunEvent> {
         let runs = self.runs.lock().await;
         runs.get(run_id).map(|s| s.events.clone()).unwrap_or_default()
     }
 
-    /// Remove uma run (útil para cleanup)
-    pub async fn remove_run(&self, run_id: &str) {
-        let mut runs = self.runs.lock().await;
-        runs.remove(run_id);
-    }
 }
 
 impl Default for AcpRunStore {

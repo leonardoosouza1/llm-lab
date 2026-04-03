@@ -28,7 +28,6 @@
 
 use std::sync::Arc;
 use compute_core::{ComputeBackend, AnyTensor};
-use serde::Serialize;
 
 /// Configuração da CfC layer.
 #[derive(Debug, Clone)]
@@ -368,56 +367,5 @@ impl CfcLayer {
         self.param_count() * 4 // F32 = 4 bytes
     }
 
-    /// Retorna o estado interno (para inspecção ou debug).
-    pub fn state_ref(&self) -> &AnyTensor {
-        &self.state.h
-    }
-
-    /// Retorna referência mutável ao estado (para injeção de estado de fora).
-    pub fn state_mut(&mut self) -> &mut AnyTensor {
-        &mut self.state.h
-    }
 }
 
-/// Telemetria da CfC para broadcast WebSocket.
-///
-/// Contém estatísticas instantâneas sobre a CfC layer:
-/// ativação, tamanho da correção, uso de VRAM, etc.
-#[derive(Debug, Clone, Serialize)]
-pub struct CfcTelemetry {
-    /// Norma L2 do estado interno h [cfc_dim].
-    /// Indica a intensidade de ativação da memória líquida.
-    pub state_norm: f32,
-    /// Norma L2 da correção [hidden_dim].
-    /// Indica o quanto a CfC está ajustando os hidden states.
-    pub correction_norm: f32,
-    /// Número total de parâmetros (para informação).
-    pub param_count: usize,
-    /// VRAM em megabytes (estimada).
-    pub vram_mb: f32,
-}
-
-impl CfcTelemetry {
-    /// Cria telemetria a partir de uma CfC layer.
-    ///
-    /// Requer backend para fazer downloads dos buffers.
-    pub fn from_layer(
-        layer: &CfcLayer,
-        _backend: &Arc<dyn ComputeBackend>,
-    ) -> Self {
-        let param_count = layer.param_count();
-        let vram_bytes = layer.vram_bytes();
-
-        // Normas (para a versão actual, usar 0 como placeholder se sem acesso a download)
-        // Versão futura: fazer download dos buffers e calcular normas reais
-        let state_norm = 0.0f32; // TODO: download state e calcular
-        let correction_norm = 0.0f32; // TODO: download correction_buf e calcular
-
-        Self {
-            state_norm,
-            correction_norm,
-            param_count,
-            vram_mb: vram_bytes as f32 / (1024.0 * 1024.0),
-        }
-    }
-}

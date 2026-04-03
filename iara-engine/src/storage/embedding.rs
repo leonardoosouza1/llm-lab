@@ -15,12 +15,14 @@ use std::fs::File;
 use std::path::Path;
 
 /// Resultado da leitura de embeddings: vetor de linhas [hidden_dim]
+#[allow(dead_code)]
 pub struct EmbeddingResult {
     pub hidden_dim: usize,
     pub vectors: Vec<Vec<f32>>, // Uma linha por token
 }
 
 /// Parseia header de um shard e retorna metadados dos tensores + offset dos dados
+#[allow(dead_code)]
 fn parse_shard_header(
     mmap: &Mmap,
 ) -> Result<(HashMap<String, TensorMeta>, usize), Box<dyn std::error::Error>> {
@@ -44,6 +46,7 @@ fn parse_shard_header(
 ///
 /// Retorna apenas as linhas solicitadas, sem carregar a matriz completa.
 /// Ideal para lookup de embeddings por token ID.
+#[allow(dead_code)]
 pub fn read_embedding_rows(
     model_dir: &Path,
     index: &SafetensorsIndex,
@@ -131,32 +134,4 @@ pub fn read_embedding_rows(
         hidden_dim,
         vectors,
     })
-}
-
-/// Retorna o embedding do **último token** do prompt.
-///
-/// Para predição de próximo token em modelos autoregressivos (Qwen/Llama),
-/// o estado oculto relevante é o do último token — é a partir dele que o
-/// modelo prediz o que vem a seguir. Usar a média de todos os tokens destrói
-/// a estrutura posicional e produz um vetor sem significado direcional no
-/// espaço do lm_head.
-///
-/// O motor de ressonância ainda recebe TODOS os embeddings como pulso físico
-/// (via `pipeline.rs → think_tx`), garantindo que todos os tokens influenciem
-/// a LiquidNetwork neuromórfica.
-pub fn combine_embeddings(embeddings: &EmbeddingResult) -> Vec<f32> {
-    if embeddings.vectors.is_empty() {
-        return vec![];
-    }
-
-    // Último token: ponto de partida para predição autoregressiva
-    let last = embeddings.vectors.last().unwrap().clone();
-
-    let norm: f32 = last.iter().map(|v| v * v).sum::<f32>().sqrt();
-    log::info!(
-        "🧮 Embedding do último token: dim={}, norm={:.4}, total_tokens={}",
-        embeddings.hidden_dim, norm, embeddings.vectors.len()
-    );
-
-    last
 }

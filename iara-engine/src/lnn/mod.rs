@@ -29,8 +29,8 @@ pub mod train;
 #[allow(unused_imports)]
 pub use esn::EsnObserver;
 #[allow(unused_imports)]
-pub use gravity::{GravitySystem, GravityConfig, GravityResult, GravityTelemetry};
+pub use gravity::{GravitySystem, GravityConfig, GravityResult};
 #[allow(unused_imports)]
-pub use cfc::{CfcLayer, CfcConfig, CfcTelemetry};
+pub use cfc::{CfcLayer, CfcConfig};
 #[allow(unused_imports)]
 pub use train::{LnnTrainer, LnnTrainResult, LnnTrainTelemetry, RewardSignal};

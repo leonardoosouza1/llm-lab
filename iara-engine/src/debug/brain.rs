@@ -88,11 +88,6 @@ impl BrainTrace {
         self.steps.push(step);
     }
 
-    /// Add IARA simulation snapshot
-    pub fn add_snapshot(&mut self, snapshot: SimulationSnapshot) {
-        self.iara_snapshots.push(snapshot);
-    }
-
     /// Finalize trace (mark as complete, compute analysis)
     pub fn finalize(&mut self) {
         self.finalized_at = Some(chrono::Utc::now().to_rfc3339());
@@ -336,33 +331,3 @@ pub struct Anomaly {
 // Export Formats
 // ─────────────────────────────────────────────────────────────────────────────
 
-impl BrainTrace {
-    /// Export to JSON for external analysis
-    pub fn to_json(&self) -> Result<String, serde_json::error::Error> {
-        serde_json::to_string_pretty(self)
-    }
-
-    /// Export analysis to JSON
-    pub fn analysis_to_json(&self) -> Result<String, serde_json::error::Error> {
-        let analysis = self.analyze();
-        serde_json::to_string_pretty(&analysis)
-    }
-
-    /// Export as CSV for spreadsheet analysis
-    pub fn to_csv(&self) -> String {
-        let mut csv = String::from("step,token,energy,active_layers_count\n");
-
-        for (idx, step) in self.steps.iter().enumerate() {
-            let energy: f32 = step.layer_traces.iter().map(|t| t.max_activation).sum();
-            csv.push_str(&format!(
-                "{},{},{:.2},{}\n",
-                idx,
-                step.token_str,
-                energy,
-                step.active_layers.len()
-            ));
-        }
-
-        csv
-    }
-}

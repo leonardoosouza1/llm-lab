@@ -39,6 +39,28 @@ pub struct SgemmParams<'a> {
     pub c_offset: usize,
 }
 
+/// Params para SGEMM batched (todas as cabeças de atenção em 1 chamada)
+/// Usa hipblasSgemmStridedBatched para substituir 32 chamadas sequenciais por 1.
+pub struct SgemmStridedBatchedParams<'a> {
+    pub trans_a: bool,
+    pub trans_b: bool,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub alpha: f32,
+    pub beta: f32,
+    pub a: &'a AnyTensor,
+    pub lda: usize,
+    pub stride_a: usize,  // stride entre batches em A
+    pub b: &'a AnyTensor,
+    pub ldb: usize,
+    pub stride_b: usize,  // stride entre batches em B
+    pub c: &'a AnyTensor,
+    pub ldc: usize,
+    pub stride_c: usize,  // stride entre batches em C
+    pub batch_count: usize,
+}
+
 /// Embedding lookup: token_ids → embeddings BF16 → F32
 pub struct EmbedParams<'a> {
     pub token_ids: &'a [u32],           // na CPU
@@ -186,4 +208,46 @@ pub struct KvCacheQuantizedParams<'a> {
     pub kv_dim: usize,
     pub max_seq: usize,
     pub group_size: usize,
+}
+
+/// Params para kernel fused: RMSNorm + bias opcional + RoPE
+/// Equivale a: rms_norm(input, weight) → add_bias(output, bias) → rope(output, pos)
+/// Mas em um único kernel dispatch, evitando 2 round-trips de VRAM.
+pub struct FusedNormBiasRopeParams<'a> {
+    pub input: &'a AnyTensor,      // [n_tokens, hidden_size] F32
+    pub norm_weight: &'a AnyTensor, // [hidden_size] F32
+    pub bias: Option<&'a AnyTensor>, // [hidden_size] F32 — None se modelo sem bias (ex: Llama)
+    pub output: &'a AnyTensor,     // [n_tokens, hidden_size] F32 (escrita no device)
+    pub n_tokens: usize,
+    pub hidden_size: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub pos_offset: usize,         // posição no KV-cache para RoPE
+    pub theta: f32,                // RoPE theta (10000.0 ou 1000000.0)
+    pub eps: f32,                  // epsilon para RMSNorm (1e-5 ou 1e-6)
+}
+
+/// Params para quantizar F32→INT8 e inserir no KV-cache
+/// Quantização por-cabeça: cada cabeça tem seu próprio scale factor.
+pub struct KvCacheInt8AppendParams<'a> {
+    pub cache_q: &'a AnyTensor,       // INT8 cache [max_seq, kv_dim]
+    pub cache_scales: &'a AnyTensor,   // F32 scales [max_seq, n_kv_heads] — 1 scale per head per token
+    pub new_kv: &'a AnyTensor,         // F32 input [n_new_tokens, kv_dim]
+    pub insert_pos: usize,
+    pub n_new_tokens: usize,
+    pub kv_dim: usize,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+    pub max_seq: usize,
+}
+
+/// Params para dequantizar INT8→F32 do KV-cache para atenção
+pub struct KvCacheInt8ReadParams<'a> {
+    pub cache_q: &'a AnyTensor,        // INT8 cache
+    pub cache_scales: &'a AnyTensor,    // F32 scales
+    pub output: &'a AnyTensor,          // F32 output [seq_len, kv_dim]
+    pub seq_len: usize,
+    pub kv_dim: usize,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
 }

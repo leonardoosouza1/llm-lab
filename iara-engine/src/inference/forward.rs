@@ -15,9 +15,6 @@ use std::time::Instant;
 
 // ── Telemetria por camada ─────────────────────────────────────────────────────
 
-/// Alias para compatibilidade com debug/brain.rs e api/handlers.rs
-pub type LayerActivationTrace = LayerTrace;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerTrace {
     pub layer_idx: usize,
@@ -48,16 +45,6 @@ pub struct GenerationStep {
     pub active_layers: Vec<usize>,
     /// ms total do forward pass
     pub time_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ActivationPattern {
-    pub peak_energy: f32,
-    pub mean_energy: f32,
-    pub early_focus: bool,
-    pub mid_focus: bool,
-    pub late_focus: bool,
-    pub total_us: u128,
 }
 
 // ── Forward com tracing ───────────────────────────────────────────────────────
@@ -113,31 +100,3 @@ pub fn forward_traced(
     })
 }
 
-// ── Análise de padrões ────────────────────────────────────────────────────────
-
-pub fn analyze_pattern(traces: &[LayerTrace]) -> ActivationPattern {
-    if traces.is_empty() { return ActivationPattern::default(); }
-    let energies: Vec<f32> = traces.iter().map(|t| t.max_activation).collect();
-    let mean = energies.iter().sum::<f32>() / energies.len() as f32;
-    let peak = energies.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let n = traces.len();
-    let third = n / 3;
-    let e = if third > 0 { energies[..third].iter().sum::<f32>() / third as f32 } else { 0.0 };
-    let m = if third > 0 { energies[third..2*third].iter().sum::<f32>() / third as f32 } else { 0.0 };
-    let l = if n > 2*third { energies[2*third..].iter().sum::<f32>() / (n - 2*third) as f32 } else { 0.0 };
-    ActivationPattern {
-        peak_energy: peak,
-        mean_energy: mean,
-        early_focus: e > m && e > l,
-        mid_focus:   m > e && m > l,
-        late_focus:  l > e && l > m,
-        total_us: traces.iter().map(|t| t.time_us).sum(),
-    }
-}
-
-pub fn layer_importance(traces: &[LayerTrace]) -> Vec<(usize, f32)> {
-    let mut v: Vec<(usize, f32)> = traces.iter()
-        .map(|t| (t.layer_idx, t.max_activation)).collect();
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    v
-}

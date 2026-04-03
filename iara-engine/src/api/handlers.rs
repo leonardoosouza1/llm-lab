@@ -617,7 +617,7 @@ pub async fn train_lnn_handler(
     Json(req): Json<TrainLnnRequest>,
 ) -> impl IntoResponse {
     use crate::lnn::EsnObserver;
-    use crate::lnn::train::{LnnTrainer, RewardSignal, train_esn_readout};
+    use crate::lnn::train::{RewardSignal, train_esn_readout};
 
     const ESN_SEED: u64 = 0xDEAD_BEEF_1337_4242;
 
@@ -747,7 +747,7 @@ pub async fn train_lnn_handler(
         if let Some(m) = guard.as_ref() {
             let weights_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../models/lnn_weights.json");
-            let mut esn_for_save = EsnObserver::new(ESN_SEED);
+            let esn_for_save = EsnObserver::new(ESN_SEED);
             // Note: ESN readout was trained per-prompt above; last one is lost
             // In production, persist the trainer state
             if let Err(e) = crate::lnn::train::save_lnn_weights(

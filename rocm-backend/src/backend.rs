@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use compute_core::{
     params::{
-        AddBiasParams, CfcForwardParams, EmbedParams, GeluMulParams, GemmBf16Params, GemvQ4Params,
+        AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params,
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
-        RopeParams, SgemmParams, SiluMulParams, SoftmaxParams,
+        RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -47,11 +47,6 @@ fn u16_ptr(t: &AnyTensor) -> *const u16 {
     t.downcast_ref::<DeviceBufferU16>()
         .expect("RocmBackend: expected BF16/u16 DeviceBuffer")
         .as_ptr()
-}
-
-/// Extract a mutable u16 (BF16 bits) device pointer from an `AnyTensor`.
-fn u16_mut_ptr(t: &AnyTensor) -> *mut u16 {
-    u16_ptr(t) as *mut u16
 }
 
 /// Extract a read-only u8 (Q4 packed) device pointer from an `AnyTensor`.
@@ -226,6 +221,34 @@ impl ComputeBackend for RocmBackend {
             p.ldb as i32,
             c_ptr,
             p.ldc as i32,
+        )
+        .map_err(|e| BackendError::Gemm(e.to_string()))
+    }
+
+    fn sgemm_strided_batched(&self, p: &SgemmStridedBatchedParams) -> Result<(), BackendError> {
+        let a_ptr = unsafe { f32_ptr(p.a).add(0) };  // Base pointer for batch
+        let b_ptr = unsafe { f32_ptr(p.b).add(0) };  // Base pointer for batch
+        let c_ptr = unsafe { f32_mut_ptr(p.c).add(0) };  // Base pointer for batch
+
+        hip_ffi::sgemm_strided_batched(
+            &self.blas,
+            p.trans_a,
+            p.trans_b,
+            p.m as i32,
+            p.n as i32,
+            p.k as i32,
+            p.alpha,
+            p.beta,
+            a_ptr,
+            p.lda as i32,
+            p.stride_a as i64,
+            b_ptr,
+            p.ldb as i32,
+            p.stride_b as i64,
+            c_ptr,
+            p.ldc as i32,
+            p.stride_c as i64,
+            p.batch_count as i32,
         )
         .map_err(|e| BackendError::Gemm(e.to_string()))
     }
@@ -592,6 +615,32 @@ impl ComputeBackend for RocmBackend {
                 f32_ptr(b),
                 n_elems as i32,
                 alpha,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_norm_bias_rope(&self, p: &FusedNormBiasRopeParams) -> Result<(), BackendError> {
+        let has_bias = if p.bias.is_some() { 1i32 } else { 0i32 };
+        let bias_ptr = if let Some(bias) = p.bias {
+            f32_ptr(bias)
+        } else {
+            std::ptr::null()
+        };
+
+        unsafe {
+            self.kernels.fused_norm_bias_rope(
+                f32_mut_ptr(p.output),
+                f32_ptr(p.input),
+                f32_ptr(p.norm_weight),
+                bias_ptr,
+                p.n_tokens as i32,
+                p.hidden_size as i32,
+                p.n_heads as i32,
+                p.pos_offset as i32,
+                p.theta,
+                p.eps,
+                has_bias,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))

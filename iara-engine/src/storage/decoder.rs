@@ -16,6 +16,7 @@ use std::path::Path;
 
 /// Resultado de um token decodificado
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DecodedToken {
     pub token_id: u32,
     pub score: f32,
@@ -29,6 +30,7 @@ pub struct DecodedToken {
 /// **Importante:** usa produto escalar PURO (não cosine similarity), pois é
 /// exatamente o que `logits = hidden @ lm_head.T` faz no Qwen original.
 /// Cosine similarity normaliza os dois lados e destrói o ranking treinado.
+#[allow(dead_code)]
 pub fn decode_activation(
     model_dir: &Path,
     index: &SafetensorsIndex,

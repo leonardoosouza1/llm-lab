@@ -43,20 +43,6 @@ pub enum ClientMessage {
     ListLayers,
 }
 
-/// Frame de telemetria enviado pelo backend
-#[derive(Debug, Serialize, Clone)]
-pub struct TelemetryFrame {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub grid_size: usize,
-    pub data: Vec<f32>,
-    pub tick: u64,
-    pub layer: String,
-    pub energy: f32,
-    pub active_nodes: usize,
-    pub total_nodes: usize,
-}
-
 /// Mensagem genérica do backend para o frontend
 #[derive(Debug, Serialize)]
 pub struct ServerMessage {

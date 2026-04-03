@@ -56,6 +56,9 @@ pub struct GpuKernels {
     fn_value_norms: hipFunction_t,
     fn_kv_cache_quantize: hipFunction_t,
     fn_add_tensors: hipFunction_t,
+    fn_fused_norm_bias_rope: hipFunction_t,
+    fn_kv_cache_int8_quantize_append: hipFunction_t,
+    fn_kv_cache_int8_dequantize: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -91,6 +94,7 @@ impl GpuKernels {
         let fn_value_norms = get_fn!("value_norms");
         let fn_kv_cache_quantize = get_fn!("kv_cache_quantize_append");
         let fn_add_tensors = get_fn!("add_tensors_inplace");
+        let fn_fused_norm_bias_rope = get_fn!("fused_norm_bias_rope");
 
         Ok(Self {
             module,
@@ -108,6 +112,7 @@ impl GpuKernels {
             fn_value_norms,
             fn_kv_cache_quantize,
             fn_add_tensors,
+            fn_fused_norm_bias_rope,
         })
     }
 }
@@ -128,24 +133,6 @@ impl Drop for GpuKernels {
 // ---------------------------------------------------------------------------
 // Helper: build a kernel-argument pointer array from references.
 //
-// `hip_launch_kernel` (via hipModuleLaunchKernel) expects `void**` where each
-// element is a pointer TO the kernel argument (i.e. &arg, not arg itself).
-//
-// The macro collects each expression as a local variable, takes its address,
-// and casts to *mut c_void, building a temporary slice on the stack.
-// ---------------------------------------------------------------------------
-macro_rules! kargs {
-    ( $( $arg:expr ),* $(,)? ) => {{
-        // Bind each argument to a named local so we can take a stable address.
-        // The variables are alive for the duration of the surrounding expression.
-        #[allow(unused_mut)]
-        let mut args: &mut [*mut std::ffi::c_void] = &mut [
-            $( &mut { $arg } as *mut _ as *mut std::ffi::c_void ),*
-        ];
-        args
-    }};
-}
-
 // ---------------------------------------------------------------------------
 // Inline helpers
 // ---------------------------------------------------------------------------
@@ -569,7 +556,13 @@ impl GpuKernels {
         let bsz = block_size(k as u32, 256);  // max 256 (kernel __launch_bounds__)
         let grid = (n as u32, m.max(1) as u32, 1);  // (N rows, M tokens)
         let block = (bsz, 1, 1);
-        let shared_mem = bsz * 4;  // 256 floats × 4 bytes
+
+        // Shared memory layout for optimized kernel:
+        // [0..n_groups) : scales
+        // [n_groups..2*n_groups) : zeros
+        // [2*n_groups..2*n_groups + 256) : reduction buffer (one per warp)
+        let n_groups = ((k as u32 + group_size as u32 - 1) / group_size as u32) as usize;
+        let shared_mem = ((n_groups * 2 + 256) * std::mem::size_of::<f32>()) as u32;
 
         let mut p_packed = packed;
         let mut p_scales = scales;
@@ -833,6 +826,72 @@ impl GpuKernels {
                 &mut p_b as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_n as *mut i32 as *mut std::ffi::c_void,
                 &mut p_alpha as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Kernel 15: fused_norm_bias_rope
+    //
+    // Fuse RMSNorm + optional bias + RoPE into a single kernel launch.
+    //   output[tok, i] = rope( (input[tok, i] / rms + bias[i]) * weight[i] )
+    //
+    // Grid : (n_tokens, 1, 1)
+    // Block: (256, 1, 1)
+    // Shared: 256 * sizeof(f32) bytes (for variance reduction)
+    // -------------------------------------------------------------------------
+
+    /// Apply RMSNorm + optional bias + RoPE in a single fused kernel.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    /// If bias is None, has_bias must be 0 and bias_ptr can be null.
+    pub unsafe fn fused_norm_bias_rope(
+        &self,
+        output: *mut f32,          // [n_tokens, hidden_size] on GPU
+        input: *const f32,         // [n_tokens, hidden_size] on GPU
+        norm_weight: *const f32,   // [hidden_size] on GPU
+        bias: *const f32,          // [hidden_size] on GPU (may be null if has_bias==0)
+        n_tokens: i32,
+        hidden_size: i32,
+        n_heads: i32,
+        pos_start: i32,            // absolute position for RoPE
+        theta: f32,                // RoPE base
+        eps: f32,                  // epsilon for RMSNorm
+        has_bias: i32,             // 1 if bias is valid, 0 otherwise
+    ) -> Result<(), HipError> {
+        let shared_bytes = 256 * std::mem::size_of::<f32>() as u32;
+        let grid = (n_tokens as u32, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_output = output;
+        let mut p_input = input;
+        let mut p_norm_weight = norm_weight;
+        let mut p_bias = bias;
+        let mut p_hidden_size = hidden_size;
+        let mut p_n_heads = n_heads;
+        let mut p_pos_start = pos_start;
+        let mut p_theta = theta;
+        let mut p_eps = eps;
+        let mut p_has_bias = has_bias;
+
+        hip_launch_kernel(
+            self.fn_fused_norm_bias_rope,
+            grid,
+            block,
+            shared_bytes,
+            ptr::null_mut(),
+            &mut [
+                &mut p_output as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_input as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_norm_weight as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bias as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_hidden_size as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
+                &mut p_pos_start as *mut i32 as *mut std::ffi::c_void,
+                &mut p_theta as *mut f32 as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32 as *mut std::ffi::c_void,
+                &mut p_has_bias as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }

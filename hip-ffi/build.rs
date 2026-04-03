@@ -15,7 +15,7 @@ fn main() {
     // Usa o Clang do ROCm (não o do sistema) — ele sabe encontrar seus próprios headers
     // LIBCLANG_PATH deve apontar para o lib do ROCm LLVM (setado em run_iara.sh)
     let rocm_llvm_lib = format!("{}/lib/llvm/lib", rocm);
-    let rocm_llvm_include = format!("{}/lib/llvm/lib/clang/19/include", rocm);
+    let _rocm_llvm_include = format!("{}/lib/llvm/lib/clang/19/include", rocm);
 
     // Exporta LIBCLANG_PATH para que bindgen use o clang certo
     println!("cargo:rustc-env=LIBCLANG_PATH={}", rocm_llvm_lib);
@@ -109,6 +109,7 @@ fn main() {
         .allowlist_function("hipblasCreate")
         .allowlist_function("hipblasDestroy")
         .allowlist_function("hipblasGemmEx_v2")
+        .allowlist_function("hipblasSgemmStridedBatched")
         // Types
         .allowlist_type("hipblasStatus_t")
         .allowlist_type("hipblasOperation_t")

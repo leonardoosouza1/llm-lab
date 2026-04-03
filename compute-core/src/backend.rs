@@ -1,4 +1,5 @@
 use crate::{AnyTensor, BackendError, params::*};
+use crate::params::{KvCacheInt8AppendParams, KvCacheInt8ReadParams};
 
 /// Trait principal de backend de compute.
 /// Toda implementação (ROCm, OpenCL, CPU) implementa este trait.
@@ -34,6 +35,7 @@ pub trait ComputeBackend: Send + Sync + 'static {
 
     fn gemm_bf16_f32(&self, p: &GemmBf16Params) -> Result<(), BackendError>;
     fn sgemm(&self, p: &SgemmParams) -> Result<(), BackendError>;
+    fn sgemm_strided_batched(&self, p: &SgemmStridedBatchedParams) -> Result<(), BackendError>;
 
     // ── Kernels customizados ──────────────────────────────────────────────────
 
@@ -50,6 +52,9 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gravity_score        (&self, p: &GravityScoreParams)       -> Result<(), BackendError>;
     fn cfc_forward          (&self, p: &CfcForwardParams)         -> Result<(), BackendError>;
     fn kv_cache_quantized_append(&self, p: &KvCacheQuantizedParams) -> Result<(), BackendError>;
+    fn fused_norm_bias_rope (&self, p: &FusedNormBiasRopeParams)  -> Result<(), BackendError>;
+    fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError>;
+    fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError>;
 
     /// Soma dois tensores F32 in-place: a[i] += alpha * b[i]
     /// Usado para aplicar CfC correction ao hidden state.

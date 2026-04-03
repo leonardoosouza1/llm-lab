@@ -39,9 +39,6 @@ const CFC_GRAD_CLIP: f32 = 1.0;
 /// Mínimo de steps para treinar (precisa de dados suficientes)
 const MIN_STEPS_FOR_TRAINING: usize = 8;
 
-/// Decay do reward exponencial (para estabilidade)
-const REWARD_DECAY: f32 = 0.99;
-
 // ── Reward Signal ──────────────────────────────────────────────────────────
 
 /// Sinal de recompensa computado a partir da telemetria de geração.
@@ -420,11 +417,6 @@ impl CfcTrainer {
         });
     }
 
-    /// Limpa ativações acumuladas (entre gerações).
-    pub fn clear_activations(&mut self) {
-        self.activations.clear();
-    }
-
     /// Executa backward pass e atualiza pesos do CfC.
     ///
     /// Fluxo:
@@ -794,13 +786,6 @@ impl LnnTrainer {
         }
     }
 
-    /// Limpa dados de ativação acumulados.
-    pub fn clear_activations(&mut self) {
-        if let Some(ref mut trainer) = self.cfc_trainer {
-            trainer.clear_activations();
-        }
-    }
-
     /// Telemetria geral do treinamento.
     pub fn telemetry(&self) -> LnnTrainTelemetry {
         LnnTrainTelemetry {
@@ -899,51 +884,6 @@ pub fn save_lnn_weights(
     file.write_all(serde_json::to_string_pretty(&json)?.as_bytes())?;
 
     log::info!("LNN weights salvos em {:?}", path);
-    Ok(())
-}
-
-/// Carrega pesos do LNN treinado de disco.
-pub fn load_lnn_weights(
-    esn: &mut EsnObserver,
-    cfc: Option<&mut CfcLayer>,
-    backend: &Arc<dyn ComputeBackend>,
-    path: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-
-    // ESN readout
-    if let Some(w_out) = json.get("esn_w_out") {
-        let weights: Vec<f32> = serde_json::from_value(w_out.clone())?;
-        esn.set_readout(weights);
-        log::info!("ESN readout carregado de {:?}", path);
-    }
-
-    // CfC weights
-    if let Some(cfc) = cfc {
-        let cd = cfc.config.cfc_dim;
-        let hd = cfc.config.hidden_dim;
-
-        macro_rules! load_weight {
-            ($key:expr, $field:ident, $shape:expr) => {
-                if let Some(v) = json.get($key) {
-                    let data: Vec<f32> = serde_json::from_value(v.clone())?;
-                    cfc.weights.$field = backend.upload_f32(&data, $shape);
-                }
-            };
-        }
-
-        load_weight!("cfc_wf", wf, &[cd, hd]);
-        load_weight!("cfc_wf2", wf2, &[cd, cd]);
-        load_weight!("cfc_bf", bf, &[cd]);
-        load_weight!("cfc_wg", wg, &[cd, hd]);
-        load_weight!("cfc_wg2", wg2, &[cd, cd]);
-        load_weight!("cfc_bg", bg, &[cd]);
-        load_weight!("cfc_wout", wout, &[hd, cd]);
-        load_weight!("cfc_bout", bout, &[hd]);
-
-        log::info!("CfC weights carregados de {:?}", path);
-    }
-
     Ok(())
 }
 

@@ -29,8 +29,8 @@ use opencl3::types::{cl_float, cl_int, cl_mem, cl_uint, cl_ushort, CL_BLOCKING};
 
 use compute_core::{
     AddBiasParams, AnyTensor, BackendError, ComputeBackend, DType,
-    EmbedParams, GeluMulParams, GemmBf16Params, KvCacheParams, LayerNormParams, RmsNormParams,
-    RopeParams, SgemmParams, SiluMulParams, SoftmaxParams,
+    EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, KvCacheParams, LayerNormParams, RmsNormParams,
+    RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
 };
 
 use crate::context::OclContext;
@@ -54,6 +54,7 @@ unsafe impl Sync for OclBufferF32 {}
 /// Na UMA: alocado com `CL_MEM_ALLOC_HOST_PTR`.
 pub struct OclBufferU16 {
     pub buf: Buffer<cl_ushort>,
+    #[allow(dead_code)]
     pub len: usize,
 }
 unsafe impl Send for OclBufferU16 {}
@@ -500,6 +501,10 @@ impl ComputeBackend for OpenClBackend {
         Ok(())
     }
 
+    fn sgemm_strided_batched(&self, _p: &SgemmStridedBatchedParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel("sgemm_strided_batched not yet implemented".into()))
+    }
+
     // ── Kernels customizados ──────────────────────────────────────────────
 
     fn embed_lookup(&self, p: &EmbedParams) -> Result<(), BackendError> {
@@ -881,6 +886,10 @@ impl ComputeBackend for OpenClBackend {
         Err(BackendError::Kernel(
             "OpenCL: add_tensors_inplace não implementado".to_string(),
         ))
+    }
+
+    fn fused_norm_bias_rope(&self, _p: &FusedNormBiasRopeParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel("fused_norm_bias_rope not yet implemented".into()))
     }
 
     fn sync(&self) -> Result<(), BackendError> {

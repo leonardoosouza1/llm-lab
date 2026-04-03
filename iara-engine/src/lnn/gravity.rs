@@ -16,7 +16,6 @@
 
 use std::sync::Arc;
 use compute_core::{ComputeBackend, AnyTensor, GravityScoreParams};
-use serde::Serialize;
 
 /// Configuração do sistema de gravidade semântica.
 #[derive(Debug, Clone)]
@@ -27,6 +26,7 @@ pub struct GravityConfig {
     /// Fração máxima de tokens a corrigir por step (controle de custo).
     pub max_correction_ratio: f32,
     /// Se true, calcula gravity mas não aplica correção (modo observação).
+    #[allow(dead_code)]
     pub observe_only: bool,
 }
 
@@ -44,6 +44,7 @@ impl Default for GravityConfig {
 #[derive(Debug, Clone)]
 pub struct GravityResult {
     /// Scores de gravidade por token [seq_len] (na CPU após download).
+    #[allow(dead_code)]
     pub scores: Vec<f32>,
     /// Índices dos tokens que excedem o threshold (candidatos a correção).
     pub high_gravity_tokens: Vec<usize>,
@@ -64,6 +65,7 @@ pub struct GravitySystem {
     pub(crate) vnorm_buf: AnyTensor,
     /// Histórico de gravidade média (para adaptação do threshold).
     pub(crate) history: Vec<f32>,
+    #[allow(dead_code)]
     pub(crate) max_seq_len: usize,
     pub(crate) n_kv_heads: usize,
     head_dim: usize,
@@ -232,20 +234,3 @@ impl GravitySystem {
     }
 }
 
-/// Telemetria de gravidade para broadcast WebSocket.
-///
-/// Contém estatísticas instantâneas do sistema de gravidade,
-/// úteis para monitoramento em tempo real via dashboard.
-#[derive(Debug, Clone, Serialize)]
-pub struct GravityTelemetry {
-    /// Gravidade média dos tokens neste step.
-    pub mean_gravity: f32,
-    /// Gravidade máxima observada.
-    pub max_gravity: f32,
-    /// Threshold efetivo (adaptativo).
-    pub threshold: f32,
-    /// Quantidade de tokens que excedem o threshold (candidatos a correção).
-    pub n_corrected: usize,
-    /// Razão de tokens corrigidos em relação ao total da sequência.
-    pub correction_ratio: f32,
-}

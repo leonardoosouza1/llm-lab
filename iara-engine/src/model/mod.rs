@@ -14,17 +14,15 @@
 // ============================================================================
 
 pub mod architecture;
-pub use architecture::{ModelArchitecture, NormType, Activation, MlpType, TensorNameMap};
+pub use architecture::{ModelArchitecture, NormType, Activation};
 
 mod kv_cache;
 pub(crate) use kv_cache::GpuKvCache;
-#[allow(unused_imports)]
-pub(crate) use kv_cache::BoundedKvCache;
 
 use std::sync::Arc;
 use compute_core::{
     ComputeBackend, AnyTensor,
-    GemmBf16Params, SgemmParams, EmbedParams, RmsNormParams, LayerNormParams,
+    GemmBf16Params, SgemmParams, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
     AddBiasParams, GemvQ4Params,
 };
@@ -127,6 +125,7 @@ impl ModelCfg {
         })
     }
 
+    #[allow(dead_code)]
     pub fn qwen_8b() -> Self {
         Self {
             hidden_size: 4096, num_layers: 36, intermediate_size: 12288,
@@ -991,6 +990,14 @@ impl CausalLM {
             }
 
             // ── QK Normalization (Qwen3) ─────────────────────────────────────
+            // T8 TODO: Fused Norm+Bias+RoPE kernel integration point
+            // Currently: Apply RMSNorm, then bias, then RoPE as separate operations.
+            // Future: When available, fuse into single kernel for Q and K:
+            //   fused_norm_bias_rope_q() then fused_norm_bias_rope_k()
+            // This would reduce VRAM round-trips: norm(Q) + bias(Q) + rope(Q) → 1 kernel
+            // Precondition: Only applicable when QK-norm is present (Qwen3 models).
+            // For now: Keep sequential operations; they are correct and not a bottleneck.
+            //
             // Aplica RMSNorm per-head em Q e K antes do RoPE.
             // Q: [n, qd] → tratado como [n * nh, hd] → RMSNorm com peso [hd]
             // K: [n, kd] → tratado como [n * nk, hd] → RMSNorm com peso [hd]
@@ -1061,72 +1068,127 @@ impl CausalLM {
             let seq = layer.kv_k.current_len;
 
             // ── Attention: Q × K^T → softmax → × V ───────────────────────────
-            // Processa cabeçote por cabeçote via sgemm com offsets.
-            // K e V estão em [seq, kv_dim] com stride kv_dim entre tokens.
+            // T7: Batched attention with GQA fallback
             //
-            // Para cabeçote hi:
-            //   Q_h offset: hi * hd  (stride qd entre tokens)
-            //   K_h offset: kv_h * hd (stride kd entre tokens, no cache)
-            //   scores offset: hi * n * seq
+            // For MHA (nk == nh): All heads can be processed via sgemm_strided_batched
+            // For GQA (nk < nh):  Multiple Q heads share K/V heads → non-uniform strides
+            //   Fall back to per-head loop since strided batched requires uniform strides
             //
-            // scores_h[n, seq] = scale × Q_h × K_h^T  — row-major
-            // C[qi*seq + ki] = scale × Q_h[qi, :] · K_h[ki, :]
-            // Kernel row-major: M=n (queries), N=seq (keys), K=hd
-            //   A = Q_h[n, hd]:   trans_a=false, a_offset=hi*hd, lda=qd
-            //   B = K_h[seq, hd]: trans_b=true,  b_offset=kv_h*hd, ldb=kd
-            //   C = scores[n, seq]: c_offset=hi*n*seq, ldc=seq
-            // Nota: sem sync aqui — hipBLAS e custom kernels compartilham o default
-            // stream, portanto a fila de comandos GPU serializa automaticamente.
+            // Scratchpad layout:
+            //   Q:      [n, qd] = [n, nh*hd]    stride=qd between tokens, hd between heads
+            //   K cache: [seq, kd]               stride=kd between tokens, hd between heads
+            //   V cache: [seq, kd]               stride=kd between tokens, hd between heads
+            //   scores: [nh*n, seq]             stride=n*seq between heads, seq between tokens
 
-            for hi in 0..nh {
-                let kv_h = hi * nk / nh;
+            let use_batched = nk == nh;  // MHA only; GQA needs per-head loop
 
-                log::trace!("layer {layer_idx}: attn QK hi={hi} kv_h={kv_h} m={n} n={seq} k={hd} lda={qd} ldb={kd} ldc={seq}");
-                self.backend.sgemm(&SgemmParams {
+            if use_batched {
+                log::trace!("layer {layer_idx}: attn QK BATCHED (MHA) m={n} n={seq} k={hd} batch={nh}");
+
+                // T7a: Batched Q×K^T for all heads
+                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                     trans_a: false,
                     trans_b: true,
-                    m: n, n: seq, k: hd,
-                    alpha: scale, beta: 0.0,
+                    m: n,
+                    n: seq,
+                    k: hd,
+                    alpha: scale,
+                    beta: 0.0,
                     a: &self.scratch.q,
-                    lda: qd,
-                    a_offset: hi * hd,
+                    lda: hd,      // leading dim of Q sub-block [n, hd]
+                    stride_a: hd,  // stride between Q heads: next head starts at +hd
                     b: &layer.kv_k.data,
-                    ldb: kd,
-                    b_offset: kv_h * hd,
+                    ldb: hd,      // leading dim of K sub-block [seq, hd]
+                    stride_b: hd,  // stride between K heads (MHA: uniform)
                     c: &self.scratch.scores,
-                    ldc: seq,
-                    c_offset: hi * n * seq,
+                    ldc: seq,     // leading dim of scores sub-block [n, seq]
+                    stride_c: n * seq,  // stride between score heads
+                    batch_count: nh,
                 })?;
 
-                // Softmax row-wise: cada query normaliza sobre seq keys
-                self.backend.softmax_rows(&SoftmaxParams {
-                    scores: &self.scratch.scores,
-                    offset_elems: hi * n * seq,
-                    n_rows: n,
-                    row_len: seq,
-                })?;
+                // T7b: Softmax per head (still sequential, it's fast)
+                for hi in 0..nh {
+                    self.backend.softmax_rows(&SoftmaxParams {
+                        scores: &self.scratch.scores,
+                        offset_elems: hi * n * seq,
+                        n_rows: n,
+                        row_len: seq,
+                    })?;
+                }
 
-                // out_h[n, hd] = attn_weights[n, seq] × V_h[seq, hd]  — row-major
-                // C[qi*qd + hi*hd + d] = Σ_ki attn[qi,ki] × V_h[ki, d]
-                // A = attn[n, seq]: trans_a=false, a_offset=hi*n*seq, lda=seq
-                // B = V_h[seq, hd]: trans_b=false, b_offset=kv_h*hd, ldb=kd
-                // C = attn_out[n, qd]: c_offset=hi*hd, ldc=qd
-                log::trace!("layer {layer_idx}: attn AV hi={hi} m={n} n={hd} k={seq} lda={seq} ldb={kd} ldc={qd}");
-                self.backend.sgemm(&SgemmParams {
+                // T7c: Batched Attn×V for all heads
+                log::trace!("layer {layer_idx}: attn AV BATCHED (MHA) m={n} n={hd} k={seq} batch={nh}");
+                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                     trans_a: false,
                     trans_b: false,
-                    m: n, n: hd, k: seq,
-                    alpha: 1.0, beta: 0.0,
+                    m: n,
+                    n: hd,
+                    k: seq,
+                    alpha: 1.0,
+                    beta: 0.0,
                     a: &self.scratch.scores,
-                    lda: seq,
-                    a_offset: hi * n * seq,
+                    lda: seq,     // leading dim of scores sub-block [n, seq]
+                    stride_a: n * seq,  // stride between score heads
                     b: &layer.kv_v.data,
-                    ldb: kd,
-                    b_offset: kv_h * hd,
+                    ldb: hd,      // leading dim of V sub-block [seq, hd]
+                    stride_b: hd,  // stride between V heads (MHA: uniform)
                     c: &self.scratch.attn_out,
-                    ldc: qd,
-                    c_offset: hi * hd,
+                    ldc: hd,      // leading dim of attn_out sub-block [n, hd]
+                    stride_c: hd,  // stride between output heads
+                    batch_count: nh,
                 })?;
+            } else {
+                // GQA fallback: non-uniform strides between K/V heads
+                // Multiple Q heads map to same K/V head: kv_h = hi * nk / nh
+                // When nk < nh, different Q heads have different strides to K/V
+                // sgemm_strided_batched cannot handle this, so revert to per-head loop
+                log::trace!("layer {layer_idx}: attn FALLBACK (GQA) — {nh} Q heads → {nk} KV heads");
+
+                for hi in 0..nh {
+                    let kv_h = hi * nk / nh;
+
+                    log::trace!("layer {layer_idx}: attn QK hi={hi} kv_h={kv_h} m={n} n={seq} k={hd} lda={qd} ldb={kd} ldc={seq}");
+                    self.backend.sgemm(&SgemmParams {
+                        trans_a: false,
+                        trans_b: true,
+                        m: n, n: seq, k: hd,
+                        alpha: scale, beta: 0.0,
+                        a: &self.scratch.q,
+                        lda: qd,
+                        a_offset: hi * hd,
+                        b: &layer.kv_k.data,
+                        ldb: kd,
+                        b_offset: kv_h * hd,
+                        c: &self.scratch.scores,
+                        ldc: seq,
+                        c_offset: hi * n * seq,
+                    })?;
+
+                    // Softmax row-wise
+                    self.backend.softmax_rows(&SoftmaxParams {
+                        scores: &self.scratch.scores,
+                        offset_elems: hi * n * seq,
+                        n_rows: n,
+                        row_len: seq,
+                    })?;
+
+                    log::trace!("layer {layer_idx}: attn AV hi={hi} m={n} n={hd} k={seq} lda={seq} ldb={kd} ldc={qd}");
+                    self.backend.sgemm(&SgemmParams {
+                        trans_a: false,
+                        trans_b: false,
+                        m: n, n: hd, k: seq,
+                        alpha: 1.0, beta: 0.0,
+                        a: &self.scratch.scores,
+                        lda: seq,
+                        a_offset: hi * n * seq,
+                        b: &layer.kv_v.data,
+                        ldb: kd,
+                        b_offset: kv_h * hd,
+                        c: &self.scratch.attn_out,
+                        ldc: qd,
+                        c_offset: hi * hd,
+                    })?;
+                }
             }
 
             // ── Output projection: attn_out × wo^T → x (residual) ─────────────
