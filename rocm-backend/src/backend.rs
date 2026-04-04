@@ -181,11 +181,10 @@ impl ComputeBackend for RocmBackend {
                 .f32_to_bf16(a_ptr, act_guard.as_mut_ptr(), expected_elems as i32)
                 .map_err(|e| BackendError::Gemm(format!("Cast: {e}")))?;
 
-            // Explicitly synchronize current stream (default) to ensure BF16 cast is complete
-            // before hipblasGemmEx reads from it. This prevents 'Invalid Value' errors
-            // caused by out-of-order data hazards on some RDNA2 drivers.
-            hip_ffi::safe::hip_stream_synchronize(std::ptr::null_mut())
-                .map_err(|e| BackendError::Gemm(format!("Post-cast sync: {e}")))?;
+            // No sync needed: f32_to_bf16 and hipblasGemmEx both run on the
+            // default stream (null), so they are already serialized by the HIP
+            // runtime.  The old explicit sync was flushing the entire GPU pipeline
+            // ~140 times per token, killing throughput.
         }
 
         hip_ffi::gemm_bf16_f32(
