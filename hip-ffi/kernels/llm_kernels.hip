@@ -602,21 +602,20 @@ extern "C" __global__ void dequant_gemv_q4(
     }
     __syncthreads();
 
-    // ── Step 4: Final reduction (only thread 0) ───────────────────────────────
+    // ── Step 4: Final reduction across warps ─────────────────────────────────
     // Combine warp-level sums. bsz = 256, so we have 256/32 = 8 warp results.
-    float result = 0.0f;
-    if (tid < (bsz / 32)) {
-        result = shared_reduce[tid];
-    }
-    for (int stride = (bsz / 32) >> 1; stride > 0; stride >>= 1) {
+    // Use shared_reduce[] as accumulator (write-back required for tree reduction).
+    int n_warps = bsz / 32;
+    for (int stride = n_warps >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            result += shared_reduce[tid + stride];
+            shared_reduce[tid] += shared_reduce[tid + stride];
         }
         __syncthreads();
     }
 
     // ── Step 5: Write output ──────────────────────────────────────────────────
     if (tid == 0) {
+        float result = shared_reduce[0];
         int out_idx = mi * N + row;
         if (beta == 0.0f) {
             out[out_idx] = result;

@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<title>IARA Observatory — Physics of Intelligence</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; color:#0ff; font-family:'Courier New',monospace; overflow:hidden; }
+canvas { display:block; }
+#hud {
+  position:fixed; top:0; left:0; width:100%; height:100%;
+  pointer-events:none; z-index:10;
+}
+#title {
+  position:absolute; top:20px; left:50%;
+  transform:translateX(-50%);
+  text-align:center; pointer-events:none;
+}
+#title h1 { font-size:18px; color:#0ff; letter-spacing:4px; text-shadow:0 0 20px #0ff; }
+#title p  { font-size:11px; color:#0ff8; margin-top:4px; letter-spacing:2px; }
+
+#tabs {
+  position:absolute; top:60px; left:50%;
+  transform:translateX(-50%);
+  display:flex; gap:4px; pointer-events:all;
+}
+.tab {
+  padding:6px 16px; font-size:11px; cursor:pointer;
+  border:1px solid #0ff4; background:#0001; color:#0ff8;
+  letter-spacing:1px; transition:all 0.2s;
+}
+.tab:hover { background:#0ff2; color:#0ff; border-color:#0ff; }
+.tab.active { background:#0ff3; color:#fff; border-color:#0ff; box-shadow:0 0 12px #0ff6; }
+
+#panel {
+  position:absolute; bottom:20px; left:20px; width:280px;
+  background:#0001; border:1px solid #0ff3; padding:14px;
+}
+#panel h3 { font-size:11px; color:#0ff; letter-spacing:2px; margin-bottom:10px; }
+.metric { display:flex; justify-content:space-between; margin:4px 0; font-size:10px; }
+.metric span:first-child { color:#0ff8; }
+.metric span:last-child { color:#fff; font-weight:bold; }
+.bar-bg { background:#0ff1; height:3px; margin:2px 0 6px 0; border-radius:2px; }
+.bar-fill { height:3px; border-radius:2px; background:linear-gradient(90deg,#0ff,#f0f); transition:width 0.3s; }
+
+#legend {
+  position:absolute; bottom:20px; right:20px; width:200px;
+  background:#0001; border:1px solid #0ff3; padding:14px;
+  font-size:10px;
+}
+#legend h3 { color:#0ff; letter-spacing:2px; margin-bottom:10px; font-size:11px; }
+.leg { display:flex; align-items:center; gap:8px; margin:5px 0; }
+.dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+
+#formula {
+  position:absolute; top:110px; right:20px;
+  background:#0001; border:1px solid #f0f3; padding:12px;
+  font-size:10px; color:#f0f8; max-width:220px; line-height:1.6;
+}
+#formula .eq { color:#fff; font-size:12px; margin:4px 0; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="title">
+    <h1>◈ IARA OBSERVATORY ◈</h1>
+    <p>PHYSICS OF INTELLIGENCE — SEMANTIC GRAVITY · VORTEX FLOW · KAN BARRIERS · RESONANCE</p>
+  </div>
+  <div id="tabs">
+    <div class="tab active" onclick="setMode(0)">⬤ GRAVITY</div>
+    <div class="tab" onclick="setMode(1)">⟳ VORTEX</div>
+    <div class="tab" onclick="setMode(2)">⋯ KAN BARRIER</div>
+    <div class="tab" onclick="setMode(3)">◎ RESONANCE</div>
+  </div>
+  <div id="panel">
+    <h3>◈ METRICS</h3>
+    <div class="metric"><span>MODE</span><span id="m-mode">GRAVITY</span></div>
+    <div class="metric"><span>ENERGY</span><span id="m-energy">0.000</span></div>
+    <div class="bar-bg"><div class="bar-fill" id="b-energy" style="width:50%"></div></div>
+    <div class="metric"><span>COHERENCE</span><span id="m-coherence">0.000</span></div>
+    <div class="bar-bg"><div class="bar-fill" id="b-coherence" style="width:30%"></div></div>
+    <div class="metric"><span>ENTROPY</span><span id="m-entropy">0.000</span></div>
+    <div class="bar-bg"><div class="bar-fill" id="b-entropy" style="width:70%"></div></div>
+    <div class="metric"><span>ALIVE NEURONS</span><span id="m-alive">0%</span></div>
+    <div class="bar-bg"><div class="bar-fill" id="b-alive" style="width:40%"></div></div>
+    <div class="metric"><span>TOKENS/S</span><span id="m-fps">0</span></div>
+  </div>
+  <div id="legend">
+    <h3>◈ LEGEND</h3>
+    <div id="legend-content"></div>
+  </div>
+  <div id="formula"></div>
+</div>
+
+<canvas id="c"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ─────────────────────────────────────────────────────────────────
+// IARA Observatory — Physics of Intelligence
+// 4 modes: Gravity · Vortex · KAN Barrier · Resonance
+// ─────────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000008);
+scene.fog = new THREE.FogExp2(0x000008, 0.015);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 500);
+camera.position.set(0, 0, 60);
+
+window.addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ── Mouse orbital control ──────────────────────────────────────
+let mx=0, my=0, mBtn=false;
+canvas.addEventListener('mousemove', e => { mx=e.clientX; my=e.clientY; });
+canvas.addEventListener('mousedown', () => mBtn=true);
+canvas.addEventListener('mouseup',   () => mBtn=false);
+let camTheta=0, camPhi=0.3, camR=60;
+canvas.addEventListener('wheel', e => { camR = Math.max(20, Math.min(150, camR + e.deltaY*0.05)); });
+let lastMx=0, lastMy=0;
+canvas.addEventListener('mousemove', e => {
+  if(mBtn) {
+    camTheta -= (e.clientX-lastMx)*0.005;
+    camPhi = Math.max(-1.2, Math.min(1.2, camPhi + (e.clientY-lastMy)*0.005));
+  }
+  lastMx=e.clientX; lastMy=e.clientY;
+});
+
+// ── Helpers ───────────────────────────────────────────────────
+const rng = (a=0,b=1) => Math.random()*(b-a)+a;
+const lerp = (a,b,t) => a+(b-a)*t;
+const clamp = (x,a,b) => Math.max(a,Math.min(b,x));
+const hsl = (h,s,l) => new THREE.Color().setHSL(h,s,l);
+
+let mode = 0;
+let objs = [];
+let t = 0;
+
+function clearScene() {
+  objs.forEach(o => { scene.remove(o); if(o.geometry) o.geometry.dispose(); });
+  objs = [];
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODE 0 — SEMANTIC GRAVITY
+// Tokens as masses orbiting each other in semantic space.
+// Gravity: F = G × m1 × m2 / d²
+// Attention weight = normalized gravitational force (replaces softmax)
+// ─────────────────────────────────────────────────────────────────
+
+function buildGravity() {
+  document.getElementById('legend-content').innerHTML = `
+    <div class="leg"><div class="dot" style="background:#0ff;box-shadow:0 0 8px #0ff"></div>Hub token (high mass)</div>
+    <div class="leg"><div class="dot" style="background:#f0f;box-shadow:0 0 8px #f0f"></div>Rare token (low mass)</div>
+    <div class="leg"><div class="dot" style="background:#ff0;box-shadow:0 0 5px #ff0"></div>Activated token</div>
+    <div class="leg" style="color:#0ff8;margin-top:8px;line-height:1.5">Lines = gravitational<br>force (attention weight)</div>
+  `;
+  document.getElementById('formula').innerHTML = `
+    <div style="color:#0ff;letter-spacing:2px;margin-bottom:6px">◈ GRAVITY ATTENTION</div>
+    <div class="eq">m_i = freq_i^0.75</div>
+    <div class="eq">d_ij = 1 - cos(e_i,e_j)</div>
+    <div class="eq">F_ij = G·m_i·m_j / d²</div>
+    <div class="eq">A_ij = softmax(F_ij)</div>
+    <div style="margin-top:8px;color:#0ff6">Replaces QKᵀ/√d with<br>Newtonian gravity in<br>embedding space</div>
+  `;
+
+  const N = 80;
+  const tokens = [];
+  const masses = [];
+
+  // Zipf distribution: most tokens rare, few very frequent (hubs)
+  for(let i=0; i<N; i++) {
+    const rank = i+1;
+    const mass = Math.pow(1/rank, 0.75) * 3.0;  // Zipf × 3
+    masses.push(mass);
+    const theta = rng(0, Math.PI*2);
+    const phi = rng(-Math.PI/2, Math.PI/2);
+    const r = rng(8, 28);
+    tokens.push({
+      pos: new THREE.Vector3(
+        r*Math.cos(phi)*Math.cos(theta),
+        r*Math.cos(phi)*Math.sin(theta),
+        r*Math.sin(phi)
+      ),
+      vel: new THREE.Vector3(rng(-0.05,0.05), rng(-0.05,0.05), rng(-0.05,0.05)),
+      mass,
+      activated: Math.random() < 0.15,
+      id: i
+    });
+  }
+
+  // Token spheres
+  const sphereGeo = new THREE.SphereGeometry(0.4, 8, 8);
+  const tokenMeshes = tokens.map((tk, i) => {
+    const isHub = i < 5;
+    const color = isHub ? 0x00ffff : (tk.activated ? 0xffff00 : 0xff00ff);
+    const mat = new THREE.MeshBasicMaterial({ color, transparent:true, opacity:0.8 });
+    const m = new THREE.Mesh(new THREE.SphereGeometry(tk.mass*0.5+0.2, 8, 8), mat);
+    m.position.copy(tk.pos);
+    scene.add(m); objs.push(m);
+    // Glow
+    const gmat = new THREE.MeshBasicMaterial({ color, transparent:true, opacity:0.15 });
+    const glow = new THREE.Mesh(new THREE.SphereGeometry((tk.mass*0.5+0.2)*2.5, 8, 8), gmat);
+    m.add(glow);
+    return m;
+  });
+
+  // Gravity lines (top attraction pairs)
+  const lines = [];
+  const lineMat = new THREE.LineBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.12 });
+  for(let i=0; i<N; i++) {
+    for(let j=i+1; j<N; j++) {
+      const d = tokens[i].pos.distanceTo(tokens[j].pos);
+      const F = (masses[i] * masses[j]) / (d*d + 0.1);
+      if(F > 0.15) {
+        const pts = [tokens[i].pos.clone(), tokens[j].pos.clone()];
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(geo, lineMat.clone());
+        line.material.opacity = Math.min(0.4, F * 0.3);
+        scene.add(line); objs.push(line);
+        lines.push({ line, i, j, geo });
+      }
+    }
+  }
+
+  // Gravity well grid (background)
+  const gridSize = 80, gridDiv = 30;
+  const gridGeo = new THREE.PlaneGeometry(gridSize, gridSize, gridDiv, gridDiv);
+  const gridMat = new THREE.MeshBasicMaterial({ color:0x002222, wireframe:true, transparent:true, opacity:0.2 });
+  const grid = new THREE.Mesh(gridGeo, gridMat);
+  grid.rotation.x = -Math.PI/2;
+  grid.position.y = -20;
+  scene.add(grid); objs.push(grid);
+
+  return function update(dt) {
+    const G = 0.3;
+    // Apply gravity
+    for(let i=0; i<N; i++) {
+      for(let j=i+1; j<N; j++) {
+        const diff = tokens[j].pos.clone().sub(tokens[i].pos);
+        const d2 = diff.lengthSq() + 2;
+        const F = G * masses[i] * masses[j] / d2;
+        diff.normalize().multiplyScalar(F * 0.001);
+        tokens[i].vel.add(diff);
+        tokens[j].vel.sub(diff);
+      }
+      // Damping + bounding
+      tokens[i].vel.multiplyScalar(0.992);
+      const dist = tokens[i].pos.length();
+      if(dist > 30) tokens[i].vel.add(tokens[i].pos.clone().negate().normalize().multiplyScalar(0.01));
+
+      tokens[i].pos.add(tokens[i].vel);
+      tokenMeshes[i].position.copy(tokens[i].pos);
+    }
+    // Update gravity lines
+    lines.forEach(({geo, i, j}) => {
+      const pts = new Float32Array([
+        tokens[i].pos.x, tokens[i].pos.y, tokens[i].pos.z,
+        tokens[j].pos.x, tokens[j].pos.y, tokens[j].pos.z
+      ]);
+      geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+    });
+
+    // Metrics
+    const totalKE = tokens.reduce((s,tk) => s + tk.vel.lengthSq() * tk.mass, 0);
+    updateMetrics('GRAVITY', totalKE*100, 0.618, 0.382, 0.607);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODE 1 — VORTEX FIELD
+// Information flows in rotational patterns (curl of attention).
+// A_vortex = A + λ × skew(A)   where skew(M) = (M - Mᵀ)/2
+// Creates "orbital" relationships: tokens orbit each other.
+// ─────────────────────────────────────────────────────────────────
+
+function buildVortex() {
+  document.getElementById('legend-content').innerHTML = `
+    <div class="leg"><div class="dot" style="background:#f0f"></div>High curl (vortex core)</div>
+    <div class="leg"><div class="dot" style="background:#0ff"></div>Low curl (laminar flow)</div>
+    <div class="leg"><div class="dot" style="background:#ff0"></div>Divergence source</div>
+    <div class="leg" style="color:#0ff8;margin-top:8px;line-height:1.5">Arrows = attention flow<br>direction + magnitude</div>
+  `;
+  document.getElementById('formula').innerHTML = `
+    <div style="color:#f0f;letter-spacing:2px;margin-bottom:6px">⟳ VORTEX ATTENTION</div>
+    <div class="eq">A = softmax(QKᵀ/√d)</div>
+    <div class="eq">A_skew = (A - Aᵀ)/2</div>
+    <div class="eq">A_v = A + λ·A_skew</div>
+    <div class="eq">curl = ∂F_y/∂x - ∂F_x/∂y</div>
+    <div style="margin-top:8px;color:#f0f6">Antisymmetric part adds<br>rotational flow component.<br>Tokens can "orbit" semantically.</div>
+  `;
+
+  // Animated vector field — 2D slice of 3D vortex
+  const N = 28;
+  const arrows = [];
+  const arrowGroup = new THREE.Group();
+  scene.add(arrowGroup); objs.push(arrowGroup);
+
+  // Create vortex centers
+  const centers = [
+    { pos: new THREE.Vector2(-10,  8), strength:  2.5, sign:  1 },
+    { pos: new THREE.Vector2( 10, -8), strength:  1.8, sign: -1 },
+    { pos: new THREE.Vector2(  0,  0), strength:  3.5, sign:  1 },
+    { pos: new THREE.Vector2(-8, -10), strength:  1.2, sign:  1 },
+    { pos: new THREE.Vector2( 12, 12), strength:  2.0, sign: -1 },
+  ];
+
+  function vortexField(x, y, time) {
+    let vx=0, vy=0;
+    centers.forEach(c => {
+      const dx = x - c.pos.x, dy = y - c.pos.y;
+      const r2 = dx*dx + dy*dy + 1;
+      // Biot-Savart: circular field around each center
+      const factor = c.strength * c.sign / r2;
+      vx += -dy * factor;
+      vy +=  dx * factor;
+      // Add slow drift
+      vx += Math.cos(c.pos.x*0.1 + time*0.3) * 0.1;
+      vy += Math.sin(c.pos.y*0.1 + time*0.3) * 0.1;
+    });
+    return { vx, vy };
+  }
+
+  // Arrow geometry (line + cone tip)
+  for(let ix=0; ix<N; ix++) {
+    for(let iy=0; iy<N; iy++) {
+      const x = (ix/N)*60 - 30;
+      const y = (iy/N)*60 - 30;
+      const { vx, vy } = vortexField(x, y, 0);
+      const speed = Math.sqrt(vx*vx+vy*vy);
+      const hue = speed*0.15;
+      const col = new THREE.Color().setHSL(hue, 1.0, 0.5);
+
+      const pts = [
+        new THREE.Vector3(x, y, 0),
+        new THREE.Vector3(x + vx*1.2, y + vy*1.2, 0)
+      ];
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({ color: col, transparent:true, opacity:0.7 });
+      const line = new THREE.Line(geo, mat);
+      arrowGroup.add(line);
+      arrows.push({ line, geo, x, y, mat });
+    }
+  }
+
+  // Curl heatmap (particles)
+  const curlParticles = [];
+  for(let i=0; i<300; i++) {
+    const x = rng(-30,30), y = rng(-30,30);
+    const geo = new THREE.SphereGeometry(0.2, 4, 4);
+    const mat = new THREE.MeshBasicMaterial({ color:0xff00ff, transparent:true, opacity:rng(0.3,0.9) });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, 0);
+    scene.add(m); objs.push(m);
+    curlParticles.push({ m, x, y, phase: rng(0,Math.PI*2) });
+  }
+
+  return function update(dt) {
+    t += dt;
+    arrows.forEach(({geo, mat, x, y}) => {
+      const { vx, vy } = vortexField(x, y, t);
+      const speed = Math.sqrt(vx*vx+vy*vy);
+      const pts = new Float32Array([
+        x, y, 0,
+        x + vx*1.2, y + vy*1.2, 0
+      ]);
+      geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+      const hue = clamp(speed*0.12, 0, 0.8);
+      mat.color.setHSL(hue, 1, 0.5);
+    });
+
+    // Advect particles along field
+    curlParticles.forEach(p => {
+      const { vx, vy } = vortexField(p.x, p.y, t);
+      p.x += vx * 0.05;
+      p.y += vy * 0.05;
+      if(Math.abs(p.x) > 32 || Math.abs(p.y) > 32) {
+        p.x = rng(-30,30); p.y = rng(-30,30);
+      }
+      p.m.position.set(p.x, p.y, Math.sin(t + p.phase)*0.5);
+      p.m.material.opacity = clamp(0.3 + Math.sin(t*2+p.phase)*0.3, 0.1, 0.9);
+    });
+
+    const curl = centers.reduce((s,c) => s + c.strength, 0);
+    updateMetrics('VORTEX', curl * 0.15, 0.382, 0.777, 0.233);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODE 2 — KAN BARRIER LANDSCAPE
+// Each KAN edge learns a function (B-spline) that creates barriers.
+// Double-well potential: f(x) = -x²/2 + x⁴/4
+// Signal either goes into one well or the other (binary decision).
+// Quantum tunneling probability: P ∝ e^(-2κd)
+// ─────────────────────────────────────────────────────────────────
+
+function buildKANBarrier() {
+  document.getElementById('legend-content').innerHTML = `
+    <div class="leg"><div class="dot" style="background:#0f4;box-shadow:0 0 6px #0f4"></div>Energy well (stable)</div>
+    <div class="leg"><div class="dot" style="background:#f40;box-shadow:0 0 6px #f40"></div>Barrier (energy peak)</div>
+    <div class="leg"><div class="dot" style="background:#ff0;box-shadow:0 0 6px #ff0"></div>Particle (signal)</div>
+    <div class="leg" style="color:#0ff8;margin-top:8px;line-height:1.5">Signal falls into wells.<br>Noise stays trapped.<br>Strong signal tunnels.</div>
+  `;
+  document.getElementById('formula').innerHTML = `
+    <div style="color:#0f8;letter-spacing:2px;margin-bottom:6px">⋯ KAN BARRIER</div>
+    <div class="eq">V(x) = -x²/2 + x⁴/4</div>
+    <div class="eq">F(x) = x - x³ (force)</div>
+    <div class="eq">P_tunnel = e^(-2κd)</div>
+    <div class="eq">κ = √(2m(V-E))/ħ</div>
+    <div style="margin-top:8px;color:#0f86">Minima at x=±1.<br>Barrier at x=0 (V=0).<br>Spline learns well depth.</div>
+  `;
+
+  // 3D surface: V(x,y) = double-well in x, flat in y (like a ridge)
+  const res = 60;
+  const geo = new THREE.PlaneGeometry(50, 50, res-1, res-1);
+  const pos = geo.attributes.position;
+  const colors = [];
+
+  for(let i=0; i<pos.count; i++) {
+    const x = pos.getX(i) / 5;  // normalize
+    const y = pos.getY(i) / 5;
+    // Double-well + ridge landscape
+    const V = -x*x/2 + x*x*x*x/4 + Math.sin(y)*0.3 + Math.cos(x*y*0.3)*0.2;
+    pos.setZ(i, V * 6);  // scale for visibility
+
+    // Color by potential: green=well, red=barrier, blue=saddle
+    const norm = clamp((V+0.8)/1.8, 0, 1);
+    const r = norm > 0.5 ? (norm-0.5)*2 : 0;
+    const g = 1 - Math.abs(norm-0.3)*3;
+    const b = norm < 0.3 ? (0.3-norm)*3 : 0;
+    colors.push(r, Math.max(0,g), Math.max(0,b));
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+  geo.computeVertexNormals();
+
+  const mat = new THREE.MeshPhongMaterial({
+    vertexColors:true, transparent:true, opacity:0.7,
+    side:THREE.DoubleSide, shininess:60,
+    wireframe:false
+  });
+  const surface = new THREE.Mesh(geo, mat);
+  surface.rotation.x = -Math.PI*0.4;
+  surface.position.y = -8;
+  scene.add(surface); objs.push(surface);
+
+  // Wireframe overlay
+  const wmat = new THREE.MeshBasicMaterial({ color:0x003322, wireframe:true, transparent:true, opacity:0.2 });
+  const wire = new THREE.Mesh(geo.clone(), wmat);
+  wire.rotation.copy(surface.rotation);
+  wire.position.copy(surface.position);
+  scene.add(wire); objs.push(wire);
+
+  // Lighting
+  const light = new THREE.DirectionalLight(0xffffff, 1.5);
+  light.position.set(20, 40, 20);
+  scene.add(light); objs.push(light);
+  const amb = new THREE.AmbientLight(0x002244, 1.0);
+  scene.add(amb); objs.push(amb);
+
+  // Particles (signals) rolling on the landscape
+  const particles = [];
+  for(let i=0; i<60; i++) {
+    const x0 = rng(-3.5, 3.5);
+    const y0 = rng(-3.5, 3.5);
+    const energy = rng(0, 1.5);  // particle energy
+    const col = energy > 0.8 ? 0xffff00 : (energy > 0.4 ? 0xff8800 : 0x00ff88);
+    const pmat = new THREE.MeshBasicMaterial({ color:col });
+    const pmesh = new THREE.Mesh(new THREE.SphereGeometry(0.25, 6, 6), pmat);
+    scene.add(pmesh); objs.push(pmesh);
+    particles.push({ x:x0, y:y0, vx:rng(-0.05,0.05), vy:rng(-0.05,0.05), energy, mesh:pmesh });
+  }
+
+  return function update(dt) {
+    t += dt;
+    surface.rotation.z = Math.sin(t*0.1)*0.05;
+    wire.rotation.copy(surface.rotation);
+
+    particles.forEach(p => {
+      // Force = -dV/dx = x - x³
+      const fx = p.x - p.x*p.x*p.x;
+      const fy = -Math.sin(p.y)*0.3;
+      p.vx += fx * 0.003;
+      p.vy += fy * 0.003;
+
+      // Tunneling: particles with high energy can cross barrier
+      const atBarrier = Math.abs(p.x) < 0.3;
+      const V_barrier = 0.25; // barrier height
+      if(atBarrier && p.energy > V_barrier) {
+        p.vx += (Math.random() > 0.5 ? 1 : -1) * 0.1 * p.energy;
+      }
+
+      p.vx *= 0.96; p.vy *= 0.96;
+      p.x += p.vx; p.y += p.vy;
+
+      // Bounding
+      if(Math.abs(p.x) > 4) { p.x = Math.sign(p.x)*3.9; p.vx *= -0.5; }
+      if(Math.abs(p.y) > 4) { p.y = Math.sign(p.y)*3.9; p.vy *= -0.5; }
+
+      const V = -p.x*p.x/2 + p.x*p.x*p.x*p.x/4;
+      // Project to surface position
+      const sx = p.x * 6.25;
+      const sy = p.y * 6.25;
+      const sz = V * 6 + 0.5;
+      // Transform from surface local to world
+      const angle = surface.rotation.x;
+      const wy = sy * Math.cos(angle) - sz * Math.sin(angle) + surface.position.y;
+      const wz = sy * Math.sin(angle) + sz * Math.cos(angle);
+      p.mesh.position.set(sx, wy, wz);
+    });
+
+    const alive = particles.filter(p => Math.abs(p.x) > 0.5).length / particles.length;
+    updateMetrics('KAN BARRIER', 0.618, 0.42, 0.58, alive);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODE 3 — KURAMOTO RESONANCE
+// Neurons as oscillators. Knowledge = synchronization.
+// dφ_i/dt = ω_i + K/N × Σ sin(φ_j - φ_i)
+// When phases align → coherence → output collapses (token chosen)
+// ─────────────────────────────────────────────────────────────────
+
+function buildResonance() {
+  document.getElementById('legend-content').innerHTML = `
+    <div class="leg"><div class="dot" style="background:#f80;box-shadow:0 0 8px #f80"></div>Natural frequency ω_i</div>
+    <div class="leg"><div class="dot" style="background:#0ff;box-shadow:0 0 8px #0ff"></div>Phase φ_i (current)</div>
+    <div class="leg"><div class="dot" style="background:#f0f;box-shadow:0 0 8px #f0f"></div>Synchronized cluster</div>
+    <div class="leg" style="color:#0ff8;margin-top:8px;line-height:1.5">All phases align =<br>token decision made.<br>No matrix multiply!</div>
+  `;
+  document.getElementById('formula').innerHTML = `
+    <div style="color:#fa0;letter-spacing:2px;margin-bottom:6px">◎ KURAMOTO</div>
+    <div class="eq">dφ/dt = ω + K/N Σ sin(φⱼ-φᵢ)</div>
+    <div class="eq">r = |1/N Σ e^(iφⱼ)|</div>
+    <div class="eq">r=0: chaos  r=1: sync</div>
+    <div class="eq">Δω = η·sin(φ_true - φ)</div>
+    <div style="margin-top:8px;color:#fa06">r = order parameter<br>Sync replaces softmax.<br>Learn by phase nudge.</div>
+  `;
+
+  const N = 96;
+  const K = 2.5;  // coupling strength
+  const radius = 22;
+
+  const phases = Array.from({length:N}, () => rng(0, Math.PI*2));
+  const freqs  = Array.from({length:N}, () => rng(0.3, 2.5));
+  const meshes = [];
+
+  // Arrange oscillators in a circle
+  for(let i=0; i<N; i++) {
+    const a = (i/N)*Math.PI*2;
+    const x = Math.cos(a)*radius;
+    const y = Math.sin(a)*radius;
+
+    const col = new THREE.Color().setHSL(freqs[i]/3, 1.0, 0.6);
+    const mat = new THREE.MeshBasicMaterial({ color:col });
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.5, 8, 8), mat);
+    m.position.set(x, y, 0);
+    scene.add(m); objs.push(m);
+
+    // Phase indicator (small line pointing outward in phase direction)
+    const linePts = [new THREE.Vector3(0,0,0), new THREE.Vector3(2.5,0,0)];
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(linePts);
+    const lineMat = new THREE.LineBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.8 });
+    const indicator = new THREE.Line(lineGeo, lineMat);
+    m.add(indicator);
+
+    meshes.push({ m, indicator, a, lineGeo });
+  }
+
+  // Order parameter indicator (center arrow)
+  const orderGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,0,0), new THREE.Vector3(10,0,0)
+  ]);
+  const orderMat = new THREE.LineBasicMaterial({ color:0xff00ff, transparent:true, opacity:0.9 });
+  const orderArrow = new THREE.Line(orderGeo, orderMat);
+  scene.add(orderArrow); objs.push(orderArrow);
+
+  // Ring
+  const ringPts = [];
+  for(let i=0; i<=128; i++) {
+    const a = (i/128)*Math.PI*2;
+    ringPts.push(new THREE.Vector3(Math.cos(a)*radius, Math.sin(a)*radius, 0));
+  }
+  const ringGeo = new THREE.BufferGeometry().setFromPoints(ringPts);
+  const ring = new THREE.Line(ringGeo, new THREE.LineBasicMaterial({ color:0x003344, transparent:true, opacity:0.6 }));
+  scene.add(ring); objs.push(ring);
+
+  // Sync lines (between synchronized nodes)
+  const syncLines = [];
+  for(let i=0; i<20; i++) {
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]);
+    const mat = new THREE.LineBasicMaterial({ color:0xff00ff, transparent:true, opacity:0 });
+    const line = new THREE.Line(geo, mat);
+    scene.add(line); objs.push(line);
+    syncLines.push({ line, geo, mat });
+  }
+
+  return function update(dt) {
+    t += dt;
+    const h = dt * 0.5;
+
+    // Kuramoto update
+    const newPhases = phases.slice();
+    for(let i=0; i<N; i++) {
+      let coupling = 0;
+      for(let j=0; j<N; j++) {
+        coupling += Math.sin(phases[j] - phases[i]);
+      }
+      newPhases[i] = phases[i] + h * (freqs[i] + K/N * coupling);
+    }
+    for(let i=0; i<N; i++) phases[i] = newPhases[i];
+
+    // Order parameter r = |mean(exp(i*phi))|
+    let re=0, im=0;
+    phases.forEach(p => { re += Math.cos(p); im += Math.sin(p); });
+    re/=N; im/=N;
+    const r = Math.sqrt(re*re+im*im);
+    const meanPhase = Math.atan2(im, re);
+
+    // Update node positions and colors
+    meshes.forEach(({m, indicator, lineGeo, a}, i) => {
+      const phi = phases[i];
+      const synced = Math.abs(Math.sin(phi - meanPhase)) < 0.3;
+      const hue = synced ? 0.8 : freqs[i]/3;  // purple if synced
+      m.material.color.setHSL(hue, 1.0, synced ? 0.7 : 0.5);
+
+      // Phase indicator direction
+      indicator.rotation.z = phi;
+      const pts = new Float32Array([
+        0, 0, 0,
+        Math.cos(phi)*2.5, Math.sin(phi)*2.5, 0
+      ]);
+      lineGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+
+      // Node position: perturb slightly based on phase
+      const baseA = (i/N)*Math.PI*2;
+      const pRadius = radius + Math.sin(phi - meanPhase)*1.5;
+      m.position.set(Math.cos(baseA)*pRadius, Math.sin(baseA)*pRadius, Math.sin(t+i*0.3)*0.5);
+    });
+
+    // Order parameter arrow
+    const pts = new Float32Array([0,0,0, re*20, im*20, 0]);
+    orderGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+    orderMat.color.setHSL(0.8+r*0.2, 1, 0.5);
+
+    // Sync lines between pairs
+    let si=0;
+    for(let i=0; i<N && si<syncLines.length; i++) {
+      if(Math.abs(Math.sin(phases[i]-meanPhase)) < 0.15) {
+        for(let j=i+1; j<N && si<syncLines.length; j++) {
+          if(Math.abs(Math.sin(phases[j]-meanPhase)) < 0.15 && Math.random()<0.05) {
+            const pi = meshes[i].m.position, pj = meshes[j].m.position;
+            const pts = new Float32Array([pi.x,pi.y,pi.z, pj.x,pj.y,pj.z]);
+            syncLines[si].geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+            syncLines[si].mat.opacity = r * 0.4;
+            si++;
+          }
+        }
+      }
+    }
+    for(; si<syncLines.length; si++) syncLines[si].mat.opacity = 0;
+
+    updateMetrics('RESONANCE', freqs.reduce((a,b)=>a+b,0)/N/3, r, 1-r, N*r/N);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────────────────────────
+
+let updateFn = null;
+const modes = ['GRAVITY','VORTEX','KAN BARRIER','RESONANCE'];
+const builders = [buildGravity, buildVortex, buildKANBarrier, buildResonance];
+
+function setMode(m) {
+  mode = m;
+  clearScene();
+  t = 0;
+  document.querySelectorAll('.tab').forEach((el,i) => el.classList.toggle('active', i===m));
+  updateFn = builders[m]();
+}
+
+function updateMetrics(modeName, energy, coherence, entropy, alive) {
+  document.getElementById('m-mode').textContent = modeName;
+  document.getElementById('m-energy').textContent = (energy*1).toFixed(3);
+  document.getElementById('b-energy').style.width = clamp(energy*100,0,100)+'%';
+  document.getElementById('m-coherence').textContent = coherence.toFixed(3);
+  document.getElementById('b-coherence').style.width = clamp(coherence*100,0,100)+'%';
+  document.getElementById('m-entropy').textContent = entropy.toFixed(3);
+  document.getElementById('b-entropy').style.width = clamp(entropy*100,0,100)+'%';
+  document.getElementById('m-alive').textContent = (alive*100).toFixed(1)+'%';
+  document.getElementById('b-alive').style.width = clamp(alive*100,0,100)+'%';
+}
+
+let lastTime = performance.now(), frames=0, fps=0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min((now-lastTime)/1000, 0.05);
+  lastTime = now;
+  frames++;
+  if(frames%30===0) {
+    fps = Math.round(1/dt);
+    document.getElementById('m-fps').textContent = fps;
+  }
+
+  // Auto-orbit camera
+  camTheta += 0.003;
+  camera.position.x = camR * Math.cos(camPhi) * Math.cos(camTheta);
+  camera.position.z = camR * Math.cos(camPhi) * Math.sin(camTheta);
+  camera.position.y = camR * Math.sin(camPhi);
+  camera.lookAt(0, 0, 0);
+
+  if(updateFn) updateFn(dt);
+  renderer.render(scene, camera);
+}
+
+// Start
+setMode(0);
+animate();
+
+// Auto-cycle modes every 18 seconds for demo
+let autoMode = 0;
+setInterval(() => { autoMode = (autoMode+1)%4; setMode(autoMode); }, 18000);
+</script>
+</body>
+</html>

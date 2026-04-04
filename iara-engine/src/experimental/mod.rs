@@ -26,3 +26,4 @@ pub mod pipeline;
 pub mod prompt;
 pub mod proprioception;
 pub mod simulation;
+pub mod iara_physics;

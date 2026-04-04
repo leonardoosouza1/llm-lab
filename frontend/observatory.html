@@ -1,2065 +1,602 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IARA Observatory — Real-time LLM Telemetry</title>
-
-    <!-- Vue 3 -->
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <!-- D3 v7 -->
-    <script src="https://d3js.org/d3.v7.min.js"></script>
-    <!-- Chart.js 4 -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        :root {
-            --bg-primary: #0a0e1a;
-            --bg-secondary: rgba(255, 255, 255, 0.03);
-            --border-color: rgba(255, 255, 255, 0.06);
-            --text-primary: #e8e8e8;
-            --text-secondary: #a0a0a0;
-            --accent-cyan: #00ffc8;
-            --accent-purple: #a855f7;
-            --accent-amber: #fbbf24;
-            --accent-red: #ef4444;
-            --accent-blue: #3b82f6;
-        }
-
-        body {
-            font-family: "JetBrains Mono", "Courier New", monospace;
-            background-color: var(--bg-primary);
-            color: var(--text-primary);
-            padding: 12px;
-            overflow-x: hidden;
-        }
-
-        #app {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            grid-template-rows: auto auto auto auto auto;
-            gap: 12px;
-            min-height: 100vh;
-        }
-
-        .panel {
-            background-color: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 12px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .panel-title {
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: var(--accent-cyan);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 8px;
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        /* Header */
-        .header {
-            grid-column: 1 / -1;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background-color: rgba(0, 255, 200, 0.05);
-            border: 1px solid rgba(0, 255, 200, 0.1);
-            border-radius: 6px;
-            padding: 12px 16px;
-            margin-bottom: 4px;
-        }
-
-        .header-left {
-            display: flex;
-            gap: 16px;
-            align-items: center;
-        }
-
-        .header-title {
-            font-size: 1.2rem;
-            font-weight: 700;
-            color: var(--accent-cyan);
-            letter-spacing: 1px;
-        }
-
-        .header-controls {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .header-controls select,
-        .header-controls button {
-            background-color: rgba(255, 255, 255, 0.08);
-            border: 1px solid var(--border-color);
-            color: var(--text-primary);
-            padding: 6px 10px;
-            border-radius: 4px;
-            font-family: inherit;
-            cursor: pointer;
-            font-size: 0.75rem;
-        }
-
-        .header-controls button:hover {
-            background-color: rgba(0, 255, 200, 0.15);
-            border-color: var(--accent-cyan);
-        }
-
-        .header-status {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-            font-size: 0.75rem;
-            color: var(--text-secondary);
-        }
-
-        .status-dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 4px;
-        }
-
-        .status-dot.connected {
-            background-color: var(--accent-cyan);
-            box-shadow: 0 0 8px var(--accent-cyan);
-        }
-
-        .status-dot.disconnected {
-            background-color: var(--accent-red);
-        }
-
-        .vram-bar {
-            width: 120px;
-            height: 4px;
-            background-color: rgba(0, 0, 0, 0.3);
-            border-radius: 2px;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .vram-bar-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
-            transition: width 0.3s ease;
-        }
-
-        /* Prompt/Response */
-        .prompt-response {
-            grid-column: 1 / 2;
-            grid-row: 2 / 4;
-        }
-
-        .prompt-section {
-            margin-bottom: 12px;
-        }
-
-        .prompt-section textarea {
-            width: 100%;
-            height: 80px;
-            background-color: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            color: var(--text-primary);
-            padding: 8px;
-            font-family: inherit;
-            font-size: 0.85rem;
-            resize: none;
-        }
-
-        .prompt-section textarea:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-            background-color: rgba(0, 255, 200, 0.05);
-        }
-
-        .controls-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-bottom: 8px;
-        }
-
-        .control-input {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-
-        .control-input label {
-            font-size: 0.7rem;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .control-input input {
-            background-color: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            color: var(--text-primary);
-            padding: 6px;
-            font-family: inherit;
-            font-size: 0.85rem;
-        }
-
-        .control-input input:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-        }
-
-        .gen-button {
-            width: 100%;
-            padding: 10px;
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
-            border: none;
-            border-radius: 4px;
-            color: var(--bg-primary);
-            font-weight: 700;
-            font-family: inherit;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-
-        .gen-button:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 16px rgba(0, 255, 200, 0.3);
-        }
-
-        .gen-button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .response-section {
-            flex: 1;
-            overflow-y: auto;
-            background-color: rgba(0, 0, 0, 0.2);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 8px;
-            line-height: 1.5;
-            font-size: 0.9rem;
-            min-height: 150px;
-        }
-
-        .response-section::-webkit-scrollbar {
-            width: 6px;
-        }
-
-        .response-section::-webkit-scrollbar-track {
-            background: rgba(0, 0, 0, 0.1);
-        }
-
-        .response-section::-webkit-scrollbar-thumb {
-            background: rgba(0, 255, 200, 0.3);
-            border-radius: 3px;
-        }
-
-        .response-section::-webkit-scrollbar-thumb:hover {
-            background: rgba(0, 255, 200, 0.5);
-        }
-
-        .response-stats {
-            font-size: 0.7rem;
-            color: var(--text-secondary);
-            margin-top: 8px;
-        }
-
-        /* Layer Heatmap */
-        .layer-heatmap {
-            grid-column: 2 / 3;
-            grid-row: 2 / 3;
-        }
-
-        .heatmap-grid {
-            display: grid;
-            grid-template-columns: repeat(7, 1fr);
-            gap: 4px;
-            flex: 1;
-        }
-
-        .heatmap-cell {
-            aspect-ratio: 1;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.65rem;
-            font-weight: 600;
-            cursor: pointer;
-            border: 1px solid rgba(0, 0, 0, 0.3);
-            transition: all 0.2s;
-            position: relative;
-        }
-
-        .heatmap-cell:hover {
-            transform: scale(1.05);
-            border-color: var(--accent-cyan);
-        }
-
-        .heatmap-tooltip {
-            position: absolute;
-            bottom: 120%;
-            left: 50%;
-            transform: translateX(-50%);
-            background-color: rgba(0, 0, 0, 0.8);
-            padding: 6px 8px;
-            border-radius: 4px;
-            font-size: 0.65rem;
-            white-space: nowrap;
-            pointer-events: none;
-            opacity: 0;
-            transition: opacity 0.2s;
-            z-index: 10;
-            border: 1px solid var(--border-color);
-        }
-
-        .heatmap-cell:hover .heatmap-tooltip {
-            opacity: 1;
-        }
-
-        /* Top Tokens */
-        .top-tokens {
-            grid-column: 3 / 4;
-            grid-row: 2 / 3;
-        }
-
-        .token-bar {
-            display: flex;
-            gap: 6px;
-            margin-bottom: 8px;
-            align-items: center;
-            font-size: 0.75rem;
-        }
-
-        .token-label {
-            width: 100px;
-            text-align: right;
-            color: var(--text-secondary);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .token-bar-fill {
-            height: 20px;
-            background: linear-gradient(90deg, rgba(168, 85, 247, 0.3), var(--accent-purple));
-            border-radius: 3px;
-            min-width: 2px;
-            flex: 1;
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            padding-right: 4px;
-            color: var(--text-secondary);
-            font-size: 0.65rem;
-        }
-
-        /* Token Stream */
-        .token-stream {
-            grid-column: 3 / 4;
-            grid-row: 3 / 4;
-        }
-
-        .stream-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.7rem;
-        }
-
-        .stream-table thead {
-            position: sticky;
-            top: 0;
-            background-color: rgba(0, 255, 200, 0.08);
-        }
-
-        .stream-table th {
-            padding: 6px 4px;
-            text-align: left;
-            color: var(--accent-cyan);
-            border-bottom: 1px solid var(--border-color);
-            font-weight: 600;
-        }
-
-        .stream-table td {
-            padding: 4px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.02);
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .stream-table tbody {
-            display: block;
-            max-height: 300px;
-            overflow-y: auto;
-        }
-
-        .stream-table tbody::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .stream-table tbody::-webkit-scrollbar-thumb {
-            background: rgba(0, 255, 200, 0.3);
-            border-radius: 2px;
-        }
-
-        .stream-table thead {
-            display: table;
-            width: 100%;
-            table-layout: fixed;
-        }
-
-        .stream-table tbody tr {
-            display: table;
-            width: 100%;
-            table-layout: fixed;
-        }
-
-        .token-id-cell {
-            color: var(--accent-cyan);
-            font-weight: 600;
-        }
-
-        .token-text-cell {
-            color: var(--accent-amber);
-        }
-
-        /* ESN Observer */
-        .esn-observer {
-            grid-column: 1 / 2;
-            grid-row: 4 / 6;
-        }
-
-        .metric-display {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-
-        .metric-box {
-            background-color: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 8px;
-            text-align: center;
-        }
-
-        .metric-label {
-            font-size: 0.65rem;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            margin-bottom: 4px;
-        }
-
-        .metric-value {
-            font-size: 1rem;
-            font-weight: 700;
-            color: var(--accent-cyan);
-        }
-
-        .sparkline-container {
-            display: flex;
-            gap: 8px;
-            margin-top: 8px;
-        }
-
-        .sparkline {
-            flex: 1;
-            height: 40px;
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            background-color: rgba(0, 0, 0, 0.2);
-        }
-
-        /* Energy Timeline */
-        .energy-timeline {
-            grid-column: 2 / 4;
-            grid-row: 4 / 5;
-        }
-
-        #energyChart {
-            max-height: 200px;
-        }
-
-        /* Layer Bars */
-        .layer-bars {
-            grid-column: 2 / 3;
-            grid-row: 5 / 6;
-        }
-
-        .layer-bar-list {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            overflow-y: auto;
-            max-height: 100%;
-        }
-
-        .layer-bar-list::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .layer-bar-list::-webkit-scrollbar-thumb {
-            background: rgba(0, 255, 200, 0.3);
-            border-radius: 2px;
-        }
-
-        .layer-row {
-            display: flex;
-            gap: 6px;
-            align-items: center;
-            padding: 4px;
-            background-color: rgba(0, 0, 0, 0.2);
-            border-radius: 3px;
-            font-size: 0.7rem;
-        }
-
-        .layer-idx-badge {
-            width: 24px;
-            height: 24px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, var(--accent-purple), var(--accent-cyan));
-            border-radius: 3px;
-            font-weight: 700;
-            color: var(--bg-primary);
-            flex-shrink: 0;
-        }
-
-        .bar-group {
-            display: flex;
-            gap: 8px;
-            flex: 1;
-            align-items: center;
-        }
-
-        .bar-component {
-            display: flex;
-            flex-direction: column;
-            flex: 1;
-        }
-
-        .bar-label {
-            font-size: 0.65rem;
-            color: var(--text-secondary);
-            margin-bottom: 2px;
-        }
-
-        .bar {
-            height: 12px;
-            border-radius: 2px;
-            background: linear-gradient(90deg, rgba(0, 255, 200, 0.2), var(--accent-cyan));
-        }
-
-        .bar.mlp {
-            background: linear-gradient(90deg, rgba(168, 85, 247, 0.2), var(--accent-purple));
-        }
-
-        .hot-dots {
-            display: flex;
-            gap: 2px;
-            align-items: center;
-        }
-
-        .hot-dot {
-            width: 4px;
-            height: 4px;
-            border-radius: 50%;
-            background-color: var(--accent-red);
-        }
-
-        /* D3 Force Graph */
-        .force-graph {
-            grid-column: 3 / 4;
-            grid-row: 5 / 6;
-        }
-
-        #forceGraphSvg {
-            width: 100%;
-            height: 100%;
-            border-radius: 4px;
-            background-color: rgba(0, 0, 0, 0.2);
-        }
-
-        .node-circle {
-            cursor: grab;
-            stroke: rgba(255, 255, 255, 0.1);
-            stroke-width: 1.5px;
-        }
-
-        .node-circle:hover {
-            stroke: var(--accent-cyan);
-            stroke-width: 2px;
-        }
-
-        .node-label {
-            font-size: 0.6rem;
-            text-anchor: middle;
-            pointer-events: none;
-            fill: var(--text-primary);
-        }
-
-        .link {
-            stroke: rgba(255, 255, 255, 0.1);
-            stroke-width: 1px;
-        }
-
-        /* Console Log */
-        .console-log {
-            grid-column: 1 / 2;
-            grid-row: 2 / 4;
-        }
-
-        .log-entries {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            overflow-y: auto;
-            font-size: 0.7rem;
-            max-height: 100%;
-        }
-
-        .log-entries::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .log-entries::-webkit-scrollbar-thumb {
-            background: rgba(0, 255, 200, 0.3);
-            border-radius: 2px;
-        }
-
-        .log-entry {
-            padding: 4px 6px;
-            background-color: rgba(0, 0, 0, 0.2);
-            border-left: 2px solid var(--accent-cyan);
-            border-radius: 2px;
-            cursor: pointer;
-            transition: background-color 0.2s;
-            word-break: break-all;
-        }
-
-        .log-entry:hover {
-            background-color: rgba(0, 0, 0, 0.4);
-        }
-
-        .log-timestamp {
-            color: var(--text-secondary);
-            margin-right: 4px;
-        }
-
-        .log-badge {
-            display: inline-block;
-            padding: 2px 4px;
-            border-radius: 2px;
-            font-weight: 600;
-            margin-right: 4px;
-            font-size: 0.65rem;
-        }
-
-        .log-badge.layer {
-            background-color: rgba(0, 255, 200, 0.2);
-            color: var(--accent-cyan);
-        }
-
-        .log-badge.result {
-            background-color: rgba(168, 85, 247, 0.2);
-            color: var(--accent-purple);
-        }
-
-        .log-badge.esn {
-            background-color: rgba(251, 191, 36, 0.2);
-            color: var(--accent-amber);
-        }
-
-        .log-badge.gravity {
-            background-color: rgba(59, 130, 246, 0.2);
-            color: var(--accent-blue);
-        }
-
-        .log-badge.cfc {
-            background-color: rgba(239, 68, 68, 0.2);
-            color: var(--accent-red);
-        }
-
-        .log-badge.status {
-            background-color: rgba(255, 255, 255, 0.1);
-            color: var(--text-secondary);
-        }
-
-        .log-content {
-            color: var(--text-secondary);
-        }
-
-        /* Training Panel */
-        .training-panel {
-            opacity: 0.5;
-            transition: opacity 0.4s ease;
-            border: 1px solid rgba(168, 85, 247, 0.2);
-        }
-        .training-panel.active {
-            opacity: 1;
-            border-color: rgba(168, 85, 247, 0.5);
-            box-shadow: 0 0 20px rgba(168, 85, 247, 0.1);
-        }
-
-        /* Gravity/CfC Panels */
-        .gravity-panel,
-        .cfc-panel {
-            display: none;
-            grid-column: 2 / 3;
-            grid-row: 5 / 6;
-        }
-
-        .gravity-panel.active,
-        .cfc-panel.active {
-            display: flex;
-        }
-
-        .metric-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
-        }
-
-        /* Status Bar */
-        .status-bar {
-            grid-column: 1 / -1;
-            display: flex;
-            justify-content: space-between;
-            background-color: rgba(255, 255, 255, 0.02);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 8px 12px;
-            font-size: 0.7rem;
-            color: var(--text-secondary);
-        }
-
-        .status-item {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        /* Responsive */
-        @media (max-width: 1600px) {
-            #app {
-                grid-template-columns: 1fr 1fr;
-            }
-
-            .prompt-response {
-                grid-column: 1 / 3;
-            }
-
-            .layer-heatmap {
-                grid-column: 1 / 2;
-            }
-
-            .top-tokens {
-                grid-column: 2 / 3;
-            }
-
-            .token-stream {
-                grid-column: 1 / 3;
-            }
-
-            .console-log {
-                grid-column: 1 / 3;
-            }
-
-            .energy-timeline {
-                grid-column: 1 / 3;
-            }
-
-            .layer-bars {
-                grid-column: 1 / 2;
-            }
-
-            .force-graph {
-                grid-column: 2 / 3;
-            }
-
-            .esn-observer {
-                grid-column: 1 / 3;
-            }
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IARA Observatory</title>
+
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: #050510;
+      color: #e0e8ff;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+    }
+
+    #root {
+      width: 100%;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    .hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 18px;
+      border-bottom: 1px solid #1a2040;
+      background: rgba(5,5,20,0.97);
+      flex-shrink: 0;
+      height: 46px;
+    }
+    .hdr-title { font-size: 1rem; font-weight: bold; color: #7eb8ff; letter-spacing: 2px; }
+    .hdr-title span { color: #ff7eb8; }
+    .mode-tabs { display: flex; gap: 6px; }
+    .tab {
+      padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.68rem;
+      border: 1px solid #2a3060; background: transparent; color: #8898cc;
+      transition: all 0.2s; font-family: inherit; letter-spacing: 1px; text-transform: uppercase;
+    }
+    .tab:hover { border-color: #4a60c0; color: #b0c0ff; }
+    .tab.active { background: #1a2880; border-color: #5070e0; color: #c0d0ff; }
+
+    /* ── Canvas wrap — fills ALL remaining height ── */
+    .canvas-wrap {
+      position: relative;
+      flex: 1 1 0;        /* take remaining space */
+      min-height: 0;      /* critical: lets flex child shrink below content size */
+      overflow: hidden;
+    }
+
+    /* Canvas fills its parent absolutely */
+    .canvas-wrap canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* ── Overlay panels ── */
+    .overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .formula-box {
+      position: absolute;
+      top: 14px; left: 14px;
+      background: rgba(5,10,30,0.88);
+      border: 1px solid #1e2d60;
+      border-radius: 6px;
+      padding: 11px 15px;
+      max-width: 320px;
+      font-size: 0.69rem;
+      line-height: 1.75;
+    }
+    .formula-box h3 { color: #7eb8ff; margin-bottom: 7px; font-size: 0.77rem; letter-spacing: 1px; }
+    .formula-box code { color: #ffd07e; font-size: 0.67rem; }
+    .formula-box p { color: #7888aa; margin-top: 5px; }
+
+    .metrics-col {
+      position: absolute;
+      top: 14px; right: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      min-width: 190px;
+    }
+    .metric-card {
+      background: rgba(5,10,30,0.88);
+      border: 1px solid #1e2d60;
+      border-radius: 6px;
+      padding: 7px 11px;
+    }
+    .metric-label { font-size: 0.6rem; color: #5060a0; text-transform: uppercase; letter-spacing: 1px; }
+    .metric-value { font-size: 1.05rem; color: #7eb8ff; font-weight: bold; }
+    .metric-bar-bg { height: 3px; background: #1a2040; border-radius: 2px; margin-top: 4px; }
+    .metric-bar-fill { height: 100%; border-radius: 2px; transition: width 0.35s; }
+
+    .cycle-hud {
+      position: absolute;
+      bottom: 14px; right: 14px;
+      font-size: 0.62rem;
+      color: #3a4a70;
+    }
+    .cycle-bar-bg { height: 2px; background: #1a2040; border-radius: 1px; margin-top: 4px; overflow: hidden; }
+    .cycle-bar-fill { height: 100%; background: #3a6aff; transition: width 0.5s linear; }
+  </style>
 </head>
 <body>
-    <div id="app">
-        <!-- Header -->
-        <div class="header">
-            <div class="header-left">
-                <div class="header-title">🧬 IARA OBSERVATORY</div>
-                <div class="header-controls">
-                    <select v-model="selectedModel">
-                        <option value="">Loading models...</option>
-                        <option v-for="model in models" :key="model.name" :value="model.name">
-                            {{ model.name }}
-                        </option>
-                    </select>
-                    <button @click="loadModel" :disabled="!selectedModel || isLoading">
-                        Load
-                    </button>
-                </div>
-            </div>
-            <div class="header-status">
-                <div>
-                    <span class="status-dot" :class="{ connected: wsConnected, disconnected: !wsConnected }"></span>
-                    WS: {{ wsConnected ? 'Connected' : 'Disconnected' }}
-                </div>
-                <div>
-                    <span class="status-dot connected"></span>
-                    HTTP: Ready
-                </div>
-                <div>
-                    VRAM:
-                    <div class="vram-bar">
-                        <div class="vram-bar-fill" :style="{ width: vramPercent + '%' }"></div>
-                    </div>
-                </div>
-            </div>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const MODES = ['GRAVITY', 'VORTEX', 'KAN BARRIER', 'RESONANCE'];
+const CYCLE_MS = 20000;
+
+// ── Physics helpers ───────────────────────────────────────────────────────────
+function doubleWell(x) { return x - x * x * x; }
+function vortexCurl(x, y, t) {
+  const r = Math.sqrt(x * x + y * y) + 0.001;
+  const theta = Math.atan2(y, x) + t * 0.35;
+  return [-Math.sin(theta) / r, Math.cos(theta) / r];
+}
+
+// ── Hook: Three.js — uses ResizeObserver on the parent div ───────────────────
+function useThreeScene(wrapRef) {
+  const canvasRef    = useRef(null);
+  const sceneRef     = useRef(null);
+  const cameraRef    = useRef(null);
+  const rendererRef  = useRef(null);
+
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+
+    // Create canvas and append to wrapper
+    const canvas = document.createElement('canvas');
+    wrap.appendChild(canvas);
+    canvasRef.current = canvas;
+
+    const w = wrap.clientWidth  || window.innerWidth;
+    const h = wrap.clientHeight || (window.innerHeight - 46);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(w, h);
+    renderer.setClearColor(0x050510, 1);
+
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 2000);
+    camera.position.set(0, 0, 80);
+
+    scene.add(new THREE.AmbientLight(0x223366, 2));
+    const pt = new THREE.PointLight(0x4488ff, 3, 300);
+    pt.position.set(0, 50, 50);
+    scene.add(pt);
+
+    sceneRef.current   = scene;
+    cameraRef.current  = camera;
+    rendererRef.current = renderer;
+
+    // ResizeObserver — more reliable than window resize inside an iframe
+    const ro = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width && height) {
+          renderer.setSize(width, height);
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        }
+      }
+    });
+    ro.observe(wrap);
+
+    // Orbital drag
+    let isDragging = false, lastX = 0, lastY = 0;
+    let theta = 0, phi = Math.PI / 2, radius = 80;
+    const updateCam = () => {
+      camera.position.set(
+        radius * Math.sin(phi) * Math.sin(theta),
+        radius * Math.cos(phi),
+        radius * Math.sin(phi) * Math.cos(theta)
+      );
+      camera.lookAt(0, 0, 0);
+    };
+    canvas.addEventListener('mousedown', e => { isDragging = true; lastX = e.clientX; lastY = e.clientY; });
+    window.addEventListener('mouseup',   () => { isDragging = false; });
+    window.addEventListener('mousemove', e => {
+      if (!isDragging) return;
+      theta -= (e.clientX - lastX) * 0.008;
+      phi    = Math.max(0.1, Math.min(Math.PI - 0.1, phi - (e.clientY - lastY) * 0.008));
+      lastX = e.clientX; lastY = e.clientY;
+      updateCam();
+    });
+    canvas.addEventListener('wheel', e => {
+      radius = Math.max(20, Math.min(200, radius + e.deltaY * 0.08));
+      updateCam();
+    }, { passive: true });
+
+    return () => {
+      ro.disconnect();
+      renderer.dispose();
+      if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+    };
+  }, []);
+
+  return { canvasRef, sceneRef, cameraRef, rendererRef };
+}
+
+// ── N-body gravity ────────────────────────────────────────────────────────────
+function useGravityBodies(N = 26) {
+  const bodiesRef = useRef([]);
+  useEffect(() => {
+    bodiesRef.current = Array.from({ length: N }, (_, i) => {
+      const a = (i / N) * Math.PI * 2;
+      const r = 10 + Math.random() * 25;
+      return {
+        x: r * Math.cos(a), y: r * Math.sin(a), z: (Math.random() - 0.5) * 10,
+        vx: -Math.sin(a) * 2, vy: Math.cos(a) * 2, vz: 0,
+        mass: 0.5 + Math.random() * 3,
+      };
+    });
+  }, [N]);
+
+  const step = useCallback((dt = 0.016) => {
+    const G = 80, eps = 4;
+    const b = bodiesRef.current;
+    for (let i = 0; i < b.length; i++) {
+      let fx = 0, fy = 0, fz = 0;
+      for (let j = 0; j < b.length; j++) {
+        if (i === j) continue;
+        const dx = b[j].x - b[i].x, dy = b[j].y - b[i].y, dz = b[j].z - b[i].z;
+        const r2 = dx*dx + dy*dy + dz*dz + eps;
+        const f  = G * b[j].mass / (r2 * Math.sqrt(r2));
+        fx += f * dx; fy += f * dy; fz += f * dz;
+      }
+      b[i].vx += fx * dt; b[i].vy += fy * dt; b[i].vz += fz * dt;
+    }
+    for (const bd of b) {
+      bd.x += bd.vx * dt; bd.y += bd.vy * dt; bd.z += bd.vz * dt;
+      const r = Math.sqrt(bd.x**2 + bd.y**2 + bd.z**2);
+      if (r > 50) { bd.vx *= 0.96; bd.vy *= 0.96; bd.vz *= 0.96; }
+    }
+    return b;
+  }, []);
+
+  return { bodiesRef, step };
+}
+
+// ── Kuramoto ──────────────────────────────────────────────────────────────────
+function useKuramoto(N = 36) {
+  const stateRef = useRef({ phases: [], freqs: [] });
+  useEffect(() => {
+    stateRef.current.phases = Array.from({ length: N }, () => Math.random() * Math.PI * 2);
+    stateRef.current.freqs  = Array.from({ length: N }, () => (Math.random() - 0.5) * 2);
+  }, [N]);
+
+  const step = useCallback((K = 2.5, dt = 0.05) => {
+    const { phases, freqs } = stateRef.current;
+    const n = phases.length;
+    const dphis = phases.map((phi, i) => {
+      let c = 0;
+      for (let j = 0; j < n; j++) c += Math.sin(phases[j] - phi);
+      return freqs[i] + (K / n) * c;
+    });
+    for (let i = 0; i < n; i++) phases[i] += dphis[i] * dt;
+    let re = 0, im = 0;
+    for (const p of phases) { re += Math.cos(p); im += Math.sin(p); }
+    return { phases, coherence: Math.sqrt(re*re + im*im) / n };
+  }, []);
+
+  return { stateRef, step };
+}
+
+// ── Scene builders ────────────────────────────────────────────────────────────
+function clearScene(scene) {
+  // keep lights (index 0,1)
+  while (scene.children.length > 2) scene.remove(scene.children[2]);
+}
+
+function buildGravityScene(scene, bodies) {
+  clearScene(scene);
+  for (const b of bodies) {
+    const r   = 0.5 + b.mass * 0.4;
+    const geo = new THREE.SphereGeometry(r, 10, 7);
+    const hue = (b.mass / 4) * 0.6;
+    const mat = new THREE.MeshPhongMaterial({
+      color:    new THREE.Color().setHSL(hue, 0.9, 0.6),
+      emissive: new THREE.Color().setHSL(hue, 0.8, 0.12),
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(b.x, b.y, b.z);
+    scene.add(mesh);
+  }
+  // gravity links
+  const pts = [];
+  for (let i = 0; i < bodies.length; i++) {
+    for (let j = i + 1; j < bodies.length; j++) {
+      const dx = bodies[j].x - bodies[i].x, dy = bodies[j].y - bodies[i].y, dz = bodies[j].z - bodies[i].z;
+      if (Math.sqrt(dx*dx+dy*dy+dz*dz) < 28) {
+        pts.push(bodies[i].x, bodies[i].y, bodies[i].z, bodies[j].x, bodies[j].y, bodies[j].z);
+      }
+    }
+  }
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  scene.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x1a3080, opacity: 0.4, transparent: true })));
+}
+
+function buildVortexScene(scene, t) {
+  clearScene(scene);
+  const N = 36, spread = 28;
+  const step = (spread / N) * 2;
+  for (let i = -N/2; i < N/2; i++) {
+    for (let j = -N/2; j < N/2; j++) {
+      const x = i * step, y = j * step;
+      const [vx, vy] = vortexCurl(x, y, t);
+      const speed = Math.sqrt(vx*vx + vy*vy);
+      const geo  = new THREE.ConeGeometry(0.14, 0.7 + speed * 0.5, 4);
+      const hue  = 0.6 + speed * 0.12;
+      const mat  = new THREE.MeshPhongMaterial({
+        color:    new THREE.Color().setHSL(hue, 0.9, 0.5 + speed * 0.12),
+        emissive: new THREE.Color().setHSL(hue, 0.7, 0.07),
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, y, 0);
+      mesh.lookAt(x + vx, y + vy, 0.001);
+      mesh.rotateX(Math.PI / 2);
+      scene.add(mesh);
+    }
+  }
+}
+
+let _kanBuilt = false;
+function buildKANScene(scene) {
+  if (_kanBuilt) return;
+  _kanBuilt = true;
+  clearScene(scene);
+  const W = 52, H = 52, segs = 64;
+  const geo = new THREE.PlaneGeometry(W, H, segs, segs);
+  const pos = geo.attributes.position.array;
+  for (let i = 0; i < pos.length; i += 3) {
+    const x = pos[i];
+    let v = 0, X = x / 6, dt = 0.04;
+    for (let s = 0; s < 50; s++) { v += doubleWell(Math.max(-2.4, Math.min(2.4, X))) * dt; X = Math.max(-2.4, Math.min(2.4, X + v * dt)); }
+    pos[i + 2] = X * 7;
+  }
+  geo.computeVertexNormals();
+  const mat  = new THREE.MeshPhongMaterial({ color: 0x1a44cc, emissive: 0x09102a, side: THREE.DoubleSide, shininess: 80 });
+  const wmat = new THREE.MeshBasicMaterial({ color: 0x4488ff, wireframe: true, opacity: 0.2, transparent: true });
+  scene.add(new THREE.Mesh(geo, mat));
+  const geo2 = new THREE.PlaneGeometry(W, H, segs, segs);
+  // copy z values
+  geo2.attributes.position.array.set(geo.attributes.position.array);
+  geo2.attributes.position.needsUpdate = true;
+  scene.add(new THREE.Mesh(geo2, wmat));
+}
+
+function buildResonanceScene(scene, phases) {
+  clearScene(scene);
+  const N = phases.length, R = 22;
+  for (let i = 0; i < N; i++) {
+    const angle = (i / N) * Math.PI * 2;
+    const hue   = (phases[i] % (Math.PI * 2)) / (Math.PI * 2);
+    const geo   = new THREE.SphereGeometry(0.55, 10, 8);
+    const mat   = new THREE.MeshPhongMaterial({
+      color:    new THREE.Color().setHSL(hue, 0.9, 0.6),
+      emissive: new THREE.Color().setHSL(hue, 0.8, 0.14),
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(R * Math.cos(angle), Math.sin(phases[i]) * 4, R * Math.sin(angle));
+    scene.add(mesh);
+  }
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const a0 = (i / N) * Math.PI * 2, a1 = ((i+1) / N) * Math.PI * 2;
+    pts.push(R*Math.cos(a0), Math.sin(phases[i])*4, R*Math.sin(a0),
+             R*Math.cos(a1), Math.sin(phases[(i+1)%N])*4, R*Math.sin(a1));
+  }
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  scene.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x3366ff, opacity: 0.55, transparent: true })));
+}
+
+// ── Formulas ──────────────────────────────────────────────────────────────────
+const FORMULAS = {
+  GRAVITY: {
+    title: 'Semantic Gravity',
+    lines: [
+      { label: 'Mass', code: 'm_i = ||embed_i||₂' },
+      { label: 'Force', code: 'F_ij = G·m_i·m_j / d²_ij' },
+      { label: 'Attn', code: 'A = softmax(F) replaces QKᵀ/√d' },
+      { text: 'Razão max/min de massa: 203× no Qwen3-8B.' },
+    ],
+  },
+  VORTEX: {
+    title: 'Vortex Field',
+    lines: [
+      { label: 'Skew', code: 'A_vortex = A + λ·(A − Aᵀ)/2' },
+      { label: 'Curl', code: '∇ × A ≠ 0 → relações orbitais' },
+      { label: 'λ', code: 'λ ∈ [0, 1],  λ=0 = atenção padrão' },
+      { text: 'A→B ≠ B→A. Fluxo direcional entre tokens.' },
+    ],
+  },
+  'KAN BARRIER': {
+    title: 'KAN Double-Well',
+    lines: [
+      { label: 'V(x)', code: '-x²/2 + x⁴/4' },
+      { label: 'F(x)', code: 'x − x³  (mínimos em ±1)' },
+      { label: 'Gate', code: 'sinal forte → atravessa barreira' },
+      { text: 'Ruído fica preso no poço. Substitui SiLU.' },
+    ],
+  },
+  RESONANCE: {
+    title: 'Kuramoto Decoder',
+    lines: [
+      { label: 'ODE', code: 'dφᵢ/dt = ωᵢ + K/N·Σ sin(φⱼ−φᵢ)' },
+      { label: 'Learn', code: 'Δω = η·sin(φ_true − φᵢ)' },
+      { label: 'Custo', code: 'O(k) vs O(vocab) — ~30× menor' },
+      { text: 'Online learning sem backprop.' },
+    ],
+  },
+};
+
+// ── Components ────────────────────────────────────────────────────────────────
+function FormulaPanel({ mode }) {
+  const f = FORMULAS[mode];
+  if (!f) return null;
+  return (
+    <div className="formula-box">
+      <h3>{f.title}</h3>
+      {f.lines.map((l, i) => (
+        <div key={i}>
+          {l.code && <><span style={{color:'#5060a0'}}>{l.label}: </span><code>{l.code}</code><br /></>}
+          {l.text && <p>{l.text}</p>}
         </div>
-
-        <!-- Prompt & Response -->
-        <div class="panel prompt-response">
-            <div class="panel-title">📝 Prompt</div>
-            <div class="prompt-section">
-                <textarea
-                    v-model="prompt"
-                    placeholder="Enter your prompt here..."
-                    :disabled="isGenerating"
-                ></textarea>
-            </div>
-
-            <div class="controls-row">
-                <div class="control-input">
-                    <label>Temperature</label>
-                    <input
-                        v-model.number="temperature"
-                        type="number"
-                        min="0"
-                        max="2"
-                        step="0.1"
-                        :disabled="isGenerating"
-                    >
-                </div>
-                <div class="control-input">
-                    <label>Top-K</label>
-                    <input
-                        v-model.number="topK"
-                        type="number"
-                        min="0"
-                        step="1"
-                        :disabled="isGenerating"
-                    >
-                </div>
-            </div>
-
-            <div class="control-input" style="margin-bottom: 8px;">
-                <label>Max Tokens</label>
-                <input
-                    v-model.number="maxTokens"
-                    type="number"
-                    min="1"
-                    max="2048"
-                    step="1"
-                    :disabled="isGenerating"
-                >
-            </div>
-
-            <button class="gen-button" @click="generate" :disabled="!prompt || isGenerating || !modelLoaded">
-                {{ isGenerating ? '⏳ Generating...' : '▶ Generate' }}
-            </button>
-
-            <div style="margin-top: 12px; flex: 1; display: flex; flex-direction: column;">
-                <div class="panel-title" style="margin-bottom: 8px;">📤 Response</div>
-                <div class="response-section">{{ response }}</div>
-                <div class="response-stats" v-if="lastGenerationStats">
-                    {{ lastGenerationStats.tokens }} tokens · {{ lastGenerationStats.totalTime }}ms
-                </div>
-            </div>
-        </div>
-
-        <!-- Layer Heatmap -->
-        <div class="panel layer-heatmap">
-            <div class="panel-title">🔥 Layer Heatmap (Attention Energy)</div>
-            <div class="heatmap-grid">
-                <div
-                    v-for="layer in 28"
-                    :key="`heatmap-${layer - 1}`"
-                    class="heatmap-cell"
-                    :style="getHeatmapStyle(layer - 1)"
-                >
-                    {{ layer - 1 }}
-                    <div class="heatmap-tooltip">
-                        Layer {{ layer - 1 }}<br>
-                        Energy: {{ (layerData[layer - 1]?.attentionEnergy || 0).toFixed(2) }}
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Top Tokens -->
-        <div class="panel top-tokens">
-            <div class="panel-title">🏆 Top Tokens</div>
-            <div style="flex: 1; overflow-y: auto;">
-                <div v-for="(token, idx) in topTokens" :key="`token-${idx}`" class="token-bar">
-                    <div class="token-label" :title="token.text">{{ token.text }}</div>
-                    <div class="token-bar-fill" :style="{ width: (token.score * 100) + '%' }">
-                        {{ (token.score * 100).toFixed(0) }}%
-                    </div>
-                </div>
-                <div v-if="topTokens.length === 0" style="color: var(--text-secondary); padding: 8px;">
-                    No tokens yet
-                </div>
-            </div>
-        </div>
-
-        <!-- Console Log -->
-        <div class="panel console-log">
-            <div class="panel-title">📡 WS Messages</div>
-            <div class="log-entries">
-                <div
-                    v-for="(entry, idx) in wsLog"
-                    :key="`log-${idx}`"
-                    class="log-entry"
-                    @click="selectedLogEntry = entry"
-                >
-                    <span class="log-timestamp">{{ entry.time }}</span>
-                    <span :class="`log-badge ${entry.type}`">{{ entry.type }}</span>
-                    <span class="log-content">{{ entry.preview }}</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Token Stream -->
-        <div class="panel token-stream">
-            <div class="panel-title">📊 Token Stream</div>
-            <table class="stream-table">
-                <thead>
-                    <tr>
-                        <th style="width: 30px;">#</th>
-                        <th style="width: 80px;">Token</th>
-                        <th style="width: 60px;">Logit</th>
-                        <th style="width: 50px;">Prob</th>
-                        <th style="width: 50px;">ms</th>
-                        <th style="width: 50px;">Entropy</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr v-for="(row, idx) in tokenStream" :key="`stream-${idx}`">
-                        <td class="token-id-cell">{{ row.step }}</td>
-                        <td class="token-text-cell">{{ row.text }}</td>
-                        <td>{{ row.logit.toFixed(2) }}</td>
-                        <td>{{ (row.prob * 100).toFixed(1) }}%</td>
-                        <td>{{ row.ms }}</td>
-                        <td>{{ row.entropy.toFixed(3) }}</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- ESN Observer -->
-        <div class="panel esn-observer">
-            <div class="panel-title">🧠 ESN Observer</div>
-            <div class="metric-display">
-                <div class="metric-box">
-                    <div class="metric-label">Entropy</div>
-                    <div class="metric-value">{{ esnState.entropy.toFixed(3) }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">Top-1 Prob</div>
-                    <div class="metric-value">{{ (esnState.top1Prob * 100).toFixed(1) }}%</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">State Norm</div>
-                    <div class="metric-value">{{ esnState.stateNorm.toFixed(3) }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">Temp Δ</div>
-                    <div class="metric-value">{{ esnState.tempDelta.toFixed(3) }}</div>
-                </div>
-            </div>
-            <div class="sparkline-container">
-                <canvas ref="sparklineEntropy" class="sparkline"></canvas>
-                <canvas ref="sparklineTop1" class="sparkline"></canvas>
-                <canvas ref="sparklineNorm" class="sparkline"></canvas>
-            </div>
-        </div>
-
-        <!-- Energy Timeline -->
-        <div class="panel energy-timeline">
-            <div class="panel-title">⚡ Energy Timeline</div>
-            <canvas id="energyChart"></canvas>
-        </div>
-
-        <!-- Layer Bars -->
-        <div class="panel layer-bars">
-            <div class="panel-title">📈 Layer Energy</div>
-            <div class="layer-bar-list">
-                <div v-for="layer in sortedLayers" :key="`layer-${layer.idx}`" class="layer-row">
-                    <div class="layer-idx-badge">{{ layer.idx }}</div>
-                    <div class="bar-group">
-                        <div class="bar-component" style="width: 70px;">
-                            <div class="bar-label">ATN</div>
-                            <div class="bar" :style="{ width: (layer.attnPercent) + '%' }"></div>
-                        </div>
-                        <div class="bar-component" style="width: 70px;">
-                            <div class="bar-label">MLP</div>
-                            <div class="bar mlp" :style="{ width: (layer.mlpPercent) + '%' }"></div>
-                        </div>
-                    </div>
-                    <div style="color: var(--text-secondary); font-size: 0.65rem; width: 50px;">
-                        {{ (layer.residualNorm || 0).toFixed(2) }}
-                    </div>
-                    <div class="hot-dots">
-                        <div v-for="_ in Math.min(layer.hotNeuronsCount, 3)" class="hot-dot"></div>
-                        <span v-if="layer.hotNeuronsCount > 3" style="color: var(--text-secondary);">
-                            +{{ layer.hotNeuronsCount - 3 }}
-                        </span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- D3 Force Graph -->
-        <div class="panel force-graph">
-            <div class="panel-title">🌐 Layer Graph</div>
-            <svg id="forceGraphSvg"></svg>
-        </div>
-
-        <!-- Gravity Panel (hidden by default) -->
-        <div class="panel gravity-panel">
-            <div class="panel-title">⚖️ Gravity</div>
-            <div class="metric-grid">
-                <div class="metric-box">
-                    <div class="metric-label">Enabled</div>
-                    <div class="metric-value">{{ gravityState.enabled ? '✓' : '✗' }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">History</div>
-                    <div class="metric-value">{{ gravityState.historyLen }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">Mean G</div>
-                    <div class="metric-value">{{ gravityState.meanGravity.toFixed(3) }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">Max G</div>
-                    <div class="metric-value">{{ gravityState.maxGravity.toFixed(3) }}</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- CfC Panel (hidden by default) -->
-        <div class="panel cfc-panel">
-            <div class="panel-title">🔗 CfC</div>
-            <div class="metric-grid">
-                <div class="metric-box">
-                    <div class="metric-label">Enabled</div>
-                    <div class="metric-value">{{ cfcState.enabled ? '✓' : '✗' }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">Dim</div>
-                    <div class="metric-value">{{ cfcState.cfcDim }}</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">VRAM</div>
-                    <div class="metric-value">{{ cfcState.vramMb }}MB</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-label">State Norm</div>
-                    <div class="metric-value">{{ cfcState.stateNorm.toFixed(3) }}</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- LNN Training Panel -->
-        <div class="panel training-panel" style="grid-column: span 3;">
-            <div class="panel-title">🧠 LNN Training — Liquid Neural Network Learning</div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;">
-                <!-- Training Status -->
-                <div>
-                    <div class="metric-grid">
-                        <div class="metric-box">
-                            <div class="metric-label">Generation</div>
-                            <div class="metric-value" style="color: var(--accent-cyan);">{{ lnnTrain.generation }}</div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">Mean Reward</div>
-                            <div class="metric-value" :style="{ color: lnnTrain.meanReward > 0.5 ? '#00ffc8' : lnnTrain.meanReward > 0.3 ? '#fbbf24' : '#ef4444' }">
-                                {{ lnnTrain.meanReward.toFixed(4) }}
-                            </div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">Recent Reward</div>
-                            <div class="metric-value" :style="{ color: lnnTrain.recentReward > 0.5 ? '#00ffc8' : '#fbbf24' }">
-                                {{ lnnTrain.recentReward.toFixed(4) }}
-                            </div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">Trend</div>
-                            <div class="metric-value" :style="{ color: lnnTrain.rewardTrend >= 0 ? '#00ffc8' : '#ef4444' }">
-                                {{ lnnTrain.rewardTrend >= 0 ? '↑' : '↓' }} {{ Math.abs(lnnTrain.rewardTrend).toFixed(4) }}
-                            </div>
-                        </div>
-                    </div>
-                    <div class="metric-grid" style="margin-top: 8px;">
-                        <div class="metric-box">
-                            <div class="metric-label">ESN Readout</div>
-                            <div class="metric-value" :style="{ color: lnnTrain.esnTrained ? '#00ffc8' : '#a0a0a0' }">
-                                {{ lnnTrain.esnTrained ? 'TRAINED' : 'pending' }}
-                            </div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">CfC Epoch</div>
-                            <div class="metric-value" style="color: var(--accent-purple);">{{ lnnTrain.cfcEpoch }}</div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">CfC Loss</div>
-                            <div class="metric-value">{{ lnnTrain.cfcLoss.toFixed(6) }}</div>
-                        </div>
-                        <div class="metric-box">
-                            <div class="metric-label">Grad Norm</div>
-                            <div class="metric-value">{{ lnnTrain.cfcGradNorm.toFixed(4) }}</div>
-                        </div>
-                    </div>
-                    <!-- Reward Detail -->
-                    <div v-if="lnnTrain.lastRewardDetail" style="margin-top: 8px; padding: 8px; background: rgba(0,255,200,0.05); border-radius: 6px; font-size: 11px;">
-                        <div style="display: flex; justify-content: space-between;">
-                            <span>Entropy: {{ (lnnTrain.lastRewardDetail.entropy || 0).toFixed(2) }}</span>
-                            <span>Diversity: {{ ((lnnTrain.lastRewardDetail.diversity || 0) * 100).toFixed(1) }}%</span>
-                            <span>Repetition: {{ ((lnnTrain.lastRewardDetail.repetition || 0) * 100).toFixed(1) }}%</span>
-                        </div>
-                    </div>
-                </div>
-                <!-- Reward Chart -->
-                <div style="position: relative; min-height: 180px;">
-                    <canvas id="rewardChart"></canvas>
-                </div>
-                <!-- Training Controls & Info -->
-                <div>
-                    <div style="margin-bottom: 12px;">
-                        <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px;">
-                            O sistema líquido aprende automaticamente após cada geração.
-                            ESN treina via ridge regression (256 pesos),
-                            CfC treina via backprop + SGD (~6M pesos).
-                        </div>
-                        <div style="font-size: 11px; color: var(--text-secondary);">
-                            <strong style="color: var(--accent-cyan);">Reward Signal:</strong>
-                            confiança do modelo + entropia baixa + diversidade léxica − repetição
-                        </div>
-                    </div>
-                    <div style="display: flex; flex-direction: column; gap: 6px;">
-                        <button class="gen-button" @click="trainBatch" :disabled="!modelLoaded || lnnTrain.isTraining" style="font-size: 12px; padding: 8px 16px;">
-                            {{ lnnTrain.isTraining ? '⏳ Training...' : '🧠 Train LNN Batch' }}
-                        </button>
-                        <div style="font-size: 10px; color: var(--text-secondary);">
-                            Gera 10 prompts diversos e treina o sistema líquido em batch
-                        </div>
-                    </div>
-                    <!-- Progress -->
-                    <div v-if="lnnTrain.rewardHistory.length > 0" style="margin-top: 12px;">
-                        <div style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px;">
-                            Reward History ({{ lnnTrain.rewardHistory.length }} gen)
-                        </div>
-                        <div style="display: flex; gap: 2px; height: 24px; align-items: flex-end;">
-                            <div v-for="(r, i) in lnnTrain.rewardHistory.slice(-30)" :key="'rh-'+i"
-                                 :style="{
-                                    width: '6px',
-                                    height: Math.max(2, r * 24) + 'px',
-                                    backgroundColor: r > 0.5 ? '#00ffc8' : r > 0.3 ? '#fbbf24' : '#ef4444',
-                                    borderRadius: '1px',
-                                    opacity: 0.8
-                                 }">
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Status Bar -->
-        <div class="status-bar">
-            <div class="status-item">
-                <span v-if="statsInfo">
-                    TPS: {{ statsInfo.tps.toFixed(1) }} |
-                    ms/layer: {{ statsInfo.msPerLayer.toFixed(1) }} |
-                    Model: {{ statsInfo.model }} |
-                    Backend: {{ statsInfo.backend }}
-                </span>
-                <span v-else>
-                    Waiting for model load...
-                </span>
-            </div>
-            <div class="status-item">
-                VRAM: {{ vramUsed }}/{{ vramTotal }} GB
-            </div>
-        </div>
+      ))}
     </div>
-
-    <script>
-        const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
-
-        createApp({
-            setup() {
-                // WebSocket
-                let ws = null;
-                const wsConnected = ref(false);
-                const wsReconnectAttempts = ref(0);
-                const MAX_RECONNECT_ATTEMPTS = 10;
-                const RECONNECT_DELAY = (attempt) => Math.min(1000 * Math.pow(2, attempt), 30000);
-
-                // Models & Generation
-                const models = ref([]);
-                const selectedModel = ref('');
-                const modelLoaded = ref(false);
-                const isLoading = ref(false);
-                const isGenerating = ref(false);
-                const prompt = ref('');
-                const temperature = ref(0.7);
-                const topK = ref(40);
-                const maxTokens = ref(128);
-                const response = ref('');
-                const lastGenerationStats = ref(null);
-
-                // Layer Data
-                const layerData = ref(Array(28).fill(null).map(() => ({
-                    attentionEnergy: 0,
-                    mlpEnergy: 0,
-                    maxActivation: 0,
-                    residualNorm: 0,
-                    hotNeurons: [],
-                    timeUs: 0,
-                    spikes: 0
-                })));
-
-                // Top Tokens
-                const topTokens = ref([]);
-
-                // Token Stream
-                const tokenStream = ref([]);
-
-                // ESN State
-                const esnState = ref({
-                    entropy: 0,
-                    top1Prob: 0,
-                    stateNorm: 0,
-                    tempDelta: 0,
-                    temperature: 0,
-                    readoutTrained: false
-                });
-
-                const esnHistory = ref({
-                    entropy: [],
-                    top1Prob: [],
-                    stateNorm: []
-                });
-
-                // Gravity/CfC
-                const gravityState = ref({
-                    enabled: false,
-                    historyLen: 0,
-                    threshold: 0,
-                    meanGravity: 0,
-                    maxGravity: 0
-                });
-
-                const cfcState = ref({
-                    enabled: false,
-                    cfcDim: 0,
-                    paramCount: 0,
-                    vramMb: 0,
-                    stateNorm: 0,
-                    correctionNorm: 0
-                });
-
-                // LNN Training State
-                const lnnTrain = ref({
-                    enabled: false,
-                    generation: 0,
-                    meanReward: 0,
-                    recentReward: 0,
-                    rewardTrend: 0,
-                    esnTrained: false,
-                    cfcEpoch: 0,
-                    cfcLoss: 0,
-                    cfcGradNorm: 0,
-                    rewardHistory: [],
-                    lossHistory: [],
-                    lastRewardDetail: null,
-                    isTraining: false,
-                });
-
-                // Charts
-                let energyChart = null;
-                let rewardChart = null;
-                const energyHistory = ref({
-                    steps: [],
-                    energies: []
-                });
-
-                // Stats
-                const statsInfo = ref(null);
-                const vramUsed = ref(0);
-                const vramTotal = ref(12);
-                const vramPercent = computed(() => (vramUsed.value / vramTotal.value) * 100);
-
-                // Console Log
-                const wsLog = ref([]);
-                const MAX_LOG_ENTRIES = 200;
-                const selectedLogEntry = ref(null);
-
-                // Computed
-                const sortedLayers = computed(() => {
-                    return layerData.value
-                        .map((data, idx) => ({
-                            idx,
-                            attentionEnergy: data.attentionEnergy,
-                            mlpEnergy: data.mlpEnergy,
-                            residualNorm: data.residualNorm,
-                            hotNeuronsCount: data.hotNeurons?.length || 0,
-                            attnPercent: Math.max(5, Math.min(100, (data.attentionEnergy || 0) * 100)),
-                            mlpPercent: Math.max(5, Math.min(100, (data.mlpEnergy || 0) * 100))
-                        }))
-                        .sort((a, b) => (b.attentionEnergy + b.mlpEnergy) - (a.attentionEnergy + a.mlpEnergy));
-                });
-
-                // Helper: color from energy
-                const getHeatmapStyle = (layerIdx) => {
-                    const energy = layerData.value[layerIdx]?.attentionEnergy || 0;
-                    const normalized = Math.min(1, energy * 2);
-                    const hue = (1 - normalized) * 240; // blue to red
-                    const saturation = 50 + normalized * 50;
-                    const lightness = 20 + normalized * 20;
-                    return {
-                        backgroundColor: `hsl(${hue}, ${saturation}%, ${lightness}%)`
-                    };
-                };
-
-                // WebSocket
-                const connectWebSocket = () => {
-                    if (wsConnected.value) return;
-
-                    try {
-                        ws = new WebSocket('ws://localhost:8080');
-
-                        ws.onopen = () => {
-                            console.log('WS connected');
-                            wsConnected.value = true;
-                            wsReconnectAttempts.value = 0;
-                        };
-
-                        ws.onmessage = (event) => {
-                            try {
-                                const data = JSON.parse(event.data);
-                                handleWSMessage(data);
-                            } catch (e) {
-                                console.error('WS parse error:', e);
-                            }
-                        };
-
-                        ws.onerror = (error) => {
-                            console.error('WS error:', error);
-                            wsConnected.value = false;
-                        };
-
-                        ws.onclose = () => {
-                            console.log('WS closed');
-                            wsConnected.value = false;
-                            attemptReconnect();
-                        };
-                    } catch (e) {
-                        console.error('WS connection failed:', e);
-                        wsConnected.value = false;
-                        attemptReconnect();
-                    }
-                };
-
-                const attemptReconnect = () => {
-                    if (wsReconnectAttempts.value < MAX_RECONNECT_ATTEMPTS) {
-                        const delay = RECONNECT_DELAY(wsReconnectAttempts.value);
-                        wsReconnectAttempts.value++;
-                        setTimeout(connectWebSocket, delay);
-                    }
-                };
-
-                const handleWSMessage = (data) => {
-                    const timestamp = new Date().toLocaleTimeString('en-US', {
-                        hour12: false,
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit'
-                    });
-
-                    // Log entry
-                    const logEntry = {
-                        type: data.type || 'unknown',
-                        time: timestamp,
-                        preview: JSON.stringify(data).substring(0, 100)
-                    };
-
-                    wsLog.value.unshift(logEntry);
-                    if (wsLog.value.length > MAX_LOG_ENTRIES) {
-                        wsLog.value.pop();
-                    }
-
-                    // Handle by type
-                    if (data.type === 'pipeline_layer') {
-                        const layer = data.layer_idx;
-                        if (layer < 28) {
-                            layerData.value[layer] = {
-                                attentionEnergy: data.attention_energy || 0,
-                                mlpEnergy: data.mlp_energy || 0,
-                                maxActivation: data.max_activation || 0,
-                                residualNorm: data.residual_norm || 0,
-                                hotNeurons: data.hot_neurons || [],
-                                timeUs: data.time_us || 0,
-                                spikes: data.spikes || 0
-                            };
-                        }
-                    } else if (data.type === 'pipeline_result') {
-                        response.value = (data.generated_so_far || '').replace(/<\|endoftext\|>|<\|im_end\|>|<\|im_start\|>/g, '').trim();
-                        topTokens.value = (data.top_tokens || []).slice(0, 10).map(t => ({
-                            text: (t.text || '').replace(/<\|.*?\|>/g, '').substring(0, 20),
-                            score: t.score || 0
-                        }));
-
-                        if (data.token_str) {
-                            const cleanToken = data.token_str.replace(/<\|.*?\|>/g, '');
-                            if (cleanToken && ![151643, 151645].includes(data.token_id)) {
-                                tokenStream.value.push({
-                                    step: data.step || 0,
-                                    text: cleanToken.substring(0, 20),
-                                    logit: data.top_tokens?.[0]?.logit || 0,
-                                    prob: data.top_tokens?.[0]?.score || 0,
-                                    ms: data.time_us ? Math.round(data.time_us / 1000) : 0,
-                                    entropy: esnState.value.entropy
-                                });
-
-                                // Update energy timeline
-                                const avgEnergy = layerData.value.reduce((sum, l) => sum + l.attentionEnergy, 0) / 28;
-                                energyHistory.value.steps.push(data.step);
-                                energyHistory.value.energies.push(avgEnergy);
-
-                                // Keep only last 100
-                                if (energyHistory.value.steps.length > 100) {
-                                    energyHistory.value.steps.shift();
-                                    energyHistory.value.energies.shift();
-                                }
-
-                                // Update chart
-                                if (energyChart) {
-                                    energyChart.data.labels = energyHistory.value.steps;
-                                    energyChart.data.datasets[0].data = energyHistory.value.energies;
-                                    energyChart.update('none');
-                                }
-                            }
-                        }
-
-                        if (data.total_time_ms) {
-                            lastGenerationStats.value = {
-                                tokens: tokenStream.value.length,
-                                totalTime: data.total_time_ms
-                            };
-                            statsInfo.value = {
-                                tps: tokenStream.value.length / (data.total_time_ms / 1000),
-                                msPerLayer: data.total_time_ms / 28,
-                                model: selectedModel.value,
-                                backend: 'ROCm'
-                            };
-                        }
-                    } else if (data.type === 'esn_state') {
-                        esnState.value = {
-                            entropy: data.entropy || 0,
-                            top1Prob: data.top1_prob || 0,
-                            stateNorm: data.state_norm || 0,
-                            tempDelta: data.temp_delta || 0,
-                            temperature: data.temperature || 0,
-                            readoutTrained: data.readout_trained || false
-                        };
-
-                        // Add to history
-                        esnHistory.value.entropy.push(esnState.value.entropy);
-                        esnHistory.value.top1Prob.push(esnState.value.top1Prob);
-                        esnHistory.value.stateNorm.push(esnState.value.stateNorm);
-
-                        const MAX_HISTORY = 200;
-                        if (esnHistory.value.entropy.length > MAX_HISTORY) {
-                            esnHistory.value.entropy.shift();
-                            esnHistory.value.top1Prob.shift();
-                            esnHistory.value.stateNorm.shift();
-                        }
-
-                        drawSparklines();
-                    } else if (data.type === 'gravity_state') {
-                        gravityState.value = {
-                            enabled: data.enabled || false,
-                            historyLen: data.history_len || 0,
-                            threshold: data.threshold || 0,
-                            meanGravity: data.mean_gravity || 0,
-                            maxGravity: data.max_gravity || 0
-                        };
-                        document.querySelector('.gravity-panel').classList.add('active');
-                    } else if (data.type === 'cfc_state') {
-                        cfcState.value = {
-                            enabled: data.enabled || false,
-                            cfcDim: data.cfc_dim || 0,
-                            paramCount: data.param_count || 0,
-                            vramMb: data.vram_mb || 0,
-                            stateNorm: data.state_norm || 0,
-                            correctionNorm: data.correction_norm || 0
-                        };
-                        document.querySelector('.cfc-panel').classList.add('active');
-                    } else if (data.type === 'lnn_train') {
-                        // Per-generation training result
-                        lnnTrain.value.generation = data.generation || 0;
-                        lnnTrain.value.esnTrained = data.esn_trained || false;
-                        lnnTrain.value.lastRewardDetail = data.reward || null;
-
-                        if (data.reward) {
-                            lnnTrain.value.recentReward = data.reward.mean || 0;
-                            lnnTrain.value.rewardHistory.push(data.reward.mean || 0);
-                            if (lnnTrain.value.rewardHistory.length > 100) {
-                                lnnTrain.value.rewardHistory.shift();
-                            }
-                        }
-
-                        if (data.cfc_trained) {
-                            lnnTrain.value.cfcEpoch = data.cfc_trained.epoch || 0;
-                            lnnTrain.value.cfcLoss = data.cfc_trained.loss || 0;
-                            lnnTrain.value.cfcGradNorm = data.cfc_trained.grad_norm || 0;
-                            lnnTrain.value.lossHistory.push(data.cfc_trained.loss || 0);
-                            if (lnnTrain.value.lossHistory.length > 100) {
-                                lnnTrain.value.lossHistory.shift();
-                            }
-                        }
-
-                        // Update reward chart
-                        if (rewardChart && lnnTrain.value.rewardHistory.length > 1) {
-                            rewardChart.data.labels = lnnTrain.value.rewardHistory.map((_, i) => i + 1);
-                            rewardChart.data.datasets[0].data = lnnTrain.value.rewardHistory;
-                            if (lnnTrain.value.lossHistory.length > 0) {
-                                rewardChart.data.datasets[1].data = lnnTrain.value.lossHistory;
-                            }
-                            rewardChart.update('none');
-                        }
-
-                        // Mark training panel active
-                        const tp = document.querySelector('.training-panel');
-                        if (tp) tp.classList.add('active');
-
-                    } else if (data.type === 'lnn_train_status') {
-                        // Overall training status
-                        lnnTrain.value.enabled = data.enabled || false;
-                        lnnTrain.value.generation = data.generations || lnnTrain.value.generation;
-                        lnnTrain.value.meanReward = data.mean_reward || 0;
-                        lnnTrain.value.recentReward = data.recent_reward || lnnTrain.value.recentReward;
-                        lnnTrain.value.rewardTrend = data.reward_trend || 0;
-
-                        if (data.cfc) {
-                            lnnTrain.value.cfcEpoch = data.cfc.epoch || 0;
-                            lnnTrain.value.cfcLoss = data.cfc.recent_loss || 0;
-                        }
-
-                    } else if (data.type === 'status') {
-                        console.log('Status:', data.message);
-                        if (data.message && data.message.includes('completa')) {
-                            lnnTrain.value.isTraining = false;
-                        }
-                    }
-                };
-
-                const drawSparklines = () => {
-                    nextTick(() => {
-                        drawSparkline(
-                            'sparklineEntropy',
-                            esnHistory.value.entropy,
-                            '#fbbf24'
-                        );
-                        drawSparkline(
-                            'sparklineTop1',
-                            esnHistory.value.top1Prob,
-                            '#00ffc8'
-                        );
-                        drawSparkline(
-                            'sparklineNorm',
-                            esnHistory.value.stateNorm,
-                            '#a855f7'
-                        );
-                    });
-                };
-
-                const drawSparkline = (refName, data, color) => {
-                    const canvasRef = refName;
-                    const elements = document.querySelectorAll(`[ref="${canvasRef}"]`);
-                    if (elements.length === 0) {
-                        const allCanvases = document.querySelectorAll('canvas');
-                        const targetCanvas = Array.from(allCanvases).find(c => c === document.querySelector(`.sparkline-container canvas:nth-child(${refName === 'sparklineEntropy' ? 1 : refName === 'sparklineTop1' ? 2 : 3})`));
-                        if (!targetCanvas) return;
-
-                        const canvas = targetCanvas;
-                        const ctx = canvas.getContext('2d');
-                        const w = canvas.offsetWidth;
-                        const h = canvas.offsetHeight;
-
-                        canvas.width = w;
-                        canvas.height = h;
-
-                        ctx.clearRect(0, 0, w, h);
-                        if (data.length < 2) return;
-
-                        const min = Math.min(...data);
-                        const max = Math.max(...data);
-                        const range = max - min || 1;
-
-                        ctx.strokeStyle = color;
-                        ctx.lineWidth = 2;
-                        ctx.beginPath();
-
-                        data.forEach((value, i) => {
-                            const x = (i / (data.length - 1)) * w;
-                            const y = h - ((value - min) / range) * (h - 4) - 2;
-                            if (i === 0) {
-                                ctx.moveTo(x, y);
-                            } else {
-                                ctx.lineTo(x, y);
-                            }
-                        });
-
-                        ctx.stroke();
-                    }
-                };
-
-                // HTTP Functions
-                const fetchModels = async () => {
-                    try {
-                        const res = await fetch('http://localhost:3000/api/models');
-                        const data = await res.json();
-                        models.value = data.models || [];
-                        if (models.value.length > 0) {
-                            selectedModel.value = models.value[0].name;
-                            await loadModel();
-                        }
-                    } catch (e) {
-                        console.error('Failed to fetch models:', e);
-                    }
-                };
-
-                const loadModel = async () => {
-                    if (!selectedModel.value) return;
-                    isLoading.value = true;
-                    try {
-                        const res = await fetch('http://localhost:3000/api/load-model', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name: selectedModel.value })
-                        });
-                        const data = await res.json();
-                        if (data.status === 'ok') {
-                            modelLoaded.value = true;
-                        }
-                    } catch (e) {
-                        console.error('Failed to load model:', e);
-                    } finally {
-                        isLoading.value = false;
-                    }
-                };
-
-                const generate = async () => {
-                    if (!prompt.value || !modelLoaded.value) return;
-
-                    isGenerating.value = true;
-                    response.value = '';
-                    topTokens.value = [];
-                    tokenStream.value = [];
-                    energyHistory.value = { steps: [], energies: [] };
-                    esnHistory.value = { entropy: [], top1Prob: [], stateNorm: [] };
-                    lastGenerationStats.value = null;
-
-                    try {
-                        // Start WS generation
-                        if (wsConnected.value && ws) {
-                            ws.send(JSON.stringify({
-                                type: 'stimulus',
-                                text: prompt.value
-                            }));
-                        }
-
-                        // Also start HTTP generation for completeness
-                        const res = await fetch('http://localhost:3000/api/generate', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                model: selectedModel.value,
-                                prompt: prompt.value,
-                                temperature: temperature.value,
-                                top_k: topK.value,
-                                max_tokens: maxTokens.value
-                            })
-                        });
-
-                        const data = await res.json();
-                        response.value = (data.response || '').replace(/<\|endoftext\|>|<\|im_end\|>|<\|im_start\|>/g, '').trim();
-                    } catch (e) {
-                        console.error('Generation failed:', e);
-                        response.value = 'Error: ' + e.message;
-                    } finally {
-                        isGenerating.value = false;
-                    }
-                };
-
-                // LNN Batch Training
-                const trainBatch = async () => {
-                    if (!modelLoaded.value || lnnTrain.value.isTraining) return;
-                    lnnTrain.value.isTraining = true;
-
-                    const trainingPrompts = [
-                        "What is the capital of France?",
-                        "Explain how a computer works",
-                        "The meaning of life is",
-                        "1+1=",
-                        "The largest planet in the solar system is",
-                        "Write a short poem about the ocean",
-                        "How does photosynthesis work?",
-                        "What is machine learning?",
-                        "The speed of light is approximately",
-                        "In mathematics, a prime number is",
-                    ];
-
-                    try {
-                        const res = await fetch('http://localhost:3000/api/train-lnn', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                prompts: trainingPrompts,
-                                max_tokens: 64,
-                                save_weights: true
-                            })
-                        });
-                        const data = await res.json();
-                        console.log('Training result:', data);
-                    } catch (e) {
-                        console.error('Training failed:', e);
-                    } finally {
-                        lnnTrain.value.isTraining = false;
-                    }
-                };
-
-                // Chart.js setup
-                const initRewardChart = () => {
-                    nextTick(() => {
-                        const canvas = document.getElementById('rewardChart');
-                        if (!canvas) return;
-
-                        rewardChart = new Chart(canvas, {
-                            type: 'line',
-                            data: {
-                                labels: [],
-                                datasets: [{
-                                    label: 'Reward',
-                                    data: [],
-                                    borderColor: '#00ffc8',
-                                    backgroundColor: 'rgba(0, 255, 200, 0.1)',
-                                    tension: 0.4,
-                                    fill: true,
-                                    pointRadius: 2,
-                                    pointBackgroundColor: '#00ffc8',
-                                    yAxisID: 'y'
-                                }, {
-                                    label: 'CfC Loss',
-                                    data: [],
-                                    borderColor: '#a855f7',
-                                    backgroundColor: 'rgba(168, 85, 247, 0.1)',
-                                    tension: 0.4,
-                                    fill: false,
-                                    pointRadius: 2,
-                                    pointBackgroundColor: '#a855f7',
-                                    yAxisID: 'y1'
-                                }]
-                            },
-                            options: {
-                                responsive: true,
-                                maintainAspectRatio: false,
-                                interaction: {
-                                    mode: 'index',
-                                    intersect: false
-                                },
-                                plugins: {
-                                    legend: {
-                                        labels: { color: '#a0a0a0', font: { size: 10, family: "'JetBrains Mono', monospace" } }
-                                    }
-                                },
-                                scales: {
-                                    y: {
-                                        type: 'linear',
-                                        position: 'left',
-                                        beginAtZero: true,
-                                        max: 1,
-                                        title: { display: true, text: 'Reward', color: '#00ffc8', font: { size: 10 } },
-                                        ticks: { color: '#a0a0a0', font: { size: 9, family: "'JetBrains Mono', monospace" } },
-                                        grid: { color: 'rgba(255, 255, 255, 0.05)' }
-                                    },
-                                    y1: {
-                                        type: 'linear',
-                                        position: 'right',
-                                        title: { display: true, text: 'Loss', color: '#a855f7', font: { size: 10 } },
-                                        ticks: { color: '#a0a0a0', font: { size: 9, family: "'JetBrains Mono', monospace" } },
-                                        grid: { drawOnChartArea: false }
-                                    },
-                                    x: {
-                                        ticks: { color: '#a0a0a0', font: { size: 9, family: "'JetBrains Mono', monospace" } },
-                                        grid: { color: 'rgba(255, 255, 255, 0.05)' }
-                                    }
-                                }
-                            }
-                        });
-                    });
-                };
-
-                const initEnergyChart = () => {
-                    nextTick(() => {
-                        const canvas = document.getElementById('energyChart');
-                        if (!canvas) return;
-
-                        energyChart = new Chart(canvas, {
-                            type: 'line',
-                            data: {
-                                labels: [],
-                                datasets: [{
-                                    label: 'Avg Energy',
-                                    data: [],
-                                    borderColor: '#fbbf24',
-                                    backgroundColor: 'rgba(251, 191, 36, 0.1)',
-                                    tension: 0.4,
-                                    fill: true,
-                                    pointRadius: 2,
-                                    pointBackgroundColor: '#fbbf24',
-                                    pointBorderColor: '#fbbf24'
-                                }]
-                            },
-                            options: {
-                                responsive: true,
-                                maintainAspectRatio: false,
-                                plugins: {
-                                    legend: {
-                                        display: false
-                                    }
-                                },
-                                scales: {
-                                    y: {
-                                        beginAtZero: true,
-                                        max: 1,
-                                        ticks: {
-                                            color: '#a0a0a0',
-                                            font: { family: "'JetBrains Mono', monospace" }
-                                        },
-                                        grid: {
-                                            color: 'rgba(255, 255, 255, 0.05)'
-                                        }
-                                    },
-                                    x: {
-                                        ticks: {
-                                            color: '#a0a0a0',
-                                            font: { family: "'JetBrains Mono', monospace" }
-                                        },
-                                        grid: {
-                                            color: 'rgba(255, 255, 255, 0.05)'
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    });
-                };
-
-                // D3 Force Graph
-                const initForceGraph = () => {
-                    nextTick(() => {
-                        const svg = document.getElementById('forceGraphSvg');
-                        if (!svg) return;
-
-                        const width = svg.parentElement.offsetWidth - 24;
-                        const height = svg.parentElement.offsetHeight - 50;
-
-                        svg.setAttribute('width', width);
-                        svg.setAttribute('height', height);
-
-                        // Create nodes (28 layers)
-                        const nodes = Array.from({ length: 28 }, (_, i) => ({
-                            id: i,
-                            fx: null,
-                            fy: null
-                        }));
-
-                        // Create links (sequential)
-                        const links = Array.from({ length: 27 }, (_, i) => ({
-                            source: i,
-                            target: i + 1
-                        }));
-
-                        const simulation = d3.forceSimulation(nodes)
-                            .force('link', d3.forceLink(links).distance(40))
-                            .force('charge', d3.forceManyBody().strength(-100))
-                            .force('center', d3.forceCenter(width / 2, height / 2))
-                            .force('collide', d3.forceCollide().radius(20));
-
-                        // Clear previous
-                        d3.select(svg).selectAll('*').remove();
-
-                        const g = d3.select(svg).append('g');
-
-                        // Links
-                        const link = g.selectAll('line')
-                            .data(links)
-                            .enter()
-                            .append('line')
-                            .attr('class', 'link');
-
-                        // Nodes
-                        const node = g.selectAll('circle.node-circle')
-                            .data(nodes)
-                            .enter()
-                            .append('circle')
-                            .attr('class', 'node-circle')
-                            .attr('r', 12)
-                            .call(d3.drag()
-                                .on('start', dragstarted)
-                                .on('drag', dragged)
-                                .on('end', dragended));
-
-                        // Labels
-                        g.selectAll('text.node-label')
-                            .data(nodes)
-                            .enter()
-                            .append('text')
-                            .attr('class', 'node-label')
-                            .text(d => d.id);
-
-                        // Zoom
-                        d3.select(svg).call(d3.zoom()
-                            .on('zoom', (event) => {
-                                g.attr('transform', event.transform);
-                            }));
-
-                        // Simulation update
-                        simulation.on('tick', () => {
-                            link
-                                .attr('x1', d => d.source.x)
-                                .attr('y1', d => d.source.y)
-                                .attr('x2', d => d.target.x)
-                                .attr('y2', d => d.target.y);
-
-                            node
-                                .attr('cx', d => d.x)
-                                .attr('cy', d => d.y)
-                                .attr('fill', (d) => {
-                                    const energy = layerData.value[d.id]?.attentionEnergy || 0;
-                                    const normalized = Math.min(1, energy * 2);
-                                    const hue = (1 - normalized) * 240;
-                                    return `hsl(${hue}, 100%, ${30 + normalized * 30}%)`;
-                                });
-
-                            g.selectAll('text.node-label')
-                                .attr('x', d => d.x)
-                                .attr('y', d => d.y + 4);
-                        });
-
-                        function dragstarted(event, d) {
-                            if (!event.active) simulation.alphaTarget(0.3).restart();
-                            d.fx = d.x;
-                            d.fy = d.y;
-                        }
-
-                        function dragged(event, d) {
-                            d.fx = event.x;
-                            d.fy = event.y;
-                        }
-
-                        function dragended(event, d) {
-                            if (!event.active) simulation.alphaTarget(0);
-                            d.fx = null;
-                            d.fy = null;
-                        }
-
-                        // Watch for layer updates
-                        watch(layerData, () => {
-                            node.attr('fill', (d) => {
-                                const energy = layerData.value[d.id]?.attentionEnergy || 0;
-                                const normalized = Math.min(1, energy * 2);
-                                const hue = (1 - normalized) * 240;
-                                return `hsl(${hue}, 100%, ${30 + normalized * 30}%)`;
-                            });
-                        }, { deep: true });
-                    });
-                };
-
-                // Lifecycle
-                onMounted(async () => {
-                    connectWebSocket();
-                    await fetchModels();
-                    initEnergyChart();
-                    initRewardChart();
-                    initForceGraph();
-                });
-
-                return {
-                    // State
-                    wsConnected,
-                    models,
-                    selectedModel,
-                    modelLoaded,
-                    isLoading,
-                    isGenerating,
-                    prompt,
-                    temperature,
-                    topK,
-                    maxTokens,
-                    response,
-                    lastGenerationStats,
-                    layerData,
-                    topTokens,
-                    tokenStream,
-                    esnState,
-                    gravityState,
-                    cfcState,
-                    wsLog,
-                    selectedLogEntry,
-                    statsInfo,
-                    vramUsed,
-                    vramTotal,
-                    vramPercent,
-                    sortedLayers,
-                    lnnTrain,
-
-                    // Methods
-                    generate,
-                    loadModel,
-                    getHeatmapStyle,
-                    trainBatch
-                };
-            }
-        }).mount('#app');
-    </script>
+  );
+}
+
+function MetricBar({ label, value, max = 1, color = '#3a6aff' }) {
+  const pct = Math.min(100, (Math.abs(value) / (max || 1)) * 100);
+  const disp = typeof value === 'number' ? value.toFixed(3) : value;
+  return (
+    <div className="metric-card">
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">{disp}</div>
+      <div className="metric-bar-bg">
+        <div className="metric-bar-fill" style={{ width: pct + '%', background: color }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Metric config per mode ────────────────────────────────────────────────────
+const METRIC_CFG = {
+  GRAVITY:      [['Mean KE',  150, '#ff7e40'], ['Max Mass', 4, '#7eb8ff'], ['Min Mass', 4, '#40ff90']],
+  VORTEX:       [['Curl λ',   1,   '#b07eff'], ['Vortex ω', 1, '#ff7eb8'], ['Coherence',1, '#7eb8ff']],
+  'KAN BARRIER':[['Dead %',   1,   '#ffd07e'], ['Barrier',  1, '#ff7e40'], ['SNR',      2, '#40ff90']],
+  RESONANCE:    [['Coherence',1,   '#7eb8ff'], ['Mean ω',   2, '#ff7e40'], ['N Osc',   40, '#40ffb0']],
+};
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+function Observatory() {
+  const wrapRef = useRef(null);
+  const { sceneRef, cameraRef, rendererRef } = useThreeScene(wrapRef);
+  const { bodiesRef, step: gravStep } = useGravityBodies(26);
+  const { stateRef: kurState, step: kurStep } = useKuramoto(36);
+
+  const animRef    = useRef(null);
+  const clockRef   = useRef(0);
+  const modeRef    = useRef('GRAVITY');  // stable ref for animation loop
+  const kanBuilt   = useRef(false);
+
+  const [mode, setModeState] = useState('GRAVITY');
+  const [metrics, setMetrics] = useState({ a: 0, b: 0, c: 0 });
+  const [progress, setProgress] = useState(0);
+
+  const setMode = useCallback(m => {
+    modeRef.current = m;
+    kanBuilt.current = (m !== 'KAN BARRIER') ? false : kanBuilt.current;
+    setModeState(m);
+  }, []);
+
+  // Auto-cycle
+  useEffect(() => {
+    const start = Date.now();
+    const id = setInterval(() => {
+      const elapsed = (Date.now() - start) % CYCLE_MS;
+      setProgress(elapsed / CYCLE_MS);
+      if (elapsed < 500) {
+        setMode(m => MODES[(MODES.indexOf(m) + 1) % MODES.length]);
+      }
+    }, 500);
+    return () => clearInterval(id);
+  }, [setMode]);
+
+  // Animation loop
+  useEffect(() => {
+    let prev = performance.now();
+    const tick = () => {
+      animRef.current = requestAnimationFrame(tick);
+      const now = performance.now();
+      const dt  = Math.min((now - prev) / 1000, 0.05);
+      prev = now;
+      clockRef.current += dt;
+      const t = clockRef.current;
+
+      const scene    = sceneRef.current;
+      const renderer = rendererRef.current;
+      const camera   = cameraRef.current;
+      if (!scene || !renderer || !camera) return;
+
+      const m = modeRef.current;
+
+      if (m === 'GRAVITY') {
+        const bodies = gravStep(dt);
+        buildGravityScene(scene, bodies);
+        const ke = bodies.reduce((s, b) => s + 0.5 * b.mass * (b.vx**2 + b.vy**2 + b.vz**2), 0);
+        const masses = bodies.map(b => b.mass);
+        setMetrics({ a: ke / bodies.length, b: Math.max(...masses), c: Math.min(...masses) });
+      } else if (m === 'VORTEX') {
+        buildVortexScene(scene, t);
+        setMetrics({ a: 0.3 + 0.3 * Math.sin(t * 0.4), b: 0.7 + 0.2 * Math.cos(t*0.5), c: 0.866 });
+      } else if (m === 'KAN BARRIER') {
+        if (!kanBuilt.current) {
+          kanBuilt.current = true;
+          _kanBuilt = false;          // allow rebuild on mode entry
+          buildKANScene(scene);
+          if (scene.children[2]) scene.children[2].rotation.z = 0;
+        }
+        if (scene.children[2]) scene.children[2].rotation.z = t * 0.08;
+        setMetrics({ a: 0.354 + 0.05 * Math.sin(t), b: 1.0, c: 1.5 + 0.3 * Math.sin(t * 0.7) });
+      } else if (m === 'RESONANCE') {
+        const K = 2.5 + Math.sin(t * 0.2) * 1.5;
+        const { phases, coherence } = kurStep(K, 0.05);
+        buildResonanceScene(scene, phases);
+        setMetrics({ a: coherence, b: 0.5, c: phases.length });
+      }
+
+      renderer.render(scene, camera);
+    };
+    animRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [gravStep, kurStep]);
+
+  const mcfg = METRIC_CFG[mode] || [];
+
+  return (
+    <>
+      <div className="hdr">
+        <div className="hdr-title">IARA <span>OBSERVATORY</span></div>
+        <div className="mode-tabs">
+          {MODES.map(m => (
+            <button key={m} className={`tab${mode === m ? ' active' : ''}`}
+              onClick={() => setMode(m)}>
+              {m}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Canvas wrapper — flex: 1, fills all remaining height */}
+      <div className="canvas-wrap" ref={wrapRef}>
+        {/* canvas injected by useThreeScene */}
+        <div className="overlay">
+          <FormulaPanel mode={mode} />
+          <div className="metrics-col">
+            <MetricBar label={mcfg[0]?.[0] ?? 'A'} value={metrics.a} max={mcfg[0]?.[1] ?? 1} color={mcfg[0]?.[2] ?? '#3a6aff'} />
+            <MetricBar label={mcfg[1]?.[0] ?? 'B'} value={metrics.b} max={mcfg[1]?.[1] ?? 1} color={mcfg[1]?.[2] ?? '#ff6a3a'} />
+            <MetricBar label={mcfg[2]?.[0] ?? 'C'} value={metrics.c} max={mcfg[2]?.[1] ?? 1} color={mcfg[2]?.[2] ?? '#3affa0'} />
+          </div>
+          <div className="cycle-hud">
+            AUTO-CYCLE
+            <div className="cycle-bar-bg">
+              <div className="cycle-bar-fill" style={{ width: (progress * 100) + '%' }} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Observatory />);
+</script>
 </body>
 </html>

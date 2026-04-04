@@ -256,6 +256,15 @@ function switchTab(tab) {
   if (tab === 'console') {
     renderConsoleLogs();
   }
+  if (tab === 'observatory') {
+    // Ensure iframe is loaded (lazy — only loads when tab is first opened)
+    const iframe = document.getElementById('observatory-iframe');
+    if (iframe && !iframe.dataset.loaded) {
+      iframe.dataset.loaded = 'true';
+      // Force a size recalculation after panel becomes visible
+      requestAnimationFrame(() => { iframe.style.height = ''; });
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
