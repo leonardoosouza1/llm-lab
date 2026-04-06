@@ -473,7 +473,7 @@ async fn execute_inference(
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
             let _ = model
-                .forward(&[tok])
+                .forward(&[tok], None)
                 .map_err(|e| format!("Prefill error: {}", e))?;
             // Discard logits and traces from prefill
         }
@@ -486,7 +486,7 @@ async fn execute_inference(
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, &[decode_token], &sampling)
+            forward_traced(model, &[decode_token], &sampling, None)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 

@@ -4,8 +4,19 @@
 pub mod decoder;
 pub mod embedding;
 pub mod quantized;
+pub mod bitnet;
+pub mod fp8;
+pub mod iara_format;
+pub mod surgery;
 
 // ── Re-exports para fácil acesso ──
+#[allow(unused_imports)]
+pub use fp8::{
+    f32_to_fp8_e4m3, fp8_e4m3_to_f32, Fp8Quantized,
+    quantize_bf16_to_fp8, dequantize_fp8_to_f32,
+};
+
+
 #[allow(unused_imports)]
 pub use quantized::{
     QuantizedTensor, QuantizationError, QuantizationResult, QuantizationCpuResult,

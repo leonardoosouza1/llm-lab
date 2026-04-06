@@ -20,6 +20,7 @@ pub mod inference_stub;
 pub mod liquid_brain;
 pub mod liquid_network;
 pub mod nlm_orchestrator;
+pub mod orchestrator;
 pub mod physics;
 pub mod physics_gpu;
 pub mod pipeline;

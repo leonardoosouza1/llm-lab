@@ -5,6 +5,7 @@ members = [
     "compute-core",
     "rocm-backend",
     "opencl-backend",
+    "ck-backend",
 ]
 resolver = "2"
 

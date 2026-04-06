@@ -8,3 +8,8 @@ description = "Backend ROCm/HIP para compute-core — AMD RDNA2 (GFX1032)"
 compute-core = { path = "../compute-core" }
 hip-ffi      = { path = "../hip-ffi" }
 thiserror    = "1"
+ck-backend   = { path = "../ck-backend", optional = true }
+
+[features]
+default = []
+composable-kernel = ["ck-backend"]

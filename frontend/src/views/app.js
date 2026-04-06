@@ -7,8 +7,13 @@ import { initFrameHeatmap, triggerFrameHeatmap } from '../charts/frame_heatmap.j
 import { initLogitsChart, updateLogitsChart } from '../charts/logits_chart.js';
 import { initForceGraph, updateForceGraph, isForceGraphInitialized } from '../charts/force_graph.js';
 import { renderTracePanel } from '../charts/energy_chart.js';
+import { updateSaeChart } from '../charts/sae_features_chart.js';
+import { updateNtcCharts } from '../charts/ntc_grid_chart.js';
 import { renderConsoleLogs, setConsoleAutoScroll } from '../components/log_console.js';
 import { renderLayerGrid, renderLayerHeatmapCells, setLayerSort } from '../components/layer_grid.js';
+import { QuantView } from './QuantView.js';
+import { NtcView } from './NtcView.js';
+import { SaeView } from './SaeView.js';
 import { el } from '../utils.js';
 
 export function mountVueApp() {
@@ -41,7 +46,72 @@ export function mountVueApp() {
           if (tab === 'console') {
             renderConsoleLogs();
           }
+          if (tab === 'quant') {
+            renderQuantPanel();
+          }
+          if (tab === 'ntc') {
+            renderNtcPanel();
+          }
+          if (tab === 'sae') {
+            renderSaePanel();
+          }
         });
+      }
+
+      function renderQuantPanel() {
+        const canvas = el('quant-error-heatmap');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const errors = s.quant.perLayerError || [];
+
+        ctx.fillStyle = '#0a0e27';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (errors.length === 0) return;
+
+        const cellWidth = canvas.width / errors.length;
+        const cellHeight = canvas.height;
+
+        errors.forEach((error, i) => {
+          const x = i * cellWidth;
+          const intensity = Math.min(1, error / 0.05);
+          const hue = 0; // Red
+          const lightness = 25 + 50 * (1 - intensity);
+          ctx.fillStyle = `hsl(${hue}, 100%, ${lightness}%)`;
+          ctx.fillRect(x, 0, cellWidth, cellHeight);
+        });
+      }
+
+      function renderNtcPanel() {
+        updateNtcCharts();
+        updateNtcMetrics();
+      }
+
+      function updateNtcMetrics() {
+        const recentEl = el('ntc-recent-tokens');
+        const compressedEl = el('ntc-compressed-tokens');
+        const ratioEl = el('ntc-compression-ratio');
+
+        if (recentEl) recentEl.textContent = `${s.ntc.recentTokens} tokens`;
+        if (compressedEl) compressedEl.textContent = `${s.ntc.compressedTokens} tokens`;
+        if (ratioEl) ratioEl.textContent = NtcView.getCompressionRatio() + '×';
+      }
+
+      function renderSaePanel() {
+        updateSaeChart();
+        updateSaeMetrics();
+      }
+
+      function updateSaeMetrics() {
+        const sparsityEl = el('sae-sparsity-percent');
+        const sparsityBarEl = el('sae-sparsity-bar');
+        const lossEl = el('sae-loss-value');
+        const activeEl = el('sae-active-features');
+
+        if (sparsityEl) sparsityEl.textContent = SaeView.getSparsityPercent() + '%';
+        if (sparsityBarEl) sparsityBarEl.style.width = (s.sae.sparsity * 100) + '%';
+        if (lossEl) lossEl.textContent = s.sae.loss.toFixed(6);
+        if (activeEl) activeEl.textContent = s.sae.activeFeatures;
       }
 
       // Generate via HTTP
@@ -140,6 +210,57 @@ export function mountVueApp() {
           }
         }
       );
+
+      // Watch SAE state
+      watch(
+        () => [s.sae.step, s.sae.topFeatures.length],
+        function() {
+          if (s.activeTab === 'sae') {
+            updateSaeChart();
+            updateSaeMetrics();
+          }
+        }
+      );
+
+      // Watch NTC state
+      watch(
+        () => [s.ntc.gridSize, s.ntc.history.length],
+        function() {
+          if (s.activeTab === 'ntc') {
+            updateNtcCharts();
+            updateNtcMetrics();
+          }
+        }
+      );
+
+      // Watch Quant state
+      watch(
+        () => [s.quant.mode, s.quant.vramMb],
+        function() {
+          if (s.activeTab === 'quant') {
+            renderQuantPanel();
+            updateQuantMetrics();
+          }
+        }
+      );
+
+      function updateQuantMetrics() {
+        const vramLabel = el('quant-vram-label');
+        const vramBar = el('quant-vram-bar');
+        const baselineLabel = el('quant-baseline-label');
+        const currentLabel = el('quant-current-label');
+        const nrmseValue = el('quant-nrmse-value');
+
+        if (vramLabel) vramLabel.textContent = s.quant.vramMb + ' MB';
+        if (baselineLabel) baselineLabel.textContent = s.quant.baselineVramMb + ' MB';
+        if (currentLabel) currentLabel.textContent = s.quant.vramMb + ' MB';
+        if (nrmseValue) nrmseValue.textContent = s.quant.nrmse.toFixed(4);
+
+        if (vramBar && s.quant.baselineVramMb > 0) {
+          const pct = Math.min(100, (s.quant.vramMb / s.quant.baselineVramMb) * 100);
+          vramBar.style.width = pct + '%';
+        }
+      }
 
       // --- Event listeners for non-Vue managed elements inside #app ---
       // This listener handles the tab navigation using document.querySelectorAll

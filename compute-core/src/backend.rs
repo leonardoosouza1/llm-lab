@@ -60,6 +60,36 @@ pub trait ComputeBackend: Send + Sync + 'static {
     /// Usado para aplicar CfC correction ao hidden state.
     fn add_tensors_inplace(&self, a: &AnyTensor, b: &AnyTensor, n_elems: usize, alpha: f32) -> Result<(), BackendError>;
 
+    // ── FP8 ──────────────────────────────────────────────────────────────────
+
+    /// Upload FP8 data + per-row scales to device
+    fn upload_fp8(&self, data: &[u8], scales: &[f32], shape: &[usize]) -> (AnyTensor, AnyTensor) {
+        let data_tensor = self.upload_f32(
+            &data.iter().map(|&b| b as f32).collect::<Vec<_>>(), shape
+        );
+        let scales_tensor = self.upload_f32(scales, &[shape[0]]);
+        (data_tensor, scales_tensor)
+    }
+
+    /// Dequantize FP8 tensor to F32 on device
+    fn dequant_fp8_to_f32(&self, _fp8_data: &AnyTensor, _scales: &AnyTensor, _output: &AnyTensor, _m: usize, _k: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("dequant_fp8_to_f32".into()))
+    }
+
+    // ── BitNet Ternary ───────────────────────────────────────────────────────
+
+    /// Upload ternary packed weights to device
+    fn upload_ternary(&self, packed: &[u8], shape: &[usize]) -> AnyTensor {
+        // Default: upload as raw bytes via u8→f32 conversion
+        self.upload_f32(&packed.iter().map(|&b| b as f32).collect::<Vec<_>>(), shape)
+    }
+
+    /// Ternary GEMV: y = W_ternary @ x * scale (no multiplications, only add/sub)
+    fn gemv_ternary(&self, _packed: &AnyTensor, _x: &AnyTensor, _output: &AnyTensor,
+                    _m: usize, _n: usize, _k: usize, _scale: f32) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_ternary".into()))
+    }
+
     // ── Sync e informações ───────────────────────────────────────────────────
 
     /// Sincroniza o device (equivale a hipDeviceSynchronize / clFinish).

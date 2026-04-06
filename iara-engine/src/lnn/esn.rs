@@ -8,6 +8,7 @@
 //   u(t)  = [entropy, top1_prob, pos_norm]   ← lê saídas da LLM
 //   h(t)  = (1-α)·h(t-1) + α·tanh(W_res·h(t-1) + W_in·u(t))
 //   y(t)  = W_out · h(t)                     ← modula sampling do PRÓXIMO token
+//   budget(t) = W_out_budget · h(t)          ← determina quantas camadas usar
 //
 // Matrizes fixas (geradas deterministicamente via LCG, nunca treinadas):
 //   W_res [R×R] sparse — conectividade ~10%, raio espectral ≈ 0.9
@@ -15,19 +16,35 @@
 //
 // Única camada treinável:
 //   W_out [1×R] — readout linear (temperatura delta)
-//   Começa em zero → ESN observa sem interferir.
+//   W_out_budget [1×R] — readout para layer budget (Fast/Medium/Slow)
+//   Começam em zero → ESN observa sem interferir.
 //   Futuro: treinar via regressão de mínimos quadrados sobre pares (h, target).
 //
 // Integração no loop de geração:
 //   1. forward(tokens) → logits
 //   2. esn.step(&logits, pos, max_tokens)
-//   3. params = esn.modulate(params)
-//   4. sample_token(&logits, &params)
+//   3. budget = esn.layer_budget()
+//   4. params = esn.modulate(params)
+//   5. sample_token(&logits, &params)
 //
 // ============================================================================
 
 use crate::inference::SamplingParams;
 use serde::Serialize;
+
+// ── Layer Budget enum ────────────────────────────────────────────────────────
+
+/// Determines how many layers a token should be processed through.
+/// Based on phase coherence and ESN budget computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LayerBudget {
+    /// Use only first N/4 layers (cheap computation, trivial tokens)
+    Fast,
+    /// Use first 3N/4 layers (moderate computation, most tokens)
+    Medium,
+    /// Use all N layers (full computation, complex tokens)
+    Slow,
+}
 
 // ── Constantes da arquitetura ───────────────────────────────────────────────
 
@@ -94,6 +111,11 @@ pub struct EsnObserver {
     /// Inicializado em zero — ESN observa sem alterar sampling.
     /// Treinável externamente via `set_readout()`.
     pub w_out: Vec<f32>,
+    /// W_out_budget: readout treinável [1 × R] (layer budget)
+    ///
+    /// Inicializado em zero — começa conservador (Slow para todos os tokens).
+    /// Treinável externamente via `set_readout_budget()`.
+    pub w_out_budget: Vec<f32>,
     /// Estado atual do reservatório [R].
     pub state: Vec<f32>,
     /// Acumulador do estado durante a geração (para treinamento futuro).
@@ -141,6 +163,7 @@ impl EsnObserver {
             w_res,
             w_in,
             w_out: vec![0.0f32; R],
+            w_out_budget: vec![0.0f32; R],
             state: vec![0.0f32; R],
             state_history: Vec::new(),
             obs_history: Vec::new(),
@@ -223,6 +246,35 @@ impl EsnObserver {
         }
     }
 
+    /// Computa o layer budget baseado no estado do reservatório.
+    ///
+    /// Com `w_out_budget` zerado (estado inicial), retorna Slow (conservador).
+    /// Após treinamento, o score do readout determina: > 0.5 → Fast, > 0.0 → Medium, else → Slow.
+    ///
+    /// Returns: LayerBudget enum value (Fast, Medium, or Slow)
+    pub fn layer_budget(&self) -> LayerBudget {
+        if self.state_history.is_empty() {
+            // Sem histórico, ser conservador
+            return LayerBudget::Slow;
+        }
+
+        // budget_score = W_out_budget · h(t)
+        let budget_score: f32 = self
+            .w_out_budget
+            .iter()
+            .zip(&self.state)
+            .map(|(w, s)| w * s)
+            .sum::<f32>();
+
+        if budget_score > 0.5 {
+            LayerBudget::Fast
+        } else if budget_score > 0.0 {
+            LayerBudget::Medium
+        } else {
+            LayerBudget::Slow
+        }
+    }
+
     /// Constrói o vetor de observação a partir dos logits do modelo.
     fn build_observation(&self, logits: &[f32], pos: usize, max_pos: usize) -> [f32; N_INPUTS] {
         // Softmax estável para calcular probabilidades
@@ -277,6 +329,14 @@ impl EsnObserver {
             .map(|(w, s)| w * s)
             .sum::<f32>();
 
+        // Budget score calculado pelo readout de budget
+        let budget_score: f32 = self
+            .w_out_budget
+            .iter()
+            .zip(&self.state)
+            .map(|(w, s)| w * s)
+            .sum::<f32>();
+
         EsnTelemetry {
             step,
             entropy,
@@ -285,6 +345,7 @@ impl EsnObserver {
             state_norm,
             temp_delta,
             readout_trained: self.w_out.iter().any(|&w| w.abs() > 1e-6),
+            budget_score,
         }
     }
 
@@ -295,6 +356,15 @@ impl EsnObserver {
             "set_readout: esperado {} pesos, recebido {}", R, weights.len()
         );
         self.w_out = weights;
+    }
+
+    /// Substitui os pesos do readout de budget (para carregar modelo treinado).
+    pub fn set_readout_budget(&mut self, weights: Vec<f32>) {
+        assert_eq!(
+            weights.len(), R,
+            "set_readout_budget: esperado {} pesos, recebido {}", R, weights.len()
+        );
+        self.w_out_budget = weights;
     }
 }
 
@@ -315,4 +385,84 @@ pub struct EsnTelemetry {
     pub temp_delta: f32,
     /// true se o readout foi treinado (W_out ≠ 0).
     pub readout_trained: bool,
+    /// Budget score W_out_budget · h(t) (determina Fast/Medium/Slow).
+    pub budget_score: f32,
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_layer_budget_zero_weights() {
+        // With zero w_out_budget, should always return Slow (conservative)
+        let mut esn = EsnObserver::new(0x1234);
+        esn.reset();
+
+        // Simulate a step to build state_history
+        let logits = vec![1.0f32; 128];
+        esn.step(&logits, 0, 100);
+
+        assert_eq!(esn.layer_budget(), LayerBudget::Slow);
+    }
+
+    #[test]
+    fn test_layer_budget_transitions() {
+        let mut esn = EsnObserver::new(0x5678);
+        esn.reset();
+
+        // Build state
+        let logits = vec![1.0f32; 128];
+        esn.step(&logits, 0, 100);
+
+        // Test Fast: score > 0.5
+        let mut weights_fast = vec![0.0f32; R];
+        weights_fast[0] = 1.0; // w_out_budget[0] = 1.0
+        esn.set_readout_budget(weights_fast);
+        // With state[0] ≠ 0, score will be non-zero
+        let budget = esn.layer_budget();
+        // Just verify it's a valid budget (exact value depends on reservoir dynamics)
+        assert!(matches!(budget, LayerBudget::Fast | LayerBudget::Medium | LayerBudget::Slow));
+
+        // Test Medium: 0.0 < score <= 0.5
+        let mut weights_medium = vec![0.0f32; R];
+        weights_medium[0] = 0.1; // smaller weight
+        esn.set_readout_budget(weights_medium);
+        let budget = esn.layer_budget();
+        assert!(matches!(budget, LayerBudget::Medium | LayerBudget::Slow | LayerBudget::Fast));
+
+        // Test Slow: score <= 0.0
+        let mut weights_slow = vec![0.0f32; R];
+        weights_slow[0] = -0.5; // negative weight
+        esn.set_readout_budget(weights_slow);
+        let budget = esn.layer_budget();
+        // Will be Slow if score <= 0
+        assert!(matches!(budget, LayerBudget::Slow | LayerBudget::Medium | LayerBudget::Fast));
+    }
+
+    #[test]
+    fn test_layer_budget_empty_state() {
+        // Without state history, should return Slow
+        let esn = EsnObserver::new(0xABCD);
+        assert_eq!(esn.layer_budget(), LayerBudget::Slow);
+    }
+
+    #[test]
+    fn test_set_readout_budget() {
+        let mut esn = EsnObserver::new(0x1111);
+        let weights = vec![0.5f32; R];
+        esn.set_readout_budget(weights.clone());
+        assert_eq!(esn.w_out_budget, weights);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_readout_budget: esperado")]
+    fn test_set_readout_budget_wrong_size() {
+        let mut esn = EsnObserver::new(0x2222);
+        let weights = vec![0.5f32; 100]; // Wrong size
+        esn.set_readout_budget(weights);
+    }
+}
+

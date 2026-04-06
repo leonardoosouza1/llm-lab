@@ -17,6 +17,7 @@ pub mod architecture;
 pub use architecture::{ModelArchitecture, NormType, Activation};
 
 mod kv_cache;
+pub mod ntc_cache;
 pub(crate) use kv_cache::GpuKvCache;
 
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use crate::storage::quantized::{QuantizedTensor, quantize_bf16_to_q4, upload_quantized, QuantizationCpuResult, save_quantized_cache, load_quantized_cache};
 use crate::inference::forward::LayerTrace;
+use crate::lnn::esn::LayerBudget;
 
 // ── Tipos de erro ────────────────────────────────────────────────────────────
 
@@ -47,6 +49,41 @@ pub enum ModelError {
 }
 
 pub type ModelResult<T> = std::result::Result<T, ModelError>;
+
+// ── Phase Coherence Computation ──────────────────────────────────────────────
+
+/// Computes phase coherence (Kuramoto order parameter) from hidden state.
+/// Interprets hidden state as complex pairs: h[0]+ih[1], h[2]+ih[3], ...
+/// Returns Kuramoto order parameter r = |mean(exp(i*theta))|,
+/// where theta = atan2(h[2k+1], h[2k]).
+///
+/// Returns value in [0.0, 1.0]:
+/// - 0.0 = completely chaotic, random phases
+/// - 1.0 = total synchronization, all phases aligned
+pub fn phase_coherence(hidden: &[f32]) -> f32 {
+    if hidden.len() < 2 {
+        return 0.0;
+    }
+
+    let n = hidden.len() / 2;
+    let (mut sum_cos, mut sum_sin) = (0.0f32, 0.0f32);
+
+    for k in 0..n {
+        // Complex number: real = hidden[2k], imag = hidden[2k+1]
+        let x = hidden[2 * k];
+        let y = hidden[2 * k + 1];
+
+        // Normalize to unit circle
+        let norm = (x * x + y * y).sqrt().max(1e-8);
+        sum_cos += x / norm;
+        sum_sin += y / norm;
+    }
+
+    // Kuramoto order parameter: r = |mean(exp(i*theta))|
+    let mean_cos = sum_cos / n as f32;
+    let mean_sin = sum_sin / n as f32;
+    (mean_cos * mean_cos + mean_sin * mean_sin).sqrt()
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -255,6 +292,9 @@ pub struct CausalLM {
     pub gravity: Option<crate::lnn::gravity::GravitySystem>,
     /// Flag: se true, pesos estão em Q4 (quantizados INT4).
     pub quantized: bool,
+    /// Optional channel to send layer stimulus signals to the orchestrator.
+    #[cfg(feature = "experimental")]
+    pub stimulus_tx: Option<tokio::sync::mpsc::Sender<crate::experimental::orchestrator::LayerStimulus>>,
 }
 
 impl CausalLM {
@@ -580,6 +620,8 @@ impl CausalLM {
             cfc: None,
             gravity: None,
             quantized: false,
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
         })
     }
 
@@ -919,6 +961,335 @@ impl CausalLM {
             cfc,
             gravity,
             quantized: true,
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
+        })
+    }
+
+    /// Carrega modelo do formato .iara v2 (com suporte a multi-quant: BF16, FP8, Q4, Ternary).
+    ///
+    /// O arquivo .iara v2 contém metadados + dados de tensores com mmap zero-copy.
+    /// Suporta tensores em diferentes dtypes dependendo da receita de quantização.
+    pub fn load_from_iara(
+        iara_path: &Path,
+        cfg: ModelCfg,
+        arch: ModelArchitecture,
+        backend: Arc<dyn ComputeBackend>,
+    ) -> ModelResult<Self> {
+        use crate::storage::iara_format::{IaraV2Reader, IaraDtype};
+
+        let reader = IaraV2Reader::open(iara_path)
+            .map_err(|e| ModelError::Model(format!("Falha ao abrir arquivo .iara: {}", e)))?;
+
+        log::info!(
+            "⏳ Carregando modelo [{}] de .iara v2: {} camadas, hidden={}, vocab={}",
+            arch.family, cfg.num_layers, cfg.hidden_size, cfg.vocab_size
+        );
+
+        let tmap = &arch.tensor_map;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let max_seq = cfg.max_seq_len;
+
+        // ── Helpers para conversão de tipos ──────────────────────────────────
+        let bf16_from_bytes = |raw: &[u8]| -> ModelResult<AnyTensor> {
+            let bits = unsafe {
+                std::slice::from_raw_parts(
+                    raw.as_ptr() as *const u16,
+                    raw.len() / 2
+                )
+            };
+            // Shape será preenchida pelo chamador via tensor_meta
+            Ok(backend.upload_bf16(bits, &[bits.len()]))
+        };
+
+        let f32_from_f32_bytes = |raw: &[u8]| -> ModelResult<Vec<f32>> {
+            Ok(raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        };
+
+        // ── Embedding ────────────────────────────────────────────────────────
+        log::info!("  → embed_tokens");
+        let embed_meta = reader.tensor_meta(&tmap.embed)
+            .map_err(|e| ModelError::Model(format!("Embedding não encontrado: {}", e)))?;
+        let embed_data = reader.tensor_data(&tmap.embed)
+            .map_err(|e| ModelError::Model(format!("Dados do embedding não acessíveis: {}", e)))?;
+
+        let embed = match embed_meta.dtype {
+            IaraDtype::Bf16 => bf16_from_bytes(embed_data)?,
+            _ => return Err(ModelError::Model(
+                format!("Dtype não suportado para embedding: {:?}", embed_meta.dtype))),
+        };
+
+        // ── Camadas ──────────────────────────────────────────────────────────
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if i % 8 == 0 {
+                log::info!("  → layers {}/{}", i, cfg.num_layers);
+            }
+
+            // ── Norms (sempre F32) ───────────────────────────────────────────
+            let in_norm_name = &tmap.layer_tensor(i, &tmap.input_norm);
+            let (in_w, _) = {
+                let meta = reader.tensor_meta(in_norm_name)
+                    .map_err(|e| ModelError::Model(format!("Norm de entrada layer {}: {}", i, e)))?;
+                let data = reader.tensor_data(in_norm_name)
+                    .map_err(|e| ModelError::Model(format!("Dados norm entrada layer {}: {}", i, e)))?;
+                (f32_from_f32_bytes(data)?, meta.shape.clone())
+            };
+
+            let pa_norm_name = &tmap.layer_tensor(i, &tmap.post_attn_norm);
+            let (pa_w, _) = {
+                let meta = reader.tensor_meta(pa_norm_name)
+                    .map_err(|e| ModelError::Model(format!("Norm pós-attn layer {}: {}", i, e)))?;
+                let data = reader.tensor_data(pa_norm_name)
+                    .map_err(|e| ModelError::Model(format!("Dados norm pós-attn layer {}: {}", i, e)))?;
+                (f32_from_f32_bytes(data)?, meta.shape.clone())
+            };
+
+            let gpu_f32 = |data: &[f32]| -> AnyTensor {
+                backend.upload_f32(data, &[data.len()])
+            };
+
+            // ── Pesos de atenção e MLP (podem ser BF16, FP8, Q4) ────────────
+            let load_weight = |name: &str| -> ModelResult<LayerWeight> {
+                let meta = reader.tensor_meta(name)
+                    .map_err(|e| ModelError::Model(format!("Tensor {} não encontrado: {}", name, e)))?;
+                let data = reader.tensor_data(name)
+                    .map_err(|e| ModelError::Model(format!("Dados tensor {} não acessíveis: {}", name, e)))?;
+
+                match meta.dtype {
+                    IaraDtype::Bf16 => {
+                        let bits = unsafe {
+                            std::slice::from_raw_parts(
+                                data.as_ptr() as *const u16,
+                                data.len() / 2
+                            )
+                        };
+                        let tensor = backend.upload_bf16(bits, &meta.shape);
+                        Ok(LayerWeight::Bf16(tensor))
+                    }
+                    IaraDtype::Fp8E4m3 => {
+                        // FP8: dados + scales (f32 por linha)
+                        let scales = reader.tensor_scales_f32(name)
+                            .map_err(|e| ModelError::Model(format!("Escalas FP8 layer {}: {}", i, e)))?;
+
+                        // Upload FP8 diretamente como BF16 por enquanto
+                        // (conversão real de FP8→F32 seria feita no forward)
+                        // Para agora, fazer uma conversão simples: fp8 → f32 via scales
+                        let fp8_bytes = data;
+
+                        // Aproximação: dados FP8 estão compactados, precisamos expandir
+                        // Por segurança, vamos fazer upload como BF16 usando a escala
+                        log::warn!("⚠️  FP8 tensor '{}' — usando aproximação BF16 (FP8 decodificação será adicionada)", name);
+                        let bits = unsafe {
+                            std::slice::from_raw_parts(
+                                fp8_bytes.as_ptr() as *const u16,
+                                (fp8_bytes.len() / 2).min(meta.shape.iter().product::<usize>())
+                            )
+                        };
+                        let tensor = backend.upload_bf16(bits, &meta.shape);
+                        Ok(LayerWeight::Bf16(tensor))
+                    }
+                    IaraDtype::Q4 => {
+                        // Q4: dados + scales + zeros
+                        let scales_bytes = reader.tensor_scales(name)
+                            .map_err(|e| ModelError::Model(format!("Escalas Q4 layer {}: {}", i, e)))?;
+                        let zeros_bytes = reader.tensor_zeros(name)
+                            .map_err(|e| ModelError::Model(format!("Zeros Q4 layer {}: {}", i, e)))?;
+
+                        let group_size = meta.group_size;
+                        let [rows, cols] = [meta.shape[0], meta.shape[1]];
+                        let n_groups = cols / group_size;
+
+                        // Converter scales e zeros de bytes para f32
+                        let scales_f32: Vec<f32> = scales_bytes.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let zeros_f32: Vec<f32> = zeros_bytes.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        // Upload Q4 via backend
+                        let packed = backend.upload_q4(data, &[rows, cols / 2]);
+                        let scales = backend.upload_f32(&scales_f32, &[rows, n_groups]);
+                        let zeros = backend.upload_f32(&zeros_f32, &[rows, n_groups]);
+
+                        let quantized = crate::storage::quantized::QuantizedTensor {
+                            packed,
+                            scales,
+                            zeros,
+                            shape: [rows, cols],
+                            group_size,
+                        };
+                        Ok(LayerWeight::Q4(quantized))
+                    }
+                    IaraDtype::Ternary => {
+                        log::warn!("⚠️  Ternary tensor '{}' — suporte não implementado, pulando", name);
+                        // Por enquanto, fall back para BF16
+                        let bits = unsafe {
+                            std::slice::from_raw_parts(
+                                data.as_ptr() as *const u16,
+                                (data.len() / 2).min(meta.shape.iter().product::<usize>())
+                            )
+                        };
+                        let tensor = backend.upload_bf16(bits, &meta.shape);
+                        Ok(LayerWeight::Bf16(tensor))
+                    }
+                    _ => Err(ModelError::Model(format!("Dtype não suportado: {:?}", meta.dtype))),
+                }
+            };
+
+            let qbn = tmap.layer_tensor_opt(i, &tmap.attn_q_bias);
+            let kbn = tmap.layer_tensor_opt(i, &tmap.attn_k_bias);
+            let vbn = tmap.layer_tensor_opt(i, &tmap.attn_v_bias);
+            let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
+            let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
+
+            let get_optional_f32 = |name_opt: &Option<String>| -> ModelResult<Option<AnyTensor>> {
+                match name_opt {
+                    Some(name) => {
+                        let meta = reader.tensor_meta(name).ok();
+                        if meta.is_none() {
+                            return Ok(None);
+                        }
+                        let data = reader.tensor_data(name)
+                            .map_err(|e| ModelError::Model(format!("Dados tensor opcional {}: {}", name, e)))?;
+                        let f32_data = f32_from_f32_bytes(data)?;
+                        Ok(Some(gpu_f32(&f32_data)))
+                    }
+                    None => Ok(None),
+                }
+            };
+
+            layers.push(TransformerLayer {
+                wq:    load_weight(&tmap.layer_tensor(i, &tmap.attn_q))?,
+                wk:    load_weight(&tmap.layer_tensor(i, &tmap.attn_k))?,
+                wv:    load_weight(&tmap.layer_tensor(i, &tmap.attn_v))?,
+                wo:    load_weight(&tmap.layer_tensor(i, &tmap.attn_o))?,
+                wgate: load_weight(&tmap.layer_tensor(i, &tmap.mlp_gate))?,
+                wup:   load_weight(&tmap.layer_tensor(i, &tmap.mlp_up))?,
+                wdown: load_weight(&tmap.layer_tensor(i, &tmap.mlp_down))?,
+                q_bias: get_optional_f32(&qbn)?,
+                k_bias: get_optional_f32(&kbn)?,
+                v_bias: get_optional_f32(&vbn)?,
+                q_norm_w: get_optional_f32(&qnn)?,
+                k_norm_w: get_optional_f32(&knn)?,
+                input_norm_w: gpu_f32(&in_w),
+                post_attn_norm_w: gpu_f32(&pa_w),
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+            });
+        }
+
+        // Log QK norm detection
+        if layers.first().map_or(false, |l| l.q_norm_w.is_some()) {
+            log::info!("  → QK Normalization detectada: q_norm + k_norm em todas as camadas");
+        }
+
+        // ── Final norm ───────────────────────────────────────────────────────
+        let (nw, _) = {
+            let meta = reader.tensor_meta(&tmap.final_norm)
+                .map_err(|e| ModelError::Model(format!("Final norm não encontrado: {}", e)))?;
+            let data = reader.tensor_data(&tmap.final_norm)
+                .map_err(|e| ModelError::Model(format!("Dados final norm não acessíveis: {}", e)))?;
+            (f32_from_f32_bytes(data)?, meta.shape.clone())
+        };
+        let norm_w = backend.upload_f32(&nw, &[nw.len()]);
+
+        let norm_b = match &tmap.final_norm_bias {
+            Some(name) => {
+                if let Ok(meta) = reader.tensor_meta(name) {
+                    if let Ok(data) = reader.tensor_data(name) {
+                        let f32_data = f32_from_f32_bytes(data)?;
+                        Some(backend.upload_f32(&f32_data, &[f32_data.len()]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        // ── LM head ──────────────────────────────────────────────────────────
+        let lm_head = if !arch.tie_word_embeddings && reader.tensor_meta(&tmap.lm_head).is_ok() {
+            let meta = reader.tensor_meta(&tmap.lm_head)
+                .map_err(|e| ModelError::Model(format!("LM head não encontrado: {}", e)))?;
+            let data = reader.tensor_data(&tmap.lm_head)
+                .map_err(|e| ModelError::Model(format!("Dados LM head não acessíveis: {}", e)))?;
+
+            match meta.dtype {
+                IaraDtype::Bf16 => {
+                    let bits = unsafe {
+                        std::slice::from_raw_parts(
+                            data.as_ptr() as *const u16,
+                            data.len() / 2
+                        )
+                    };
+                    backend.upload_bf16(bits, &meta.shape)
+                }
+                _ => {
+                    log::warn!("⚠️  LM head com dtype não-BF16, usando embed_tokens (tied)");
+                    // Reload embedding as fallback
+                    let embed_data = reader.tensor_data(&tmap.embed)
+                        .map_err(|e| ModelError::Model(format!("Embedding fallback: {}", e)))?;
+                    bf16_from_bytes(embed_data)?
+                }
+            }
+        } else {
+            log::info!("  → lm_head: usando embed_tokens (tied weights)");
+            // Reload embedding as fallback
+            let embed_data = reader.tensor_data(&tmap.embed)
+                .map_err(|e| ModelError::Model(format!("Embedding fallback: {}", e)))?;
+            bf16_from_bytes(embed_data)?
+        };
+
+        // ── Contabilidade de VRAM ────────────────────────────────────────────
+        let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
+        let f32_bytes = |t: &AnyTensor| t.numel() * 4;
+        let layer_weight_bytes = |w: &LayerWeight| match w {
+            LayerWeight::Bf16(t) => bf16_bytes(t),
+            LayerWeight::Q4(qt) => {
+                let [rows, cols] = qt.shape;
+                let packed_bytes = rows * cols / 2;
+                let n_groups = cols / qt.group_size;
+                let scales_bytes = rows * n_groups * 4;
+                let zeros_bytes = rows * n_groups * 4;
+                packed_bytes + scales_bytes + zeros_bytes
+            }
+        };
+
+        let mut vram_bytes = bf16_bytes(&embed) + bf16_bytes(&lm_head);
+        for l in &layers {
+            vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk) + layer_weight_bytes(&l.wv)
+                        + layer_weight_bytes(&l.wo) + layer_weight_bytes(&l.wgate)
+                        + layer_weight_bytes(&l.wup) + layer_weight_bytes(&l.wdown);
+            vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
+            vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
+        }
+
+        log::info!("✅ Modelo [{}] carregado de .iara v2 — memória estimada: {:.2} GB", arch.family, vram_bytes as f64 / 1e9);
+
+        let scratch = ForwardScratchpad::new(&cfg, &backend);
+
+        Ok(Self {
+            embed,
+            layers,
+            norm_w,
+            norm_b,
+            lm_head,
+            cfg,
+            arch,
+            vram_bytes,
+            backend,
+            scratch,
+            cfc: None,
+            gravity: None,
+            quantized: false, // Será true se modelos Q4/FP8, por enquanto false
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
         })
     }
 
@@ -937,10 +1308,14 @@ impl CausalLM {
         }
     }
 
-    /// Forward pass via ComputeBackend.
+    /// Forward pass via ComputeBackend with optional early exit via phase coherence.
     /// Único download_f32(): logits finais [vocab_size] → CPU para sampling.
     /// Returns: (logits, layer_traces) onde layer_traces contém telemetria por camada.
-    pub fn forward(&mut self, token_ids: &[u32]) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
+    ///
+    /// Parâmetros:
+    /// - `token_ids`: token sequence to process
+    /// - `layer_budget`: how many layers to use (Fast/Medium/Slow), None = use all
+    pub fn forward(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
         let n    = token_ids.len();
         let h    = self.cfg.hidden_size;
         let nh   = self.cfg.num_heads;
@@ -970,7 +1345,28 @@ impl CausalLM {
         let activation = self.arch.activation;
         let n_layers = self.layers.len();
 
+        // ── Early exit thresholds and layer boundaries ──────────────────────
+        const EXIT_THRESHOLD_FAST: f32 = 0.85;
+        const EXIT_THRESHOLD_MEDIUM: f32 = 0.75;
+        let fast_layer_count = (n_layers + 3) / 4;         // first N/4 layers
+        let medium_layer_count = (3 * n_layers + 3) / 4;   // first 3N/4 layers
+
+        // Determine final layer to process based on budget
+        let final_layer = match layer_budget {
+            Some(LayerBudget::Fast) => fast_layer_count.saturating_sub(1),
+            Some(LayerBudget::Medium) => medium_layer_count.saturating_sub(1),
+            _ => n_layers - 1,  // Slow or None: use all layers
+        };
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Check if we should early exit based on budget
+            if layer_idx > final_layer {
+                log::debug!(
+                    "Early exit at layer {} (budget={:?}): skipping remaining layers",
+                    layer_idx, layer_budget
+                );
+                break;
+            }
             // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
             Self::apply_norm(
                 &self.backend, norm_type,
@@ -1320,6 +1716,37 @@ impl CausalLM {
             Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
             log::trace!("layer {layer_idx}: done");
 
+            // ── Phase coherence check for early exit (decode-only) ────────────────
+            // Only check for early exit during token generation (n == 1)
+            let mut early_exit_flag = false;
+            if n == 1 && layer_budget.is_none() {
+                let x_data = self.backend.download_f32(&self.scratch.x);
+                let start_idx = (n - 1) * h;
+                let end_idx = start_idx + h;
+                let token_data = if end_idx <= x_data.len() {
+                    &x_data[start_idx..end_idx]
+                } else {
+                    &x_data[..h.min(x_data.len())]
+                };
+
+                let coherence = phase_coherence(token_data);
+
+                // Check phase coherence at layer boundaries
+                if layer_idx + 1 == fast_layer_count && coherence > EXIT_THRESHOLD_FAST {
+                    log::debug!(
+                        "Phase coherence {:.3} > {:.3} at fast layer boundary (layer {}): early exit",
+                        coherence, EXIT_THRESHOLD_FAST, layer_idx
+                    );
+                    early_exit_flag = true;
+                } else if layer_idx + 1 == medium_layer_count && coherence > EXIT_THRESHOLD_MEDIUM {
+                    log::debug!(
+                        "Phase coherence {:.3} > {:.3} at medium layer boundary (layer {}): early exit",
+                        coherence, EXIT_THRESHOLD_MEDIUM, layer_idx
+                    );
+                    early_exit_flag = true;
+                }
+            }
+
             // ── Per-layer telemetry (sampled, decode-only) ─────────────────────
             // download_f32 é um sync implícito que para o pipeline GPU.
             // Amostramos apenas a cada 8 camadas + última para manter o dashboard
@@ -1378,7 +1805,30 @@ impl CausalLM {
                 }
             };
 
-            layer_traces.push(trace);
+            layer_traces.push(trace.clone());
+
+            // ── Send stimulus to orchestrator (experimental) ──────────────────
+            #[cfg(feature = "experimental")]
+            {
+                // Only send every 4th layer to avoid channel pressure.
+                // Use the computed residual_norm and max_activation from the trace.
+                if let Some(tx) = &self.stimulus_tx {
+                    if layer_idx % 4 == 0 {
+                        let stim = crate::experimental::orchestrator::LayerStimulus {
+                            layer_idx,
+                            activation_energy: trace.max_activation,
+                            residual_norm: trace.residual_norm,
+                        };
+                        let _ = tx.try_send(stim);
+                    }
+                }
+            }
+
+            // Early exit if phase coherence threshold exceeded
+            if early_exit_flag {
+                log::info!("Early exit triggered at layer {}", layer_idx);
+                break;
+            }
         }
 
         // ── Gravity + CfC (decode-only: n == 1) ──────────────────────────────
@@ -1518,5 +1968,137 @@ pub(crate) fn apply_rope(
                 x[base + half_dim + i] = x0 * s + x1 * c;
             }
         }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::iara_format::IaraV2Reader;
+
+    #[test]
+    fn test_iara_v2_reader_opens_file() {
+        let iara_path = std::path::Path::new("/home/leonardo/projects/LLM/llm-lab/models/qwen2.5-1.5b-fp8.iara");
+
+        // Skip test if file doesn't exist (CI environment)
+        if !iara_path.exists() {
+            println!("Skipping IARA test: file not found");
+            return;
+        }
+
+        let reader = IaraV2Reader::open(iara_path)
+            .expect("Failed to open IARA v2 file");
+
+        // Verify metadata
+        assert_eq!(reader.header.metadata.architecture, "qwen2");
+        assert_eq!(reader.header.metadata.n_layers, 28);
+        assert_eq!(reader.header.metadata.hidden_dim, 1536);
+        assert!(reader.header.metadata.vocab_size > 0);
+
+        // Verify tensors exist
+        assert!(reader.header.tensors.len() > 0);
+
+        println!("✓ IARA v2 Reader test passed");
+        println!("  Architecture: {}", reader.header.metadata.architecture);
+        println!("  Layers: {}", reader.header.metadata.n_layers);
+        println!("  Hidden dim: {}", reader.header.metadata.hidden_dim);
+        println!("  Tensors: {}", reader.header.tensors.len());
+    }
+
+    #[test]
+    fn test_iara_v2_tensor_meta_access() {
+        let iara_path = std::path::Path::new("/home/leonardo/projects/LLM/llm-lab/models/qwen2.5-1.5b-fp8.iara");
+
+        if !iara_path.exists() {
+            println!("Skipping IARA tensor meta test: file not found");
+            return;
+        }
+
+        let reader = IaraV2Reader::open(iara_path)
+            .expect("Failed to open IARA v2 file");
+
+        // Test accessing a tensor's metadata
+        let tensor_names = reader.tensor_names();
+        assert!(tensor_names.len() > 0);
+
+        // Try to access first tensor's metadata
+        if let Some(first_tensor) = tensor_names.first() {
+            let meta = reader.tensor_meta(first_tensor)
+                .expect("Failed to get tensor metadata");
+            assert!(meta.shape.len() > 0);
+            assert!(meta.data_length > 0);
+            println!("✓ Tensor metadata access test passed");
+            println!("  First tensor: {}", first_tensor);
+            println!("  Shape: {:?}", meta.shape);
+            println!("  Dtype: {:?}", meta.dtype);
+        }
+    }
+
+    // ── Phase Coherence Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_phase_coherence_all_aligned() {
+        // All phases aligned (all complex numbers pointing same direction)
+        // Should return ~1.0
+        let hidden = vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let coherence = phase_coherence(&hidden);
+        assert!(coherence > 0.99, "Expected coherence ~1.0, got {}", coherence);
+    }
+
+    #[test]
+    fn test_phase_coherence_random() {
+        // Random phases (completely chaotic)
+        // Should return ~0.0
+        let hidden = vec![
+            1.0, -1.0, // atan2(-1, 1) ≈ -π/4
+            -1.0, 1.0, // atan2(1, -1) ≈ 3π/4
+            1.0, 1.0,  // atan2(1, 1) ≈ π/4
+            -1.0, -1.0, // atan2(-1, -1) ≈ -3π/4
+        ];
+        let coherence = phase_coherence(&hidden);
+        assert!(coherence < 0.1, "Expected coherence ~0.0 for random phases, got {}", coherence);
+    }
+
+    #[test]
+    fn test_phase_coherence_partially_aligned() {
+        // Half aligned, half not
+        // Should return ~0.5
+        let hidden = vec![
+            1.0, 0.0, // phase 0
+            1.0, 0.0, // phase 0
+            1.0, 0.0, // phase 0
+            0.0, 1.0, // phase π/2
+            0.0, 1.0, // phase π/2
+            0.0, 1.0, // phase π/2
+        ];
+        let coherence = phase_coherence(&hidden);
+        // Two groups at 90° gives coherence = sqrt(0.5) ≈ 0.707
+        assert!(coherence > 0.5 && coherence < 0.85, "Expected coherence ~0.707, got {}", coherence);
+    }
+
+    #[test]
+    fn test_phase_coherence_empty() {
+        let hidden = vec![];
+        let coherence = phase_coherence(&hidden);
+        assert_eq!(coherence, 0.0);
+    }
+
+    #[test]
+    fn test_phase_coherence_single_pair() {
+        let hidden = vec![1.0, 0.0];
+        let coherence = phase_coherence(&hidden);
+        assert!(coherence > 0.99);
+    }
+
+    #[test]
+    fn test_layer_budget_enum() {
+        // Test enum values exist and can be compared
+        assert_eq!(LayerBudget::Fast, LayerBudget::Fast);
+        assert_eq!(LayerBudget::Medium, LayerBudget::Medium);
+        assert_eq!(LayerBudget::Slow, LayerBudget::Slow);
+        assert_ne!(LayerBudget::Fast, LayerBudget::Medium);
+        assert_ne!(LayerBudget::Medium, LayerBudget::Slow);
     }
 }

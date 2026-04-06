@@ -82,4 +82,37 @@ export const store = reactive({
 
   // Trace tab — token-by-token timeline built from pipeline_result
   traceTokens: [],  // [{step, token, energy, top_logit, prob, ms_token, entropy, anomaly}]
+
+  // SAE (Sparse Autoencoder) interpretability
+  sae: {
+    active: false,
+    layer: null,
+    activeFeatures: 0,
+    topFeatures: [],  // [[feature_idx, activation_count, description], ...]
+    sparsity: 0,
+    loss: 0,
+    step: 0,
+    history: []  // [{step, loss, sparsity, activeFeatures}]
+  },
+
+  // NTC KV-Cache compression
+  ntc: {
+    active: false,
+    gridSize: 0,
+    latentDim: 0,
+    vramMb: 0,
+    reconstructionLoss: 0,
+    compressedTokens: 0,
+    recentTokens: 0,
+    history: []  // [{step, reconstructionLoss, vramMb, compressionRatio}]
+  },
+
+  // Quantization status
+  quant: {
+    mode: 'bf16',  // 'bf16' | 'q4' | 'fp8' | 'bitnet'
+    vramMb: 0,
+    baselineVramMb: 0,
+    nrmse: 0,
+    perLayerError: []
+  }
 });

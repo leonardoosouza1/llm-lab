@@ -56,13 +56,14 @@ pub fn forward_traced(
     model: &mut CausalLM,
     token_ids: &[u32],
     sampling: &SamplingParams,
+    layer_budget: Option<crate::lnn::esn::LayerBudget>,
 ) -> ModelResult<GenerationStep> {
     let total_start = Instant::now();
     let num_layers  = model.cfg.num_layers;
 
     // GPU forward: embedding → transformer blocks → lm_head → logits [vocab]
     // Returns both logits and per-layer traces with real telemetry
-    let (logits, mut layer_traces) = model.forward(token_ids)?;
+    let (logits, mut layer_traces) = model.forward(token_ids, layer_budget)?;
 
     let elapsed_us = total_start.elapsed().as_micros();
     let us_per_layer = elapsed_us / num_layers.max(1) as u128;

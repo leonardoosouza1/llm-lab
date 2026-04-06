@@ -25,6 +25,7 @@ pub mod esn;
 pub mod gravity;
 pub mod cfc;
 pub mod train;
+pub mod sae;
 
 #[allow(unused_imports)]
 pub use esn::EsnObserver;
@@ -34,3 +35,5 @@ pub use gravity::{GravitySystem, GravityConfig, GravityResult};
 pub use cfc::{CfcLayer, CfcConfig};
 #[allow(unused_imports)]
 pub use train::{LnnTrainer, LnnTrainResult, LnnTrainTelemetry, RewardSignal};
+#[allow(unused_imports)]
+pub use sae::{SparseAutoencoder, SaeConfig, SaeObservation};

@@ -1,0 +1,11 @@
+[package]
+name = "ck-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+compute-core = { path = "../compute-core" }
+
+[features]
+default = []
+composable-kernel = []

@@ -109,7 +109,7 @@ impl SpeculativeEngine {
         let mut current_ids = input_ids.to_vec();
 
         for _ in 0..k {
-            let (logits, _traces) = draft_model.forward(&current_ids)?;
+            let (logits, _traces) = draft_model.forward(&current_ids, None)?;
             let token = sample_greedy(&logits);
 
             if eos_ids.contains(&token) {
@@ -134,7 +134,7 @@ impl SpeculativeEngine {
         let mut verify_ids = input_ids.to_vec();
         verify_ids.extend_from_slice(&draft_tokens);
 
-        let (target_logits, _traces) = target_model.forward(&verify_ids)?;
+        let (target_logits, _traces) = target_model.forward(&verify_ids, None)?;
 
         // Phase 3: Accept/reject
         // target_logits contains logits for the last position only

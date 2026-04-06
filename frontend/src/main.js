@@ -265,6 +265,107 @@ function switchTab(tab) {
       requestAnimationFrame(() => { iframe.style.height = ''; });
     }
   }
+  if (tab === 'quant') {
+    renderQuantPanel();
+  }
+  if (tab === 'ntc') {
+    renderNtcPanel();
+  }
+  if (tab === 'sae') {
+    renderSaePanel();
+  }
+}
+
+function renderQuantPanel() {
+  const canvas = document.getElementById('quant-error-heatmap');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const errors = store.quant.perLayerError || [];
+
+  ctx.fillStyle = '#0a0e27';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (errors.length === 0) {
+    ctx.fillStyle = '#6b7fa3';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Module not active', canvas.width / 2, canvas.height / 2);
+    return;
+  }
+
+  const cellWidth = canvas.width / errors.length;
+  const cellHeight = canvas.height;
+  const maxError = Math.max(...errors, 0.05);
+
+  errors.forEach((error, i) => {
+    const x = i * cellWidth;
+    const intensity = Math.min(1, error / maxError);
+    const hue = 0;
+    const lightness = 25 + 50 * (1 - intensity);
+    ctx.fillStyle = `hsl(${hue}, 100%, ${lightness}%)`;
+    ctx.fillRect(x, 0, cellWidth, cellHeight);
+  });
+
+  updateQuantMetrics();
+}
+
+function renderNtcPanel() {
+  import('./charts/ntc_grid_chart.js').then(m => {
+    m.updateNtcCharts();
+  });
+  updateNtcMetrics();
+}
+
+function updateNtcMetrics() {
+  const recentEl = document.getElementById('ntc-recent-tokens');
+  const compressedEl = document.getElementById('ntc-compressed-tokens');
+  const ratioEl = document.getElementById('ntc-compression-ratio');
+
+  if (recentEl) recentEl.textContent = `${store.ntc.recentTokens} tokens`;
+  if (compressedEl) compressedEl.textContent = `${store.ntc.compressedTokens} tokens`;
+  if (ratioEl) {
+    const ratio = store.ntc.recentTokens > 0
+      ? (store.ntc.recentTokens / Math.max(1, store.ntc.compressedTokens)).toFixed(2)
+      : '—';
+    ratioEl.textContent = ratio + '×';
+  }
+}
+
+function renderSaePanel() {
+  import('./charts/sae_features_chart.js').then(m => {
+    m.updateSaeChart();
+  });
+  updateSaeMetrics();
+}
+
+function updateSaeMetrics() {
+  const sparsityEl = document.getElementById('sae-sparsity-percent');
+  const sparsityBarEl = document.getElementById('sae-sparsity-bar');
+  const lossEl = document.getElementById('sae-loss-value');
+  const activeEl = document.getElementById('sae-active-features');
+
+  if (sparsityEl) sparsityEl.textContent = (store.sae.sparsity * 100).toFixed(2) + '%';
+  if (sparsityBarEl) sparsityBarEl.style.width = (store.sae.sparsity * 100) + '%';
+  if (lossEl) lossEl.textContent = store.sae.loss.toFixed(6);
+  if (activeEl) activeEl.textContent = store.sae.activeFeatures;
+}
+
+function updateQuantMetrics() {
+  const vramLabel = document.getElementById('quant-vram-label');
+  const vramBar = document.getElementById('quant-vram-bar');
+  const baselineLabel = document.getElementById('quant-baseline-label');
+  const currentLabel = document.getElementById('quant-current-label');
+  const nrmseValue = document.getElementById('quant-nrmse-value');
+
+  if (vramLabel) vramLabel.textContent = store.quant.vramMb + ' MB';
+  if (baselineLabel) baselineLabel.textContent = store.quant.baselineVramMb + ' MB';
+  if (currentLabel) currentLabel.textContent = store.quant.vramMb + ' MB';
+  if (nrmseValue) nrmseValue.textContent = store.quant.nrmse.toFixed(4);
+
+  if (vramBar && store.quant.baselineVramMb > 0) {
+    const pct = Math.min(100, (store.quant.vramMb / store.quant.baselineVramMb) * 100);
+    vramBar.style.width = pct + '%';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -635,7 +736,43 @@ createApp({
       })
     );
 
+    // ── Quant mode selector ────────────────────────────────────────────────
+    const quantModeSelect = document.getElementById('quant-mode-select');
+    if (quantModeSelect) {
+      quantModeSelect.addEventListener('change', function() {
+        store.quant.mode = this.value;
+        // Could also send to backend via wsManager if needed
+      });
+    }
+
     // Graph controls now handled internally by force_graph.js bindControls()
+
+    // ── SAE state ──────────────────────────────────────────────────────────
+    watch(() => [store.sae.step, store.sae.topFeatures.length], () => {
+      if (store.activeTab === 'sae') {
+        import('./charts/sae_features_chart.js').then(m => {
+          m.updateSaeChart();
+        });
+        updateSaeMetrics();
+      }
+    });
+
+    // ── NTC state ──────────────────────────────────────────────────────────
+    watch(() => [store.ntc.gridSize, store.ntc.history.length], () => {
+      if (store.activeTab === 'ntc') {
+        import('./charts/ntc_grid_chart.js').then(m => {
+          m.updateNtcCharts();
+        });
+        updateNtcMetrics();
+      }
+    });
+
+    // ── Quant state ────────────────────────────────────────────────────────
+    watch(() => [store.quant.mode, store.quant.vramMb, store.quant.perLayerError.length], () => {
+      if (store.activeTab === 'quant') {
+        renderQuantPanel();
+      }
+    });
 
     console.log('✅ IARA Dashboard v3 iniciado');
   },

@@ -6,6 +6,7 @@
 mod acp;        // Agent Communication Protocol (ACP) module
 mod api;
 mod debug;
+mod fire_test;  // Performance stress test ("fire test")
 mod generation;
 mod hardware;
 mod inference;
@@ -44,6 +45,179 @@ use sysinfo::System; // Importa System
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+
+    // Check for special flags first
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && (args[1] == "--fire-test" || args[1] == "-f") {
+        fire_test::run_fire_tests();
+        return Ok(());
+    }
+
+    // Convert safetensors → .iara v2
+    // Usage: iara-engine --convert <model_dir> [--recipe fp8|q4|aggressive] [--output file.iara]
+    if args.len() > 2 && args[1] == "--convert" {
+        let model_dir = std::path::PathBuf::from(&args[2]);
+        let recipe_name = args.iter().position(|a| a == "--recipe")
+            .map(|i| args.get(i + 1).map(|s| s.as_str()))
+            .flatten()
+            .unwrap_or("fp8");
+        let output = args.iter().position(|a| a == "--output")
+            .map(|i| args.get(i + 1).cloned())
+            .flatten()
+            .unwrap_or_else(|| {
+                let stem = model_dir.file_name()
+                    .unwrap_or_default().to_string_lossy();
+                format!("{}.iara", stem)
+            });
+
+        // Read config.json for model metadata (needed for pulse recipe)
+        let config_path = model_dir.join("config.json");
+        let config: serde_json::Value = if config_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?
+        } else {
+            eprintln!("⚠️  config.json not found at {}", config_path.display());
+            std::process::exit(1);
+        };
+
+        let n_layers = config.get("num_hidden_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32) as usize;
+
+        let recipe = match recipe_name {
+            "fp8" => storage::iara_format::QuantRecipe::fp8_standard(),
+            "q4" => storage::iara_format::QuantRecipe::q4_standard(),
+            "aggressive" => storage::iara_format::QuantRecipe::aggressive(),
+            "pulse" => storage::iara_format::QuantRecipe::pulse(n_layers),
+            _ => {
+                eprintln!("Unknown recipe: {}. Use: fp8, q4, aggressive, pulse", recipe_name);
+                std::process::exit(1);
+            }
+        };
+
+        // Build metadata
+        let metadata = storage::iara_format::IaraV2Metadata {
+            architecture: config.get("model_type")
+                .and_then(|v| v.as_str()).unwrap_or("unknown").into(),
+            hidden_dim: config.get("hidden_size")
+                .and_then(|v| v.as_u64()).unwrap_or(4096) as usize,
+            n_layers: n_layers,
+            vocab_size: config.get("vocab_size")
+                .and_then(|v| v.as_u64()).unwrap_or(32000) as usize,
+            n_heads: config.get("num_attention_heads")
+                .and_then(|v| v.as_u64()).unwrap_or(32) as usize,
+            n_kv_heads: config.get("num_key_value_heads")
+                .and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+            intermediate_dim: config.get("intermediate_size")
+                .and_then(|v| v.as_u64()).unwrap_or(11008) as usize,
+            rope_theta: config.get("rope_theta")
+                .and_then(|v| v.as_f64()).unwrap_or(10000.0),
+            source_model: model_dir.file_name()
+                .unwrap_or_default().to_string_lossy().into(),
+            converted_at: chrono::Utc::now().to_rfc3339(),
+            iara_version: "2.0".into(),
+            quant_recipe: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("default".into(), recipe_name.into());
+                m
+            },
+            original_size_bytes: 0,
+            converted_size_bytes: 0,
+            compression_ratio: 1.0,
+        };
+
+        println!("🔄 Converting: {} → {}", model_dir.display(), output);
+        println!("   Recipe: {}", recipe_name);
+
+        let output_path = std::path::PathBuf::from(&output);
+        match storage::iara_format::convert_safetensors_to_iara(
+            &model_dir, &output_path, &recipe, metadata
+        ) {
+            Ok(size) => {
+                println!("✅ Conversion complete: {:.1} MB", size as f64 / 1e6);
+
+                // Print summary
+                if let Ok(reader) = storage::iara_format::IaraV2Reader::open(&output_path) {
+                    println!("\n{}", reader.summary());
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Conversion failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Analyze tensors in an .iara file
+    // Usage: iara-engine --analyze-importance <model.iara>
+    if args.len() > 2 && args[1] == "--analyze-importance" {
+        let iara_path = std::path::PathBuf::from(&args[2]);
+        match storage::iara_format::IaraV2Reader::open(&iara_path) {
+            Ok(reader) => {
+                println!("📊 Tensor Analysis: {}", iara_path.display());
+                println!("{}", reader.summary());
+                println!("\n✅ Analysis complete");
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to analyze {}: {}", iara_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // Prune dead tensors from an .iara file
+    // Usage: iara-engine --prune <model.iara> --tensors tensor1,tensor2 [--output pruned.iara]
+    if args.len() > 2 && args[1] == "--prune" {
+        let iara_path = std::path::PathBuf::from(&args[2]);
+        let tensors_str = args.iter().position(|a| a == "--tensors")
+            .map(|i| args.get(i + 1).map(|s| s.as_str()))
+            .flatten()
+            .unwrap_or("");
+        let output = args.iter().position(|a| a == "--output")
+            .map(|i| args.get(i + 1).cloned())
+            .flatten()
+            .unwrap_or_else(|| {
+                let stem = iara_path.file_stem()
+                    .unwrap_or_default().to_string_lossy();
+                format!("{}_pruned.iara", stem)
+            });
+
+        let tensors_to_prune: Vec<String> = tensors_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if tensors_to_prune.is_empty() {
+            eprintln!("⚠️  No tensors specified. Use --tensors tensor1,tensor2,...");
+            std::process::exit(1);
+        }
+
+        match storage::surgery::TensorSurgeon::from_iara(&iara_path) {
+            Ok(mut surgeon) => {
+                surgeon.prune(&tensors_to_prune);
+                let report = surgeon.report();
+                println!("{}", report.display());
+
+                match surgeon.export(std::path::Path::new(&output)) {
+                    Ok(size) => {
+                        println!("\n✅ Pruned model exported: {} ({:.1} MB)", output, size as f64 / 1e6);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Export failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to open {}: {}", iara_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     // 1. Hardware init
     let hw = HardwareManager::new()?;
@@ -171,12 +345,20 @@ async fn run_engine_loop(
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
     frame_tx: broadcast::Sender<String>,
 ) {
+    #[cfg(feature = "experimental")]
+    use crate::experimental::orchestrator::PulseOrchestrator;
+
     const MAX_STEPS: usize = 256;
     const ESN_SEED: u64 = 0xDEAD_BEEF_1337_4242;
 
     // ── LNN Trainer: persiste entre gerações ─────────────────────────
     // Inicializado lazy na primeira geração com CfC habilitado.
     let mut lnn_trainer: Option<LnnTrainer> = None;
+
+    // ── Experimental Orchestrator ──────────────────────────────────────
+    // Created lazily when the model is loaded (num_layers known).
+    #[cfg(feature = "experimental")]
+    let mut orchestrator: Option<PulseOrchestrator> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -185,10 +367,28 @@ async fn run_engine_loop(
 
                 // Check model is ready
                 {
-                    let guard = model.lock().await;
+                    let mut guard = model.lock().await;
                     if guard.is_none() {
                         let _ = frame_tx.send(r#"{"type":"status","message":"Nenhum modelo carregado. Selecione um no painel."}"#.to_string());
                         continue;
+                    }
+
+                    // Initialize orchestrator lazily on first generation
+                    #[cfg(feature = "experimental")]
+                    {
+                        if orchestrator.is_none() {
+                            if let Some(m) = guard.as_ref() {
+                                let num_layers = m.cfg.num_layers;
+                                log::info!("Initializing PulseOrchestrator with {} layers", num_layers);
+                                let (stim_tx, stim_rx) = tokio::sync::mpsc::channel(256);
+                                orchestrator = Some(PulseOrchestrator::new(num_layers, stim_rx));
+
+                                // Attach stimulus_tx to model for this and subsequent generations
+                                if let Some(m) = guard.as_mut() {
+                                    m.stimulus_tx = Some(stim_tx);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -234,7 +434,7 @@ async fn run_engine_loop(
                     let mut guard = model.lock().await;
                     if let Some(m) = guard.as_mut() {
                         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-                            if let Err(e) = m.forward(&[tok]) {
+                            if let Err(e) = m.forward(&[tok], None) {
                                 log::error!("Prefill error: {}", e);
                                 let _ = frame_tx.send(serde_json::json!({
                                     "type": "status",
@@ -262,7 +462,8 @@ async fn run_engine_loop(
                             Some(m) => m,
                             None => break,
                         };
-                        match forward_traced(m, &[decode_token], &sampling) {
+                        let layer_budget = esn.layer_budget();
+                        match forward_traced(m, &[decode_token], &sampling, Some(layer_budget)) {
                             Ok(s) => s,
                             Err(e) => {
                                 log::error!("Forward error step {}: {}", step, e);
@@ -275,6 +476,24 @@ async fn run_engine_loop(
                         }
                     };
                     decode_token = gen_step.token_id;
+
+                    // ── Orchestrator tick (experimental) ────────────────────
+                    #[cfg(feature = "experimental")]
+                    {
+                        // Tick the liquid network physics and homeostasis.
+                        if let Some(ref mut orch) = orchestrator {
+                            orch.tick();
+                            let orch_state = orch.state();
+                            let _ = frame_tx.send(serde_json::json!({
+                                "type": "orchestrator_state",
+                                "step": step,
+                                "is_sleeping": orch_state.is_sleeping,
+                                "dominant_mode": orch_state.dominant_mode.to_string(),
+                                "global_coherence": orch_state.global_coherence,
+                                "stress": orch_state.stress,
+                            }).to_string());
+                        }
+                    }
 
                     // Não acumula tokens especiais/EOS no texto visível
                     if eos_ids.contains(&decode_token) {

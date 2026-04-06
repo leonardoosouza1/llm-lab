@@ -97,6 +97,39 @@
         <span class="tab-icon">🔭</span>
         <span class="tab-label">Observatory</span>
       </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="quant"
+        aria-selected="false"
+        aria-controls="panel-quant"
+        id="tab-btn-quant"
+      >
+        <span class="tab-icon">💾</span>
+        <span class="tab-label">Quant</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="ntc"
+        aria-selected="false"
+        aria-controls="panel-ntc"
+        id="tab-btn-ntc"
+      >
+        <span class="tab-icon">🗜️</span>
+        <span class="tab-label">NTC</span>
+      </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="sae"
+        aria-selected="false"
+        aria-controls="panel-sae"
+        id="tab-btn-sae"
+      >
+        <span class="tab-icon">🧠</span>
+        <span class="tab-label">SAE</span>
+      </button>
     </nav>
 
     <div id="status-area" role="status" aria-live="polite" aria-label="Connection and system status">
@@ -826,6 +859,266 @@
         title="IARA Physics Observatory"
         loading="lazy"
       ></iframe>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: QUANT
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-quant"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-quant"
+      tabindex="0"
+    >
+      <div class="panel-grid-quant">
+
+        <!-- Quantization Status Card -->
+        <div class="glass-panel quant-status-box" aria-label="Quantization mode and settings">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">💾</span>
+              Quantization Status
+            </h2>
+          </div>
+          <div style="padding: 16px; display: flex; flex-direction: column; gap: 12px;">
+            <!-- Mode selector -->
+            <div>
+              <label for="quant-mode-select" style="display: block; font-size: 11px; color: #a78bfa; font-weight: 600; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em;">Mode</label>
+              <select id="quant-mode-select" class="control-select" style="width: 100%;" aria-label="Select quantization mode">
+                <option value="bf16">BF16</option>
+                <option value="q4">Q4</option>
+                <option value="fp8">FP8</option>
+                <option value="bitnet">BitNet</option>
+              </select>
+            </div>
+
+            <!-- VRAM usage bar -->
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 11px; font-weight: 600; color: #a78bfa; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: 0.05em;">VRAM Usage</span>
+                <span id="quant-vram-label" style="font-size: 11px; color: #c4b5fd; font-family: 'JetBrains Mono', monospace;">— MB</span>
+              </div>
+              <div style="height: 8px; background: rgba(51, 65, 85, 0.6); border-radius: 4px; overflow: hidden;">
+                <div id="quant-vram-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #06b6d4, #3b82f6); transition: width 0.3s ease;"></div>
+              </div>
+              <div style="display: flex; justify-content: space-between; margin-top: 4px; font-size: 9px; color: #6b7fa3;">
+                <span>Baseline: <span id="quant-baseline-label">— MB</span></span>
+                <span>Current: <span id="quant-current-label">— MB</span></span>
+              </div>
+            </div>
+
+            <!-- NRMSE Widget -->
+            <div>
+              <span style="font-size: 11px; font-weight: 600; color: #a78bfa; text-transform: uppercase; letter-spacing: 0.05em;">NRMSE</span>
+              <div style="margin-top: 6px; padding: 8px 12px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; border-left: 3px solid #f59e0b;">
+                <span id="quant-nrmse-value" style="font-size: 14px; font-weight: bold; color: #fbbf24; font-family: 'JetBrains Mono', monospace;">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Per-layer Error Heatmap -->
+        <div class="glass-panel quant-heatmap-box" aria-label="Per-layer quantization error">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔥</span>
+              Per-Layer Error
+            </h2>
+          </div>
+          <div class="canvas-wrapper" style="height: 200px;">
+            <canvas
+              id="quant-error-heatmap"
+              width="800"
+              height="200"
+              aria-label="Per-layer quantization error heatmap"
+            ></canvas>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: NTC
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-ntc"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-ntc"
+      tabindex="0"
+    >
+      <div class="panel-grid-ntc">
+
+        <!-- Latent Grid Heatmap -->
+        <div class="glass-panel ntc-grid-box" aria-label="NTC latent space grid">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">📊</span>
+              Latent Grid (grid_size × latent_dim)
+            </h2>
+          </div>
+          <div class="canvas-wrapper" style="height: 250px;">
+            <canvas
+              id="ntc-grid-heatmap"
+              width="800"
+              height="250"
+              aria-label="NTC latent grid heatmap"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- Reconstruction Loss Timeline -->
+        <div class="glass-panel ntc-loss-box" aria-label="NTC reconstruction loss over time">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">📈</span>
+              Reconstruction Loss
+            </h2>
+          </div>
+          <div class="canvas-wrapper canvas-wrapper--wide" style="height: 200px;">
+            <canvas
+              id="ntc-loss-chart"
+              width="800"
+              height="200"
+              aria-label="Reconstruction loss line chart"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- VRAM Comparison -->
+        <div class="glass-panel ntc-vram-box" aria-label="VRAM usage comparison">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">💾</span>
+              VRAM Comparison
+            </h2>
+          </div>
+          <div class="canvas-wrapper" style="height: 200px;">
+            <canvas
+              id="ntc-vram-chart"
+              width="600"
+              height="200"
+              aria-label="VRAM usage comparison bar chart"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- Token Compression Info -->
+        <div class="glass-panel ntc-tokens-box" aria-label="Token compression statistics">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔤</span>
+              Token Compression
+            </h2>
+          </div>
+          <div style="padding: 16px; display: flex; flex-direction: column; gap: 12px;">
+            <div>
+              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Recent Tokens (Exact)</span>
+              <div id="ntc-recent-tokens" style="margin-top: 8px; padding: 8px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #06b6d4;">—</div>
+            </div>
+            <div>
+              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Compressed (NTC)</span>
+              <div id="ntc-compressed-tokens" style="margin-top: 8px; padding: 8px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #34d399;">—</div>
+            </div>
+            <div>
+              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Compression Ratio</span>
+              <div id="ntc-compression-ratio" style="margin-top: 8px; padding: 12px; background: rgba(6, 182, 212, 0.1); border-left: 3px solid #06b6d4; border-radius: 4px; font-size: 14px; font-weight: bold; color: #06b6d4; font-family: 'JetBrains Mono', monospace;">—</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────
+         TAB: SAE
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-sae"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-sae"
+      tabindex="0"
+    >
+      <div class="panel-grid-sae">
+
+        <!-- Top Features Bar Chart -->
+        <div class="glass-panel sae-features-box" aria-label="Top-20 SAE features by activation">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">⭐</span>
+              Top-20 Features
+            </h2>
+          </div>
+          <div class="canvas-wrapper" style="height: 250px;">
+            <canvas
+              id="sae-features-canvas"
+              width="800"
+              height="250"
+              aria-label="Top-20 features bar chart"
+            ></canvas>
+          </div>
+        </div>
+
+        <!-- Sparsity Gauge and Loss -->
+        <div class="glass-panel sae-metrics-box" aria-label="SAE sparsity and loss metrics">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">📊</span>
+              Sparsity & Loss
+            </h2>
+          </div>
+          <div style="padding: 16px; display: flex; flex-direction: column; gap: 16px;">
+            <!-- Sparsity Gauge -->
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-size: 11px; font-weight: 600; color: #a78bfa; text-transform: uppercase; letter-spacing: 0.05em;">Sparsity</span>
+                <span id="sae-sparsity-percent" style="font-size: 13px; font-weight: bold; color: #34d399; font-family: 'JetBrains Mono', monospace;">—%</span>
+              </div>
+              <div style="height: 12px; background: rgba(51, 65, 85, 0.6); border-radius: 6px; overflow: hidden;">
+                <div id="sae-sparsity-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #34d399, #10b981); transition: width 0.3s ease;"></div>
+              </div>
+            </div>
+
+            <!-- Reconstruction Loss -->
+            <div>
+              <span style="font-size: 11px; font-weight: 600; color: #a78bfa; text-transform: uppercase; letter-spacing: 0.05em;">Reconstruction Loss</span>
+              <div style="margin-top: 8px; padding: 10px 14px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; border-left: 3px solid #fbbf24;">
+                <span id="sae-loss-value" style="font-size: 14px; font-weight: bold; color: #fbbf24; font-family: 'JetBrains Mono', monospace;">—</span>
+              </div>
+            </div>
+
+            <!-- Active Features Count -->
+            <div>
+              <span style="font-size: 11px; font-weight: 600; color: #a78bfa; text-transform: uppercase; letter-spacing: 0.05em;">Active Features</span>
+              <div style="margin-top: 8px; padding: 10px 14px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; border-left: 3px solid #06b6d4;">
+                <span id="sae-active-features" style="font-size: 14px; font-weight: bold; color: #06b6d4; font-family: 'JetBrains Mono', monospace;">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Feature Activation Heatmap -->
+        <div class="glass-panel sae-heatmap-box" aria-label="Feature activation heatmap">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">🔥</span>
+              Feature Activation (50 tokens × 20 features)
+            </h2>
+          </div>
+          <div class="canvas-wrapper" style="height: 250px;">
+            <canvas
+              id="sae-activation-heatmap"
+              width="800"
+              height="250"
+              aria-label="Feature activation heatmap"
+            ></canvas>
+          </div>
+        </div>
+
+      </div>
     </section>
 
   </main>

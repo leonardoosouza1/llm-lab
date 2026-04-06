@@ -278,10 +278,15 @@ pub async fn load_model_handler(
     }
 
     let model_path = state.models_dir.join(&req.name);
-    if !model_path.join("config.json").exists() {
+
+    // Check for .iara file or config.json (safetensors)
+    let iara_file = model_path.with_extension("iara");
+    let use_iara = iara_file.exists();
+
+    if !use_iara && !model_path.join("config.json").exists() {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado", req.name) })),
+            Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado (nem .iara nem config.json)", req.name) })),
         ).into_response();
     }
 
@@ -363,44 +368,85 @@ pub async fn load_model_handler(
 
         // Load model weights
         log::info!("⏳ Carregando pesos de '{}'...", model_name);
-        let config_path = model_path.join("config.json");
-        let cfg = match ModelCfg::from_config_json(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("❌ Falha ao ler config.json: {}", e);
-                let _ = frame_tx.send(serde_json::json!({
-                    "type": "status",
-                    "message": format!("ERRO config '{}': {}", model_name, e)
-                }).to_string());
-                model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        };
 
-        // Detect model architecture from config.json
-        let arch = match ModelArchitecture::from_config_json(&config_path) {
-            Ok(a) => a,
-            Err(e) => {
-                log::error!("❌ Falha ao detectar arquitetura: {}", e);
-                let _ = frame_tx.send(serde_json::json!({
-                    "type": "status",
-                    "message": format!("ERRO arquitetura '{}': {}", model_name, e)
-                }).to_string());
-                model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        };
-
-        // Tenta carregar com quantização se habilitado
-        let load_result = if quantize_on_load {
-            log::info!("🔧 Carregando com quantização Q4 (IARA_QUANTIZE=1)");
+        // Check if we should load from .iara v2 format
+        let iara_file = model_path.with_extension("iara");
+        let load_result = if iara_file.exists() {
+            log::info!("📦 Detectado arquivo .iara v2: {}", iara_file.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
-                "message": format!("Carregando '{}' com quantização Q4...", model_name)
+                "message": format!("Carregando '{}' do formato .iara v2...", model_name)
             }).to_string());
-            CausalLM::load_quantized(&model_path, cfg, arch.clone(), backend, enable_cfc)
+
+            // Para .iara, precisamos de config.json para cfg e arch
+            let config_path = model_path.join("config.json");
+            let cfg = match ModelCfg::from_config_json(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("❌ Falha ao ler config.json para .iara: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO config para .iara '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let arch = match ModelArchitecture::from_config_json(&config_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("❌ Falha ao detectar arquitetura para .iara: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO arquitetura para .iara '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            CausalLM::load_from_iara(&iara_file, cfg, arch, backend)
         } else {
-            CausalLM::load(&model_path, cfg, arch, backend)
+            // Load from safetensors (traditional path)
+            let config_path = model_path.join("config.json");
+            let cfg = match ModelCfg::from_config_json(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("❌ Falha ao ler config.json: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO config '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let arch = match ModelArchitecture::from_config_json(&config_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("❌ Falha ao detectar arquitetura: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO arquitetura '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Tenta carregar com quantização se habilitado
+            if quantize_on_load {
+                log::info!("🔧 Carregando com quantização Q4 (IARA_QUANTIZE=1)");
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "status",
+                    "message": format!("Carregando '{}' com quantização Q4...", model_name)
+                }).to_string());
+                CausalLM::load_quantized(&model_path, cfg, arch.clone(), backend, enable_cfc)
+            } else {
+                CausalLM::load(&model_path, cfg, arch, backend)
+            }
         };
 
         match load_result {
@@ -528,7 +574,7 @@ async fn generate_internal(
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-            let _ = model.forward(&[tok])
+            let _ = model.forward(&[tok], None)
                 .map_err(|e| format!("Prefill error: {}", e))?;
             // Discard logits and traces from prefill
         }
@@ -542,7 +588,7 @@ async fn generate_internal(
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, &[decode_token], &sampling)
+            forward_traced(model, &[decode_token], &sampling, None)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
@@ -684,7 +730,7 @@ pub async fn train_lnn_handler(
         // Prefill
         if prompt_ids.len() > 1 {
             for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-                if let Err(e) = m.forward(&[tok]) {
+                if let Err(e) = m.forward(&[tok], None) {
                     log::error!("Train prefill error: {}", e);
                     break;
                 }
@@ -699,7 +745,7 @@ pub async fn train_lnn_handler(
         let mut generated_tokens = Vec::new();
 
         for step in 0..max_tokens {
-            let gen_step = match crate::inference::forward_traced(m, &[decode_token], &sampling) {
+            let gen_step = match crate::inference::forward_traced(m, &[decode_token], &sampling, None) {
                 Ok(s) => s,
                 Err(_) => break,
             };

@@ -12,4 +12,6 @@ pub enum BackendError {
     Transfer(String),
     #[error("Tipo de tensor incompatível: esperado {expected}, recebido {got}")]
     WrongTensorType { expected: String, got: String },
+    #[error("Operação não implementada: {0}")]
+    NotImplemented(String),
 }

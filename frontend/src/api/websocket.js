@@ -239,6 +239,48 @@ export const wsManager = {
         if (msg.active) store.quantization = 'q4';
         break;
 
+      case 'sae_state':
+        store.sae.active = true;
+        store.sae.layer = msg.layer;
+        store.sae.activeFeatures = msg.active_features || 0;
+        store.sae.topFeatures = msg.top_features || [];
+        store.sae.sparsity = msg.sparsity || 0;
+        store.sae.loss = msg.loss || 0;
+        store.sae.step = msg.step || 0;
+        store.sae.history.push({
+          step: msg.step,
+          loss: msg.loss,
+          sparsity: msg.sparsity,
+          activeFeatures: msg.active_features,
+        });
+        if (store.sae.history.length > 512) store.sae.history.shift();
+        break;
+
+      case 'ntc_state':
+        store.ntc.active = true;
+        store.ntc.gridSize = msg.grid_size || 0;
+        store.ntc.latentDim = msg.latent_dim || 0;
+        store.ntc.vramMb = msg.memory_bytes ? Math.round(msg.memory_bytes / 1024 / 1024) : 0;
+        store.ntc.compressedTokens = msg.current_len || 0;
+        store.ntc.recentTokens = msg.recent_window || 0;
+        store.ntc.reconstructionLoss = msg.reconstruction_loss || 0;
+        store.ntc.history.push({
+          step: msg.step,
+          reconstructionLoss: msg.reconstruction_loss,
+          vramMb: store.ntc.vramMb,
+          compressionRatio: msg.compression_ratio,
+        });
+        if (store.ntc.history.length > 512) store.ntc.history.shift();
+        break;
+
+      case 'quant_status':
+        store.quant.mode = msg.mode || 'bf16';
+        store.quant.vramMb = msg.vram_mb || 0;
+        store.quant.baselineVramMb = msg.baseline_vram_mb || 0;
+        store.quant.nrmse = msg.nrmse || 0;
+        store.quant.perLayerError = msg.per_layer_error || [];
+        break;
+
       default:
         // Still log unhandled types
         break;
