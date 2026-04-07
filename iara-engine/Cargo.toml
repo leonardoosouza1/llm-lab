@@ -74,12 +74,17 @@ tokenizers = "0.21"
 # Geração aleatória (multinomial sampling)
 rand = "0.8"
 
+# HTTP client (used by stress_test binary + integration tests)
+reqwest = { version = "0.12", features = ["json"] }
+
 [dev-dependencies]
-# HTTP client for integration tests
-reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bin]]
+name = "stress_test"
+path = "src/bin/stress_test.rs"
 
 [[bench]]
 name = "baseline"

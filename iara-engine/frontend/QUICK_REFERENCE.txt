@@ -1,0 +1,303 @@
+================================================================================
+IARA DEEP TRACE VISUALIZATION - QUICK REFERENCE
+================================================================================
+
+FILE LOCATION:
+  /home/leonardo/projects/LLM/llm-lab/iara-engine/frontend/trace.html
+
+QUICK START:
+  1. Open trace.html in any modern browser
+  2. Mock data is enabled by default - works immediately
+  3. Enter a prompt and click "Trace"
+  4. Click any layer bar to inspect that layer
+  5. View attention patterns and neuron activations
+
+================================================================================
+VISUALIZATION COMPONENTS
+================================================================================
+
+LAYER FLOW GRAPH (Main):
+  ┌─────────────────────────────────────────────────┐
+  │ Layer  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ●     │
+  │ 0      (bar width = MLP activation) (dot = coherence) │
+  │ 1      ████████████████████████████████ ●     │
+  │ ...                                              │
+  │ 27     ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ●     │
+  └─────────────────────────────────────────────────┘
+
+  COLOR:  Blue=cold/passive  Orange=moderate  Red=hot/active
+  WIDTH:  0-100% based on neuron activation rate
+  DOT:    Green=coherent  Yellow=medium  Red=chaotic
+
+NEURON GRID (Bottom Left):
+  16×16 grid of 256 neurons
+  Bright = active    Gray = dormant    Dark = dead
+  Click a layer to see its neuron activation
+
+ATTENTION HEATMAP (Bottom Right):
+  Shows which context positions get attention
+  Brighter = more attention to that position
+  Click a layer to see its attention pattern
+
+SUMMARY STATS (Right Panel):
+  - Active Layers: count of layers meaningfully processing
+  - Avg MLP Activation: % neurons firing across all layers
+  - Logit Entropy: prediction confidence
+  - Confidence Score: probability of top token
+  - Top Predictions: best 5 next-token candidates
+  - Forward Time: inference latency in ms
+
+================================================================================
+INTERACTION
+================================================================================
+
+CLICK Layer Bar:        Select that layer (see neurons + attention)
+CLICK Layer Again:      Deselect layer
+HOVER Layer Bar:        Show detailed tooltip
+CHANGE Token Selector:  View different token's activation
+CHANGE Prompt:          Type new prompt (or Enter key)
+CLICK Trace Button:     Run inference (server or mock)
+CHECK Mock Data:        Use synthetic data (no server needed)
+UNCHECK Mock Data:      Use real /api/trace server
+
+================================================================================
+WHAT THE COLORS MEAN
+================================================================================
+
+BAR COLOR (Residual Delta - how much layer changed the token):
+  Blue     = passive (layer barely changed anything)
+  Orange   = moderate (layer made some changes)
+  Red      = active (layer heavily transformed the token)
+
+DOT COLOR (Phase Coherence - neuron synchronization):
+  Green    = coherent (neurons working together)
+  Yellow   = medium (mixed patterns)
+  Red      = chaotic (neurons firing randomly)
+
+NEURON COLORS (Per-layer activation state):
+  Bright Green = active in this forward pass
+  Gray         = dormant (could activate but didn't)
+  Dark         = dead (almost never activates)
+
+ATTENTION HEATMAP (Brightness = attention weight):
+  Bright   = strong attention to this position
+  Dim      = weak attention to this position
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+trace.html              32 KB   Main visualization (all-in-one file)
+README.md               4.6 KB  Feature overview
+QUICKSTART.md           9.4 KB  Step-by-step guide (start here!)
+TECHNICAL_NOTES.md      8.4 KB  Architecture & code details
+API_REFERENCE.md        9.7 KB  Server integration specs
+SUMMARY.md              13 KB   Project overview
+QUICK_REFERENCE.txt     This file
+
+Total: 96 KB (lightweight, single folder deployment)
+
+================================================================================
+INTEGRATION WITH IARA ENGINE
+================================================================================
+
+SETUP:
+  1. Place frontend/ folder in iara-engine directory
+  2. Configure server to serve static files from frontend/
+  3. Implement POST /api/trace endpoint:
+     Input:  { "prompt": "text here" }
+     Output: BrainTrace with GenerationStep array
+
+ENDPOINT REQUIREMENTS:
+  - Must accept POST with prompt
+  - Must perform inference
+  - Must return GenerationStep[] (one per token)
+  - Each GenerationStep must have 28 LayerTrace objects
+  - Each LayerTrace needs: residual_norm, mlp_activation_rate,
+    phase_coherence, hot_neurons, top_logits, active_layers
+
+ACCESS:
+  Open: http://localhost:PORT/trace.html
+  Uncheck "Mock Data"
+  Enter prompt and click "Trace"
+
+================================================================================
+KEYBOARD SHORTCUTS
+================================================================================
+
+In Prompt Box:
+  ENTER           = Submit trace
+
+On Layer Bar:
+  CLICK           = Select/deselect layer
+  HOVER           = Show tooltip
+
+In Token Dropdown:
+  SELECT          = Switch to different token
+
+================================================================================
+STATISTICS EXPLAINED
+================================================================================
+
+Active Layers:
+  Count of layers above activation threshold
+  More = model uncertain (working harder)
+  Fewer = model confident (minimal computation)
+
+Avg MLP Activation:
+  % of neurons firing on average
+  High % = dense computation = slower
+  Low % = sparse computation = faster
+
+Logit Entropy:
+  Measure of prediction sharpness
+  High = uncertain (multiple good options)
+  Low = confident (clear winner)
+
+Confidence Score:
+  Probability of the top prediction
+  >80% = very confident
+  <50% = very uncertain
+
+Top Predictions:
+  Best 5 token candidates with probabilities
+  Should sum to ~100% (normalized)
+
+Forward Time:
+  Milliseconds to generate one token
+  Includes all 28 layers + attention + MLP
+
+================================================================================
+MOCK DATA MODE
+================================================================================
+
+Works Without Server:
+  - Open trace.html
+  - "Mock Data" checkbox enabled
+  - Generates synthetic but realistic traces
+  - No internet/server required
+  - Perfect for testing and demos
+
+Mock Data Characteristics:
+  - 28 layers per token
+  - Middle layers more active (realistic depth pattern)
+  - 0-8 random "hot" neurons per layer
+  - Synthetic attention with recency bias
+  - 0.1-0.8 residual delta range
+  - 0.2-0.8 MLP activation rate range
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+"Failed to trace: Server error":
+  → Server not running or /api/trace not implemented
+  → Enable Mock Data or start IARA engine
+
+Visualization shows blank:
+  → JavaScript error (open DevTools: F12)
+  → Check console for error messages
+
+Colors don't show on bars:
+  → CSS not loading properly
+  → Hard refresh: Ctrl+Shift+R
+
+Layers show but no details:
+  → Click a layer bar to select it
+  → Details appear in right panel
+
+================================================================================
+WHAT TO LOOK FOR
+================================================================================
+
+Good Model Behavior:
+  ✓ Early layers (0-8): Some activation
+  ✓ Middle layers (8-20): Highest activation (feature processing)
+  ✓ Late layers (20-28): Moderate activation (refinement)
+  ✓ Green dots on most layers (coherence)
+  ✓ Confidence >60% for known tokens
+
+Signs of Issues:
+  ✗ All layers equally active (may be redundant)
+  ✗ Red dots (chaotic patterns)
+  ✗ Very low confidence (<20%)
+  ✗ Sparse activation everywhere (under-parameterized)
+  ✗ Dense activation everywhere (over-parameterized)
+
+================================================================================
+KEYBOARD/MOUSE
+================================================================================
+
+Mouse:
+  Click   = Select/interact
+  Hover   = Show tooltip/highlight
+  Scroll  = Navigate panels
+
+Keyboard:
+  Enter   = Submit (in prompt box)
+  Tab     = Navigate form elements
+
+================================================================================
+BROWSER SUPPORT
+================================================================================
+
+Works on:
+  ✓ Chrome 90+
+  ✓ Firefox 88+
+  ✓ Safari 14+
+  ✓ Edge 90+
+
+Requirements:
+  - Modern JavaScript (ES6+)
+  - CSS Grid & Flexbox
+  - D3.js v7 from CDN
+
+================================================================================
+API ENDPOINT SPEC (For Server Integration)
+================================================================================
+
+Request:
+  POST /api/trace
+  {"prompt": "your text here"}
+
+Response:
+  {
+    "prompt": "string",
+    "response": "string",
+    "steps": [
+      {
+        "token_id": 12345,
+        "token_str": "token",
+        "top_logits": [[id, logit], ...],
+        "layer_traces": [28 LayerTrace objects],
+        "active_layers": [indices of active layers],
+        "time_ms": milliseconds
+      },
+      ... one per token ...
+    ],
+    "finalized_at": "ISO8601 timestamp"
+  }
+
+LayerTrace requires:
+  - layer_idx (0-27)
+  - residual_norm (0-2, typical)
+  - mlp_activation_rate (0-1, sparsity)
+  - phase_coherence (0-1, synchronization)
+  - hot_neurons ([neuron indices])
+  - attention_energy, mlp_energy, max_activation
+  - top_logits, time_us
+
+See API_REFERENCE.md for full specification
+
+================================================================================
+GETTING HELP
+================================================================================
+
+For Features:          See README.md
+For Step-by-Step:      See QUICKSTART.md
+For Architecture:      See TECHNICAL_NOTES.md
+For Server Integration: See API_REFERENCE.md
+For Project Overview:   See SUMMARY.md
+For Troubleshooting:   This QUICK_REFERENCE.txt
+
+================================================================================
