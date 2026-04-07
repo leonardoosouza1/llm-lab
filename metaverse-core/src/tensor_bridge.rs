@@ -581,6 +581,209 @@ impl TensorToOrganism {
 }
 
 // ============================================================================
+// FibonacciSampler: golden-ratio low-discrepancy tensor sampling
+// ============================================================================
+
+const PHI_GOLDEN: f32 = 1.6180339887498948;
+
+/// FibonacciSampler samples tensor elements using the golden-ratio sequence.
+/// Adjacent samples differ by φ in normalised position space → no clustering,
+/// maximally uniform coverage with √N effective density per unit range.
+pub struct FibonacciSampler;
+
+impl FibonacciSampler {
+    /// Sample `num_samples` indices from a flat tensor.
+    pub fn sample_indices(tensor: &TensorSlice, num_samples: usize) -> Vec<usize> {
+        let n = tensor.num_elements();
+        if n == 0 || num_samples == 0 { return vec![]; }
+        let m = num_samples.min(n);
+        (0..m).map(|k| {
+            let t = (k as f32 * PHI_GOLDEN).fract();
+            (t * n as f32) as usize % n
+        }).collect()
+    }
+
+    /// Sample tensor values at Fibonacci-spaced indices.
+    pub fn sample_values(tensor: &TensorSlice, num_samples: usize) -> Vec<f32> {
+        Self::sample_indices(tensor, num_samples)
+            .into_iter().map(|i| tensor.data[i]).collect()
+    }
+
+    /// For 2-D tensors [rows × cols]: return (row, col) pairs on Fibonacci disk lattice.
+    pub fn sample_2d_indices(tensor: &TensorSlice, num_samples: usize) -> Vec<(usize, usize)> {
+        if tensor.shape.len() < 2 { return vec![]; }
+        let rows = tensor.shape[0];
+        let cols = tensor.shape[1];
+        if rows == 0 || cols == 0 { return vec![]; }
+        let m = num_samples.min(rows * cols);
+        (0..m).map(|k| {
+            let r = ((k as f32 + 0.5) / m as f32).sqrt();
+            let theta = k as f32 * 2.0 * std::f32::consts::PI / (PHI_GOLDEN * PHI_GOLDEN);
+            let x = (r * theta.cos() * 0.5 + 0.5).clamp(0.0, 1.0 - 1e-6);
+            let y = (r * theta.sin() * 0.5 + 0.5).clamp(0.0, 1.0 - 1e-6);
+            ((x * rows as f32) as usize % rows, (y * cols as f32) as usize % cols)
+        }).collect()
+    }
+
+    /// Coverage quality ∈ [0, 1]: 1.0 = perfectly uniform over [0, n).
+    pub fn coverage_score(indices: &[usize], n: usize) -> f32 {
+        if n == 0 || indices.is_empty() { return 0.0; }
+        let mut hist = vec![0u32; n];
+        for &i in indices { if i < n { hist[i] += 1; } }
+        let target = indices.len() as f32 / n as f32;
+        let var: f32 = hist.iter().map(|&c| (c as f32 - target).powi(2)).sum::<f32>() / n as f32;
+        1.0 / (1.0 + var)
+    }
+}
+
+// ============================================================================
+// NtcTensorCompressor: Neural Texture Compression for organism tensors
+// ============================================================================
+// Inspired by NVIDIA NTC (Müller et al., SIGGRAPH 2023):
+//   G0 (coarse, bilinear) + G1 (fine, nearest-neighbor) + triangular PE + MLP
+// Applied here to 1-D organism/weight tensors instead of 2-D textures.
+// ============================================================================
+
+/// NtcTensorCompressor: dual-grid + MLP compression for organism-scale tensors.
+pub struct NtcTensorCompressor {
+    pub g0_size: usize,
+    pub g1_size: usize,
+    pub latent_dim: usize,
+    pub hidden_dim: usize,
+    pub g0_grid: Vec<f32>,   // [g0_size × latent_dim] — bilinear grid
+    pub g1_grid: Vec<f32>,   // [g1_size × latent_dim] — nearest-neighbour grid
+    pub mlp_w1: Vec<f32>,    // [hidden_dim × input_dim]
+    pub mlp_w2: Vec<f32>,    // [1 × hidden_dim]
+    pub mlp_b1: Vec<f32>,
+    pub mlp_b2: Vec<f32>,
+    pub reconstruction_error: f32,
+}
+
+impl NtcTensorCompressor {
+    const PE_OCTAVES: usize = 3;
+    const PE_DIM: usize = 6; // 3 octaves × (tri + complement)
+
+    /// Create a new compressor. Smaller `g0_size` → more compression.
+    pub fn new(g0_size: usize) -> Self {
+        let g1_size = g0_size * 4;
+        let latent_dim = 8usize;
+        let hidden_dim = 32usize;
+        let input_dim = latent_dim * 2 + Self::PE_DIM; // 22
+
+        let g0_grid: Vec<f32> = (0..g0_size * latent_dim)
+            .map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
+        let g1_grid: Vec<f32> = (0..g1_size * latent_dim)
+            .map(|i| (i as f32 * 0.07).cos() * 0.1).collect();
+
+        let scale1 = (2.0f32 / input_dim as f32).sqrt();
+        let mlp_w1: Vec<f32> = (0..hidden_dim * input_dim)
+            .map(|i| (i as f32 * 0.05).sin() * scale1).collect();
+        let mlp_b1 = vec![0.0f32; hidden_dim];
+
+        let scale2 = (2.0f32 / hidden_dim as f32).sqrt();
+        let mlp_w2: Vec<f32> = (0..hidden_dim)
+            .map(|i| (i as f32 * 0.03).cos() * scale2).collect();
+        let mlp_b2 = vec![0.0f32; 1];
+
+        Self { g0_size, g1_size, latent_dim, hidden_dim,
+               g0_grid, g1_grid, mlp_w1, mlp_w2, mlp_b1, mlp_b2,
+               reconstruction_error: 0.0 }
+    }
+
+    /// Triangular-wave PE (per NTC paper §3.3): more localizable than sinusoidal.
+    fn triangular_pe(t: f32) -> Vec<f32> {
+        let mut pe = Vec::with_capacity(Self::PE_DIM);
+        for oct in 0..Self::PE_OCTAVES {
+            let freq = (1usize << oct) as f32;
+            let phase = (t * freq).fract();
+            let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
+            pe.push(tri);
+            pe.push(1.0 - tri);
+        }
+        pe
+    }
+
+    /// Bilinear G0 lookup (smooth interpolation).
+    fn lookup_g0(&self, t: f32) -> Vec<f32> {
+        let s = (t * (self.g0_size - 1) as f32).clamp(0.0, (self.g0_size - 1) as f32);
+        let lo = s as usize;
+        let hi = (lo + 1).min(self.g0_size - 1);
+        let a = s - lo as f32;
+        (0..self.latent_dim).map(|j| {
+            let vl = self.g0_grid[lo * self.latent_dim + j];
+            let vh = self.g0_grid[hi * self.latent_dim + j];
+            vl + (vh - vl) * a
+        }).collect()
+    }
+
+    /// Nearest-neighbour G1 lookup (captures high-frequency detail).
+    fn lookup_g1(&self, t: f32) -> Vec<f32> {
+        let s = (t * (self.g1_size - 1) as f32).clamp(0.0, (self.g1_size - 1) as f32);
+        let idx = (s.round() as usize).min(self.g1_size - 1);
+        self.g1_grid[idx * self.latent_dim..(idx + 1) * self.latent_dim].to_vec()
+    }
+
+    #[inline] fn relu(x: f32) -> f32 { if x > 0.0 { x } else { 0.0 } }
+
+    fn mlp_forward(&self, input: &[f32]) -> f32 {
+        let in_dim = input.len();
+        let h: Vec<f32> = (0..self.hidden_dim).map(|i| {
+            let pre: f32 = input.iter().enumerate()
+                .map(|(j, &x)| self.mlp_w1.get(i * in_dim + j).copied().unwrap_or(0.0) * x)
+                .sum::<f32>() + self.mlp_b1.get(i).copied().unwrap_or(0.0);
+            Self::relu(pre)
+        }).collect();
+        h.iter().enumerate()
+            .map(|(j, &hj)| self.mlp_w2.get(j).copied().unwrap_or(0.0) * hj)
+            .sum::<f32>() + self.mlp_b2.get(0).copied().unwrap_or(0.0)
+    }
+
+    /// Decode t ∈ [0, 1] → reconstructed scalar value.
+    pub fn decode(&self, t: f32) -> f32 {
+        let mut input = self.lookup_g0(t);
+        input.extend(self.lookup_g1(t));
+        input.extend(Self::triangular_pe(t));
+        self.mlp_forward(&input)
+    }
+
+    /// Evaluate RMSE against a tensor (up to 256 sample points).
+    pub fn evaluate(&mut self, tensor: &TensorSlice) -> f32 {
+        let n = tensor.num_elements();
+        if n == 0 { return 0.0; }
+        let m = n.min(256);
+        let mse: f32 = (0..m).map(|i| {
+            let t = i as f32 / (m as f32 - 1.0).max(1.0);
+            let idx = (t * (n - 1) as f32).round() as usize;
+            let pred = self.decode(t);
+            let actual = tensor.data[idx.min(n - 1)];
+            (pred - actual) * (pred - actual)
+        }).sum::<f32>() / m as f32;
+        self.reconstruction_error = mse.sqrt();
+        self.reconstruction_error
+    }
+
+    /// Approximate compression ratio (original elements / compressed params).
+    pub fn compression_ratio(&self, original_size: usize) -> f32 {
+        let c = (self.g0_size + self.g1_size) * self.latent_dim
+            + self.mlp_w1.len() + self.mlp_w2.len()
+            + self.mlp_b1.len() + self.mlp_b2.len();
+        original_size as f32 / c.max(1) as f32
+    }
+
+    /// Export compressed parameters as a flat TensorSlice.
+    pub fn export(&self) -> TensorSlice {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.g0_grid);
+        data.extend_from_slice(&self.g1_grid);
+        data.extend_from_slice(&self.mlp_w1);
+        data.extend_from_slice(&self.mlp_b1);
+        data.extend_from_slice(&self.mlp_w2);
+        data.extend_from_slice(&self.mlp_b2);
+        TensorSlice::new("ntc_compressed".to_string(), vec![data.len()], data)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -845,5 +1048,93 @@ mod tests {
         let sparse_rank = TensorAnalyzer::effective_rank(&sparse_tensor);
 
         assert!(dense_rank > sparse_rank);
+    }
+
+    // ========================================================================
+    // FibonacciSampler tests
+    // ========================================================================
+
+    #[test]
+    fn test_fibonacci_sampler_indices_valid() {
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let tensor = TensorSlice::new("t".to_string(), vec![100], data);
+        let indices = FibonacciSampler::sample_indices(&tensor, 20);
+        assert_eq!(indices.len(), 20);
+        for &i in &indices { assert!(i < 100, "index {} out of range", i); }
+    }
+
+    #[test]
+    fn test_fibonacci_sampler_coverage_score_positive() {
+        let data: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        let tensor = TensorSlice::new("big".to_string(), vec![1000], data);
+        let indices = FibonacciSampler::sample_indices(&tensor, 100);
+        let score = FibonacciSampler::coverage_score(&indices, 1000);
+        assert!(score > 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_fibonacci_sampler_2d_valid() {
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let tensor = TensorSlice::new("2d".to_string(), vec![10, 10], data);
+        let pts = FibonacciSampler::sample_2d_indices(&tensor, 20);
+        for &(r, c) in &pts {
+            assert!(r < 10 && c < 10, "2D index out of range: ({},{})", r, c);
+        }
+    }
+
+    #[test]
+    fn test_fibonacci_sampler_values_in_range() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let tensor = TensorSlice::new("v".to_string(), vec![5], data);
+        let vals = FibonacciSampler::sample_values(&tensor, 3);
+        for &v in &vals { assert!(v >= 1.0 && v <= 5.0); }
+    }
+
+    // ========================================================================
+    // NtcTensorCompressor tests
+    // ========================================================================
+
+    #[test]
+    fn test_ntc_creation() {
+        let ntc = NtcTensorCompressor::new(8);
+        assert_eq!(ntc.g0_size, 8);
+        assert_eq!(ntc.g1_size, 32);
+        assert_eq!(ntc.g0_grid.len(), 8 * 8); // g0_size * latent_dim
+        assert_eq!(ntc.g1_grid.len(), 32 * 8);
+    }
+
+    #[test]
+    fn test_ntc_decode_finite() {
+        let ntc = NtcTensorCompressor::new(8);
+        for i in 0..=10 {
+            let v = ntc.decode(i as f32 / 10.0);
+            assert!(v.is_finite(), "decode({}) is not finite", i as f32 / 10.0);
+        }
+    }
+
+    #[test]
+    fn test_ntc_evaluate_rmse_nonneg() {
+        let mut ntc = NtcTensorCompressor::new(16);
+        let data: Vec<f32> = (0..256).map(|i| (i as f32 * 0.1).sin()).collect();
+        let tensor = TensorSlice::new("sin".to_string(), vec![256], data);
+        let rmse = ntc.evaluate(&tensor);
+        assert!(rmse.is_finite() && rmse >= 0.0);
+    }
+
+    #[test]
+    fn test_ntc_compression_ratio_greater_than_one() {
+        // NTC is designed for large tensors (thousands+ params).
+        // With g0=8, g1=32, latent=8, hidden=32 → ~1089 compressed params.
+        let ntc = NtcTensorCompressor::new(8);
+        let ratio = ntc.compression_ratio(4096);
+        assert!(ratio > 1.0, "expected compression, got ratio={}", ratio);
+    }
+
+    #[test]
+    fn test_ntc_export_nonempty() {
+        let ntc = NtcTensorCompressor::new(8);
+        let exported = ntc.export();
+        assert_eq!(exported.name, "ntc_compressed");
+        assert!(!exported.data.is_empty());
     }
 }

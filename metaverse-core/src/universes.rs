@@ -743,6 +743,425 @@ impl UniversePhysics for HybridUniverse {
 }
 
 // ============================================================================
+// GEOMETRIC CONSTANTS
+// ============================================================================
+
+/// Golden ratio φ = (1 + √5) / 2
+const PHI: f32 = 1.6180339887498948;
+
+/// Fibonacci lattice point k of n in unit disk (r ≤ 1).
+/// Angular spacing = 2π/φ² ≈ 137.5° → no two points ever align radially.
+fn fibonacci_disk_point(k: usize, n: usize) -> Vec2 {
+    let r = ((k as f32 + 0.5) / n as f32).sqrt();
+    let theta = k as f32 * 2.0 * PI / (PHI * PHI);
+    Vec2::new(r * theta.cos(), r * theta.sin())
+}
+
+// ============================================================================
+// 6. FIBONACCI UNIVERSE — Solves COVERAGE/SAMPLING problems
+// ============================================================================
+
+/// FibonacciUniverse: organisms drift toward golden-ratio lattice points.
+/// √N organisms on Fibonacci lattice cover a disk as uniformly as N regular
+/// grid points — that is the lattice's power. Solves: optimal sampling,
+/// load balancing, Voronoi coverage.
+pub struct FibonacciUniverse {
+    num_lattice_points: usize,
+    pub lattice: Vec<Vec2>,
+    coverage_map: Vec<f32>,
+    target_distribution: Vec<f32>,
+    pub coverage_score: f32,
+}
+
+impl FibonacciUniverse {
+    pub fn new(num_points: usize) -> Self {
+        let n = num_points.max(1);
+        let lattice: Vec<Vec2> = (0..n).map(|k| fibonacci_disk_point(k, n)).collect();
+        let uniform = 1.0 / n as f32;
+        Self {
+            num_lattice_points: n,
+            lattice,
+            coverage_map: vec![0.0; n],
+            target_distribution: vec![uniform; n],
+            coverage_score: 0.0,
+        }
+    }
+
+    /// Returns the index of the nearest Fibonacci lattice point to `pos`.
+    pub fn nearest_lattice_idx(&self, pos: Vec2) -> usize {
+        let mut best_idx = 0;
+        let mut best_d2 = f32::MAX;
+        for (i, &lp) in self.lattice.iter().enumerate() {
+            let dx = pos.x - lp.x;
+            let dy = pos.y - lp.y;
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_d2 { best_d2 = d2; best_idx = i; }
+        }
+        best_idx
+    }
+}
+
+impl UniversePhysics for FibonacciUniverse {
+    fn name(&self) -> &str { "FibonacciUniverse" }
+
+    fn tick(&mut self, organisms: &mut [UniverseOrganism], _grid: &mut UniverseGrid) {
+        for c in &mut self.coverage_map { *c *= 0.95; }
+
+        for org in organisms.iter_mut() {
+            if !org.alive { continue; }
+            let idx = self.nearest_lattice_idx(org.position);
+            let target = self.lattice[idx];
+
+            org.velocity.x = org.velocity.x * 0.7 + (target.x - org.position.x) * 0.3;
+            org.velocity.y = org.velocity.y * 0.7 + (target.y - org.position.y) * 0.3;
+            org.position.x += org.velocity.x * 0.1;
+            org.position.y += org.velocity.y * 0.1;
+
+            let r = (org.position.x * org.position.x + org.position.y * org.position.y).sqrt();
+            if r > 1.0 { org.position.x /= r; org.position.y /= r; }
+
+            let nearest = self.nearest_lattice_idx(org.position);
+            if nearest < self.coverage_map.len() {
+                self.coverage_map[nearest] += 1.0;
+            }
+
+            let spd2 = org.velocity.x * org.velocity.x + org.velocity.y * org.velocity.y;
+            org.energy -= spd2.sqrt() * 0.01 + 0.005;
+            if org.energy <= 0.0 { org.alive = false; }
+        }
+
+        let total: f32 = self.coverage_map.iter().sum::<f32>().max(1e-10);
+        let kl: f32 = self.coverage_map.iter()
+            .zip(self.target_distribution.iter())
+            .filter(|(&c, &t)| c > 0.0 && t > 1e-10)
+            .map(|(&c, &t)| { let p = c / total; p * (p / t).ln() })
+            .sum();
+        self.coverage_score = (-kl).exp().min(1.0);
+    }
+
+    fn fitness(&self, organism: &UniverseOrganism) -> f32 {
+        organism.energy + self.coverage_score * 0.5
+    }
+
+    fn inject_problem(&mut self, input: &[f32]) {
+        let total: f32 = input.iter().map(|x| x.abs()).sum::<f32>().max(1e-10);
+        self.target_distribution = input.iter().map(|x| x.abs() / total).collect();
+        self.coverage_map = vec![0.0; input.len().max(self.num_lattice_points)];
+    }
+
+    fn extract_solution(&self) -> Vec<f32> {
+        let total: f32 = self.coverage_map.iter().sum::<f32>().max(1e-10);
+        self.coverage_map.iter().map(|&c| c / total).collect()
+    }
+}
+
+// ============================================================================
+// 7. HYPERBOLIC UNIVERSE — Solves HIERARCHY/TREE problems
+// ============================================================================
+
+/// HyperbolicUniverse: organisms navigate the Poincaré disk.
+/// - d(u,v) = arccosh(1 + 2|u-v|² / ((1-|u|²)(1-|v|²)))
+/// - Center (r≈0) = abstract root; boundary (r≈1) = concrete leaves.
+/// - Exponential area growth: a large tree fits in a tiny disk.
+pub struct HyperbolicUniverse {
+    curvature: f32,
+    activation_trace: Vec<f32>,
+    pub total_distance_traveled: f32,
+}
+
+impl HyperbolicUniverse {
+    pub fn new(curvature: f32) -> Self {
+        Self {
+            curvature: curvature.abs().max(0.1),
+            activation_trace: Vec::new(),
+            total_distance_traveled: 0.0,
+        }
+    }
+
+    /// Poincaré disk geodesic distance.
+    pub fn poincare_distance(u: Vec2, v: Vec2) -> f32 {
+        let dx = u.x - v.x;
+        let dy = u.y - v.y;
+        let uv_sq = dx * dx + dy * dy;
+        let u_sq = u.x * u.x + u.y * u.y;
+        let v_sq = v.x * v.x + v.y * v.y;
+        let denom = (1.0 - u_sq) * (1.0 - v_sq);
+        if denom < 1e-10 { return 1e6; }
+        (1.0 + 2.0 * uv_sq / denom).max(1.0).acosh()
+    }
+
+    fn clamp_to_disk(pos: Vec2) -> Vec2 {
+        let r = (pos.x * pos.x + pos.y * pos.y).sqrt();
+        if r >= 0.98 { Vec2::new(pos.x * 0.97 / r, pos.y * 0.97 / r) } else { pos }
+    }
+}
+
+impl UniversePhysics for HyperbolicUniverse {
+    fn name(&self) -> &str { "HyperbolicUniverse" }
+
+    fn tick(&mut self, organisms: &mut [UniverseOrganism], grid: &mut UniverseGrid) {
+        let mut tick_dist = 0.0f32;
+
+        for org in organisms.iter_mut() {
+            if !org.alive { continue; }
+            org.position = Self::clamp_to_disk(org.position);
+            let r2 = org.position.x * org.position.x + org.position.y * org.position.y;
+            let conformal = 2.0 / (1.0 - r2).max(1e-4);
+
+            org.velocity.x += -org.position.x * self.curvature * 0.001 * conformal;
+            org.velocity.y += -org.position.y * self.curvature * 0.001 * conformal;
+            org.velocity.x *= 0.95;
+            org.velocity.y *= 0.95;
+
+            let prev = org.position;
+            org.position.x += org.velocity.x;
+            org.position.y += org.velocity.y;
+            org.position = Self::clamp_to_disk(org.position);
+
+            let d = Self::poincare_distance(prev, org.position);
+            if d.is_finite() && d < 1e5 { tick_dist += d; }
+
+            let gx = ((org.position.x * 0.5 + 0.5) * (grid.width.saturating_sub(1)) as f32) as usize;
+            let gy = ((org.position.y * 0.5 + 0.5) * (grid.height.saturating_sub(1)) as f32) as usize;
+            grid.add_scalar(gx.min(grid.width - 1), gy.min(grid.height - 1), 1.0);
+
+            org.energy -= d.min(1.0) * 0.05 + 0.005;
+            if org.energy <= 0.0 { org.alive = false; }
+        }
+
+        self.total_distance_traveled += tick_dist;
+        self.activation_trace = grid.scalar_field.clone();
+    }
+
+    fn fitness(&self, organism: &UniverseOrganism) -> f32 {
+        let depth = (organism.position.x * organism.position.x +
+                     organism.position.y * organism.position.y).sqrt();
+        organism.energy + depth * 0.5
+    }
+
+    fn inject_problem(&mut self, input: &[f32]) {
+        self.activation_trace = vec![0.0; input.len()];
+    }
+
+    fn extract_solution(&self) -> Vec<f32> {
+        if self.activation_trace.is_empty() { return vec![]; }
+        let max_a = self.activation_trace.iter().cloned().fold(0.0f32, f32::max);
+        if max_a <= 0.0 { return vec![0.0; self.activation_trace.len()]; }
+        self.activation_trace.iter().map(|&a| a / max_a).collect()
+    }
+}
+
+// ============================================================================
+// 8. TUNNEL UNIVERSE — Solves COMPRESSION/MULTI-SCALE problems
+// ============================================================================
+
+/// A Fibonacci lattice layer (coarse G0 or fine G1).
+pub struct TunnelLayer {
+    pub lattice: Vec<Vec2>,
+    pub activation: Vec<f32>,
+}
+
+impl TunnelLayer {
+    pub fn new(num_points: usize) -> Self {
+        let n = num_points.max(1);
+        let lattice = (0..n).map(|k| fibonacci_disk_point(k, n)).collect();
+        Self { lattice, activation: vec![0.0; n] }
+    }
+
+    pub fn nearest_idx(&self, pos: Vec2) -> usize {
+        let mut best = 0;
+        let mut best_d2 = f32::MAX;
+        for (i, &lp) in self.lattice.iter().enumerate() {
+            let d2 = (pos.x - lp.x) * (pos.x - lp.x) + (pos.y - lp.y) * (pos.y - lp.y);
+            if d2 < best_d2 { best_d2 = d2; best = i; }
+        }
+        best
+    }
+}
+
+/// TunnelUniverse: dual-scale Fibonacci hierarchy (NTC dual-grid analogy).
+/// - G0 (16 pts): coarse, bilinear — global structure (NTC low-res)
+/// - G1 (64 pts): fine, nearest-neighbor — local detail (NTC high-res)
+/// - Center → coarse; edge → fine → multi-scale "tunnel effect"
+/// - reconstruction_error: how well G0 predicts G1 (= compression quality)
+pub struct TunnelUniverse {
+    pub g0: TunnelLayer,
+    pub g1: TunnelLayer,
+    tunnel_map: Vec<usize>,        // g1_idx → nearest g0_idx
+    pub reconstruction_error: f32,
+    scale_activations: Vec<f32>,   // [g0 | g1] activations concatenated
+}
+
+impl TunnelUniverse {
+    pub fn new() -> Self {
+        let g0 = TunnelLayer::new(16);
+        let g1 = TunnelLayer::new(64);
+        let tunnel_map: Vec<usize> = g1.lattice.iter()
+            .map(|&lp| g0.nearest_idx(lp))
+            .collect();
+        Self { g0, g1, tunnel_map, reconstruction_error: 0.0, scale_activations: vec![0.0; 80] }
+    }
+}
+
+impl Default for TunnelUniverse {
+    fn default() -> Self { Self::new() }
+}
+
+impl UniversePhysics for TunnelUniverse {
+    fn name(&self) -> &str { "TunnelUniverse" }
+
+    fn tick(&mut self, organisms: &mut [UniverseOrganism], _grid: &mut UniverseGrid) {
+        for a in &mut self.g0.activation { *a *= 0.9; }
+        for a in &mut self.g1.activation { *a *= 0.9; }
+
+        for org in organisms.iter_mut() {
+            if !org.alive { continue; }
+            let r = (org.position.x * org.position.x + org.position.y * org.position.y).sqrt();
+            let fine_w = r.clamp(0.0, 1.0);
+            let coarse_w = 1.0 - fine_w;
+
+            let g1_idx = self.g1.nearest_idx(org.position);
+            let g0_idx = self.tunnel_map[g1_idx];
+            let g1_lp = self.g1.lattice[g1_idx];
+            let g0_lp = self.g0.lattice[g0_idx];
+
+            let tx = g0_lp.x * coarse_w + g1_lp.x * fine_w;
+            let ty = g0_lp.y * coarse_w + g1_lp.y * fine_w;
+            org.velocity.x = org.velocity.x * 0.7 + (tx - org.position.x) * 0.3;
+            org.velocity.y = org.velocity.y * 0.7 + (ty - org.position.y) * 0.3;
+            org.position.x += org.velocity.x * 0.1;
+            org.position.y += org.velocity.y * 0.1;
+
+            let nr = (org.position.x * org.position.x + org.position.y * org.position.y).sqrt();
+            if nr > 1.0 { org.position.x /= nr; org.position.y /= nr; }
+
+            if g0_idx < self.g0.activation.len() {
+                self.g0.activation[g0_idx] += org.energy * coarse_w;
+            }
+            if g1_idx < self.g1.activation.len() {
+                self.g1.activation[g1_idx] += org.energy * fine_w;
+            }
+            org.energy -= (r - 0.5).abs() * 0.02 + 0.008;
+            if org.energy <= 0.0 { org.alive = false; }
+        }
+
+        let n = self.tunnel_map.len() as f32;
+        let err: f32 = self.tunnel_map.iter().enumerate().map(|(g1_i, &g0_i)| {
+            let p = self.g0.activation.get(g0_i).copied().unwrap_or(0.0);
+            let a = self.g1.activation.get(g1_i).copied().unwrap_or(0.0);
+            (p - a) * (p - a)
+        }).sum();
+        self.reconstruction_error = (err / n.max(1.0)).sqrt();
+
+        for (i, &a) in self.g0.activation.iter().enumerate() {
+            if i < 16 { self.scale_activations[i] = a; }
+        }
+        for (i, &a) in self.g1.activation.iter().enumerate() {
+            if 16 + i < 80 { self.scale_activations[16 + i] = a; }
+        }
+    }
+
+    fn fitness(&self, organism: &UniverseOrganism) -> f32 {
+        organism.energy + (1.0 - self.reconstruction_error.min(1.0)) * 0.5
+    }
+
+    fn inject_problem(&mut self, input: &[f32]) {
+        for (i, &v) in input.iter().take(self.g0.activation.len()).enumerate() {
+            self.g0.activation[i] = v.abs();
+        }
+    }
+
+    fn extract_solution(&self) -> Vec<f32> { self.scale_activations.clone() }
+}
+
+// ============================================================================
+// 9. MULTIVERSE TOPOLOGY — Fiber Bundle of Universes
+// ============================================================================
+
+/// MultiverseTopology: base FibonacciUniverse × N fiber universes.
+/// Each fiber is a rotated projection of organism positions into a different
+/// physics (like attention heads). Coupling pulls energy from fibers back.
+pub struct MultiverseTopology {
+    pub base: FibonacciUniverse,
+    pub fibers: Vec<(Box<dyn UniversePhysics>, f32)>,
+    pub fiber_projections: Vec<Vec<f32>>,
+}
+
+impl MultiverseTopology {
+    pub fn new(base_points: usize) -> Self {
+        Self {
+            base: FibonacciUniverse::new(base_points),
+            fibers: Vec::new(),
+            fiber_projections: Vec::new(),
+        }
+    }
+
+    pub fn add_fiber(&mut self, physics: Box<dyn UniversePhysics>, coupling: f32) {
+        self.fibers.push((physics, coupling.clamp(0.0, 1.0)));
+        self.fiber_projections.push(Vec::new());
+    }
+
+    pub fn num_fibers(&self) -> usize { self.fibers.len() }
+}
+
+impl UniversePhysics for MultiverseTopology {
+    fn name(&self) -> &str { "MultiverseTopology" }
+
+    fn tick(&mut self, organisms: &mut [UniverseOrganism], grid: &mut UniverseGrid) {
+        let mut base_grid = UniverseGrid::new(grid.width, grid.height);
+        self.base.tick(organisms, &mut base_grid);
+
+        let num_fibers = self.fibers.len();
+        for f_idx in 0..num_fibers {
+            let angle = f_idx as f32 * PI / num_fibers.max(1) as f32;
+            let (sin_a, cos_a) = angle.sin_cos();
+
+            let mut fiber_orgs: Vec<UniverseOrganism> = organisms.iter().map(|o| {
+                let mut fo = o.clone();
+                fo.position = Vec2::new(
+                    o.position.x * cos_a - o.position.y * sin_a,
+                    o.position.x * sin_a + o.position.y * cos_a,
+                );
+                fo
+            }).collect();
+
+            let mut fg = UniverseGrid::new(grid.width, grid.height);
+            self.fibers[f_idx].0.tick(&mut fiber_orgs, &mut fg);
+
+            let coupling = self.fibers[f_idx].1;
+            for (i, org) in organisms.iter_mut().enumerate() {
+                if let Some(fo) = fiber_orgs.get(i) {
+                    org.energy = org.energy * (1.0 - coupling) + fo.energy * coupling;
+                    if !fo.alive { org.alive = false; }
+                }
+            }
+
+            let sol = self.fibers[f_idx].0.extract_solution();
+            if f_idx < self.fiber_projections.len() {
+                self.fiber_projections[f_idx] = sol;
+            }
+        }
+    }
+
+    fn fitness(&self, organism: &UniverseOrganism) -> f32 {
+        let bf = self.base.fitness(organism);
+        let ff: f32 = self.fibers.iter().map(|(p, c)| p.fitness(organism) * c).sum();
+        bf + ff
+    }
+
+    fn inject_problem(&mut self, input: &[f32]) {
+        self.base.inject_problem(input);
+        for (p, _) in &mut self.fibers { p.inject_problem(input); }
+    }
+
+    fn extract_solution(&self) -> Vec<f32> {
+        let mut r = self.base.extract_solution();
+        for proj in &self.fiber_projections { r.extend_from_slice(proj); }
+        r
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -996,6 +1415,187 @@ mod tests {
         assert_eq!(grid.index(0, 0), 0);
         assert_eq!(grid.index(1, 0), 1);
         assert_eq!(grid.index(0, 1), 32);
+    }
+
+    // ========================================================================
+    // FibonacciUniverse Tests
+    // ========================================================================
+
+    #[test]
+    fn test_fibonacci_universe_creation() {
+        let fib = FibonacciUniverse::new(32);
+        assert_eq!(fib.name(), "FibonacciUniverse");
+        assert_eq!(fib.lattice.len(), 32);
+    }
+
+    #[test]
+    fn test_fibonacci_disk_points_in_unit_disk() {
+        for k in 0..100 {
+            let p = fibonacci_disk_point(k, 100);
+            let r = (p.x * p.x + p.y * p.y).sqrt();
+            assert!(r <= 1.001, "k={} r={} outside unit disk", k, r);
+        }
+    }
+
+    #[test]
+    fn test_fibonacci_nearest_lattice_idx_self() {
+        let fib = FibonacciUniverse::new(16);
+        for (i, &lp) in fib.lattice.iter().enumerate() {
+            assert_eq!(fib.nearest_lattice_idx(lp), i);
+        }
+    }
+
+    #[test]
+    fn test_fibonacci_universe_tick_costs_energy() {
+        let mut fib = FibonacciUniverse::new(16);
+        let mut grid = UniverseGrid::new(64, 64);
+        let mut orgs = vec![UniverseOrganism::new(1, 0.0, 0.0)];
+        orgs[0].energy = 10.0;
+        fib.tick(&mut orgs, &mut grid);
+        assert!(orgs[0].energy < 10.0);
+    }
+
+    #[test]
+    fn test_fibonacci_inject_extract() {
+        let mut fib = FibonacciUniverse::new(8);
+        let input: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
+        fib.inject_problem(&input);
+        let sol = fib.extract_solution();
+        assert!(!sol.is_empty());
+    }
+
+    // ========================================================================
+    // HyperbolicUniverse Tests
+    // ========================================================================
+
+    #[test]
+    fn test_hyperbolic_universe_creation() {
+        let h = HyperbolicUniverse::new(1.0);
+        assert_eq!(h.name(), "HyperbolicUniverse");
+        assert!(h.curvature > 0.0);
+    }
+
+    #[test]
+    fn test_poincare_distance_origin_zero() {
+        let d = HyperbolicUniverse::poincare_distance(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0));
+        assert!(d < 1e-4);
+    }
+
+    #[test]
+    fn test_poincare_distance_symmetry() {
+        let u = Vec2::new(0.3, 0.1);
+        let v = Vec2::new(-0.2, 0.4);
+        let d1 = HyperbolicUniverse::poincare_distance(u, v);
+        let d2 = HyperbolicUniverse::poincare_distance(v, u);
+        assert!((d1 - d2).abs() < 1e-5, "asymmetric: {} vs {}", d1, d2);
+    }
+
+    #[test]
+    fn test_poincare_distance_larger_near_boundary() {
+        let u_c = Vec2::new(0.1, 0.0);
+        let v_c = Vec2::new(0.2, 0.0);
+        let u_e = Vec2::new(0.85, 0.0);
+        let v_e = Vec2::new(0.89, 0.0);
+        let d_center = HyperbolicUniverse::poincare_distance(u_c, v_c);
+        let d_edge   = HyperbolicUniverse::poincare_distance(u_e, v_e);
+        assert!(d_edge > d_center, "d_edge={} d_center={}", d_edge, d_center);
+    }
+
+    #[test]
+    fn test_hyperbolic_tick_costs_energy() {
+        let mut h = HyperbolicUniverse::new(1.0);
+        let mut grid = UniverseGrid::new(64, 64);
+        let mut orgs = vec![UniverseOrganism::new(1, 0.3, 0.2)];
+        orgs[0].energy = 10.0;
+        h.tick(&mut orgs, &mut grid);
+        assert!(orgs[0].energy < 10.0);
+    }
+
+    // ========================================================================
+    // TunnelUniverse Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tunnel_universe_creation() {
+        let t = TunnelUniverse::new();
+        assert_eq!(t.name(), "TunnelUniverse");
+        assert_eq!(t.g0.lattice.len(), 16);
+        assert_eq!(t.g1.lattice.len(), 64);
+        assert_eq!(t.tunnel_map.len(), 64);
+    }
+
+    #[test]
+    fn test_tunnel_map_valid_indices() {
+        let t = TunnelUniverse::new();
+        for &g0_i in &t.tunnel_map {
+            assert!(g0_i < 16, "tunnel_map entry {} out of range", g0_i);
+        }
+    }
+
+    #[test]
+    fn test_tunnel_tick_costs_energy() {
+        let mut t = TunnelUniverse::new();
+        let mut grid = UniverseGrid::new(64, 64);
+        let mut orgs = vec![UniverseOrganism::new(1, 0.5, 0.0)];
+        orgs[0].energy = 10.0;
+        t.tick(&mut orgs, &mut grid);
+        assert!(orgs[0].energy < 10.0);
+    }
+
+    #[test]
+    fn test_tunnel_reconstruction_error_finite() {
+        let mut t = TunnelUniverse::new();
+        let input: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        t.inject_problem(&input);
+        let mut grid = UniverseGrid::new(64, 64);
+        let mut orgs = vec![UniverseOrganism::new(1, 0.0, 0.5)];
+        t.tick(&mut orgs, &mut grid);
+        assert!(t.reconstruction_error.is_finite() && t.reconstruction_error >= 0.0);
+    }
+
+    #[test]
+    fn test_tunnel_extract_solution_length() {
+        let t = TunnelUniverse::new();
+        assert_eq!(t.extract_solution().len(), 80); // 16 G0 + 64 G1
+    }
+
+    // ========================================================================
+    // MultiverseTopology Tests
+    // ========================================================================
+
+    #[test]
+    fn test_multiverse_creation() {
+        let mv = MultiverseTopology::new(16);
+        assert_eq!(mv.name(), "MultiverseTopology");
+        assert_eq!(mv.num_fibers(), 0);
+    }
+
+    #[test]
+    fn test_multiverse_add_fibers() {
+        let mut mv = MultiverseTopology::new(16);
+        mv.add_fiber(Box::new(FluidUniverse::new(0.1)), 0.3);
+        mv.add_fiber(Box::new(TunnelUniverse::new()), 0.5);
+        assert_eq!(mv.num_fibers(), 2);
+    }
+
+    #[test]
+    fn test_multiverse_tick_costs_energy() {
+        let mut mv = MultiverseTopology::new(8);
+        mv.add_fiber(Box::new(FluidUniverse::new(0.2)), 0.3);
+        let mut grid = UniverseGrid::new(32, 32);
+        let mut orgs = vec![UniverseOrganism::new(1, 0.2, 0.1)];
+        orgs[0].energy = 10.0;
+        mv.tick(&mut orgs, &mut grid);
+        assert!(orgs[0].energy < 10.0);
+    }
+
+    #[test]
+    fn test_multiverse_inject_extract() {
+        let mut mv = MultiverseTopology::new(8);
+        mv.add_fiber(Box::new(PhotonicUniverse::new()), 0.2);
+        mv.inject_problem(&[0.5, 1.0, 0.3, 0.8]);
+        let sol = mv.extract_solution();
+        assert!(!sol.is_empty());
     }
 
     #[test]
