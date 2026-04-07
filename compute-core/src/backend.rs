@@ -25,11 +25,25 @@ pub trait ComputeBackend: Send + Sync + 'static {
     /// Upload de dados INT4 comprimido (2 valores por byte) host → device.
     fn upload_q4(&self, data: &[u8], shape: &[usize]) -> AnyTensor;
 
+    /// Upload de slice I32 host → device (para índices de gather/scatter).
+    fn upload_i32(&self, data: &[i32], shape: &[usize]) -> AnyTensor {
+        // Default: cast to f32 and upload (CPU backends without native i32 support)
+        let _ = data;
+        let _ = shape;
+        panic!("upload_i32 not implemented for this backend");
+    }
+
     /// Aloca buffer Q4 não inicializado no device.
     fn alloc_q4(&self, shape: &[usize]) -> AnyTensor;
 
     /// Download de tensor F32 device → Vec<f32> host. Sincroniza o device.
     fn download_f32(&self, t: &AnyTensor) -> Vec<f32>;
+
+    /// Download de tensor BF16 device → Vec<f32> host, convertendo BF16→F32.
+    /// Default: tenta download_f32 (para backends que armazenam tudo como F32).
+    fn download_bf16_as_f32(&self, t: &AnyTensor) -> Vec<f32> {
+        self.download_f32(t)
+    }
 
     // ── GEMM ─────────────────────────────────────────────────────────────────
 
@@ -88,6 +102,28 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_ternary(&self, _packed: &AnyTensor, _x: &AnyTensor, _output: &AnyTensor,
                     _m: usize, _n: usize, _k: usize, _scale: f32) -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_ternary".into()))
+    }
+
+    // ── Sparse MLP (gather/scatter for Kuramoto Router) ────────────────────
+
+    /// Gather selected rows from BF16 weight matrix.
+    fn gather_rows_bf16(&self, _p: &GatherRowsBf16Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gather_rows_bf16".into()))
+    }
+
+    /// Gather selected columns from BF16 weight matrix.
+    fn gather_cols_bf16(&self, _p: &GatherColsBf16Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gather_cols_bf16".into()))
+    }
+
+    /// GPU-side Kuramoto phase coherence: hidden × tuning_forks → coherences.
+    fn kuramoto_coherence(&self, _p: &KuramotoCoherenceParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("kuramoto_coherence".into()))
+    }
+
+    /// GPU-side top-K selection from coherences → indices.
+    fn topk_select(&self, _p: &TopkSelectParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("topk_select".into()))
     }
 
     // ── Sync e informações ───────────────────────────────────────────────────

@@ -6,6 +6,8 @@ use compute_core::{
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
+        GatherRowsBf16Params, GatherColsBf16Params,
+        KuramotoCoherenceParams, TopkSelectParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -58,6 +60,17 @@ fn u8_ptr(t: &AnyTensor) -> *const u8 {
     t.downcast_ref::<DeviceBuffer<u8>>()
         .expect("RocmBackend: expected Q4/u8 DeviceBuffer")
         .as_ptr()
+}
+
+/// Extract a read-only i32 device pointer from an `AnyTensor`.
+fn i32_ptr(t: &AnyTensor) -> *const i32 {
+    t.downcast_ref::<DeviceBuffer<i32>>()
+        .expect("RocmBackend: expected I32 DeviceBuffer")
+        .as_ptr()
+}
+
+fn u16_mut_ptr(t: &AnyTensor) -> *mut u16 {
+    u16_ptr(t) as *mut u16
 }
 
 /// Extract a mutable u8 (Q4 packed) device pointer from an `AnyTensor`.
@@ -138,6 +151,10 @@ impl ComputeBackend for RocmBackend {
     }
 
     fn upload_bf16(&self, data: &[u16], shape: &[usize]) -> AnyTensor {
+        let expected: usize = shape.iter().product();
+        assert_eq!(data.len(), expected,
+            "upload_bf16: data.len()={} != shape.product()={} shape={:?}",
+            data.len(), expected, shape);
         // `DeviceBuffer::from_slice` calls `hip_h2d` generically over T = u16.
         let buf = DeviceBufferU16::from_slice(data).unwrap();
         AnyTensor::new(Arc::new(buf), shape.to_vec(), DType::BF16)
@@ -147,6 +164,12 @@ impl ComputeBackend for RocmBackend {
         // Upload Q4 packed data (2 valores por byte) como u8 no device.
         let buf = DeviceBufferU8::from_slice(data).unwrap();
         AnyTensor::new(Arc::new(buf), shape.to_vec(), DType::Q4)
+    }
+
+    fn upload_i32(&self, data: &[i32], shape: &[usize]) -> AnyTensor {
+        let buf = DeviceBuffer::<i32>::from_slice(data).unwrap();
+        // Reuse F32 dtype tag — the kernel treats it as i32 via raw pointer
+        AnyTensor::new(Arc::new(buf), shape.to_vec(), DType::F32)
     }
 
     fn alloc_q4(&self, shape: &[usize]) -> AnyTensor {
@@ -159,6 +182,13 @@ impl ComputeBackend for RocmBackend {
     fn download_f32(&self, t: &AnyTensor) -> Vec<f32> {
         let buf = t.downcast_ref::<DeviceBuffer<f32>>().unwrap();
         buf.to_host().unwrap()
+    }
+
+    fn download_bf16_as_f32(&self, t: &AnyTensor) -> Vec<f32> {
+        let buf = t.downcast_ref::<DeviceBufferU16>()
+            .expect("download_bf16_as_f32: expected BF16/u16 DeviceBuffer");
+        let u16_host = buf.to_host().unwrap();
+        u16_host.iter().map(|&bits| f32::from_bits((bits as u32) << 16)).collect()
     }
 
     // ── GEMM ─────────────────────────────────────────────────────────────────
@@ -685,6 +715,61 @@ impl ComputeBackend for RocmBackend {
                 p.kv_dim as i32,
                 p.head_dim as i32,
                 p.n_kv_heads as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    // ── Sparse MLP gather kernels ────────────────────────────────────────────
+
+    fn gather_rows_bf16(&self, p: &GatherRowsBf16Params) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.gather_rows_bf16(
+                u16_ptr(p.src),
+                u16_mut_ptr(p.dst),
+                i32_ptr(p.indices),
+                p.n_indices as i32,
+                p.cols as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gather_cols_bf16(&self, p: &GatherColsBf16Params) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.gather_cols_bf16(
+                u16_ptr(p.src),
+                u16_mut_ptr(p.dst),
+                i32_ptr(p.indices),
+                p.rows as i32,
+                p.total_cols as i32,
+                p.n_indices as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn kuramoto_coherence(&self, p: &KuramotoCoherenceParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.kuramoto_coherence(
+                f32_ptr(p.hidden),
+                f32_ptr(p.tuning_forks),
+                f32_mut_ptr(p.coherences),
+                p.n_neurons as i32,
+                p.hidden_dim as i32,
+                p.phase_dim as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn topk_select(&self, p: &TopkSelectParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.topk_select(
+                f32_ptr(p.coherences),
+                i32_ptr(p.indices) as *mut i32,
+                p.n_neurons as i32,
+                p.top_k as i32,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))

@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IARA Deep Trace Visualization</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0e27;
+            color: #e0e0e0;
+            font-family: 'Courier New', monospace;
+            line-height: 1.6;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 16px;
+            gap: 12px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background: #0f1535;
+            border: 1px solid #1e3a5f;
+            border-radius: 6px;
+        }
+
+        .header h1 {
+            font-size: 18px;
+            color: #00d9ff;
+            font-weight: bold;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .control-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        input[type="text"], select {
+            padding: 6px 12px;
+            background: #1a1f3a;
+            border: 1px solid #00d9ff;
+            color: #00d9ff;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+
+        input[type="text"]::placeholder {
+            color: #666;
+        }
+
+        button {
+            padding: 6px 16px;
+            background: linear-gradient(135deg, #00d9ff 0%, #0099cc 100%);
+            color: #0a0e27;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            background: linear-gradient(135deg, #00ffff 0%, #00bbdd 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.3);
+        }
+
+        .mock-toggle {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            padding: 6px 12px;
+            background: #1a1f3a;
+            border: 1px solid #666;
+            border-radius: 4px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .mock-toggle input[type="checkbox"] {
+            cursor: pointer;
+        }
+
+        .main-content {
+            display: flex;
+            gap: 12px;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .left-panel {
+            display: flex;
+            flex-direction: column;
+            flex: 3;
+            gap: 12px;
+            overflow: hidden;
+        }
+
+        .right-panel {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            gap: 12px;
+            overflow: hidden;
+        }
+
+        .panel {
+            background: #0f1535;
+            border: 1px solid #1e3a5f;
+            border-radius: 6px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-title {
+            font-size: 13px;
+            color: #00d9ff;
+            font-weight: bold;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        #layer-flow {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        #attention-heatmap {
+            flex: 1;
+            overflow: auto;
+        }
+
+        #mlp-neurons {
+            flex: 1;
+            overflow: auto;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .stat-item {
+            padding: 10px;
+            background: #1a1f3a;
+            border: 1px solid #1e3a5f;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .stat-label {
+            color: #888;
+            text-transform: uppercase;
+            font-size: 11px;
+            margin-bottom: 4px;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-value {
+            color: #00d9ff;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .stat-bar {
+            width: 100%;
+            height: 4px;
+            background: #0a0e27;
+            border-radius: 2px;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+
+        .stat-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d9ff, #00ff99);
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+
+        .layer-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            height: 24px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border-radius: 3px;
+            padding: 0 6px;
+        }
+
+        .layer-bar:hover {
+            background: rgba(0, 217, 255, 0.1);
+            transform: translateX(4px);
+        }
+
+        .layer-bar.selected {
+            background: rgba(0, 217, 255, 0.2);
+            border-left: 3px solid #00d9ff;
+        }
+
+        .layer-index {
+            width: 24px;
+            text-align: right;
+            color: #888;
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+
+        .layer-bar-container {
+            flex: 1;
+            height: 20px;
+            background: #1a1f3a;
+            border-radius: 3px;
+            position: relative;
+            overflow: hidden;
+            border: 1px solid #1e3a5f;
+        }
+
+        .layer-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #ff3366, #ff9933);
+            border-radius: 2px;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .layer-bar-fill.cold {
+            background: linear-gradient(90deg, #003366, #0066cc);
+        }
+
+        .layer-bar-fill.moderate {
+            background: linear-gradient(90deg, #ff6633, #ffaa33);
+        }
+
+        .layer-bar-fill.hot {
+            background: linear-gradient(90deg, #ff3333, #ff0000);
+        }
+
+        .phase-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            margin: 0 2px;
+            flex-shrink: 0;
+        }
+
+        .phase-dot.coherent {
+            background: #00ff99;
+            box-shadow: 0 0 4px #00ff99;
+        }
+
+        .phase-dot.medium {
+            background: #ffff00;
+            box-shadow: 0 0 4px #ffff00;
+        }
+
+        .phase-dot.chaotic {
+            background: #ff3366;
+            box-shadow: 0 0 4px #ff3366;
+        }
+
+        .connection-line {
+            position: absolute;
+            left: 12px;
+            width: 2px;
+            background: rgba(0, 217, 255, 0.3);
+            z-index: 0;
+        }
+
+        .tooltip {
+            position: absolute;
+            background: #0a0e27;
+            border: 1px solid #00d9ff;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 11px;
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+            max-width: 200px;
+        }
+
+        .heatmap-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(16px, 1fr));
+            gap: 1px;
+            background: #1a1f3a;
+            padding: 8px;
+            border-radius: 4px;
+        }
+
+        .heatmap-cell {
+            width: 16px;
+            height: 16px;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .heatmap-cell:hover {
+            transform: scale(1.2);
+            filter: brightness(1.3);
+        }
+
+        .neuron-grid {
+            display: grid;
+            grid-template-columns: repeat(16, 1fr);
+            gap: 2px;
+            padding: 8px;
+        }
+
+        .neuron {
+            width: 100%;
+            aspect-ratio: 1;
+            border-radius: 2px;
+            cursor: pointer;
+            border: 1px solid rgba(0, 217, 255, 0.2);
+        }
+
+        .neuron.alive {
+            background: #00ff99;
+            box-shadow: 0 0 4px #00ff99;
+        }
+
+        .neuron.dormant {
+            background: #444444;
+        }
+
+        .neuron.dead {
+            background: #1a1a1a;
+        }
+
+        .token-selector {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            padding: 6px;
+            background: #1a1f3a;
+            border-radius: 4px;
+        }
+
+        .token-btn {
+            padding: 4px 8px;
+            background: #0f1535;
+            border: 1px solid #1e3a5f;
+            border-radius: 3px;
+            color: #e0e0e0;
+            cursor: pointer;
+            white-space: nowrap;
+            font-size: 11px;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .token-btn:hover {
+            background: #1e3a5f;
+            border-color: #00d9ff;
+        }
+
+        .token-btn.selected {
+            background: #00d9ff;
+            color: #0a0e27;
+            border-color: #00d9ff;
+            font-weight: bold;
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #00d9ff;
+            font-size: 12px;
+        }
+
+        .error {
+            padding: 12px;
+            background: #3a1a1a;
+            border: 1px solid #ff3366;
+            border-radius: 4px;
+            color: #ff9999;
+            font-size: 12px;
+            display: none;
+        }
+
+        .error.show {
+            display: block;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0a0e27;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #1e3a5f;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #2a4a7f;
+        }
+
+        .legend {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 8px;
+            font-size: 11px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #1e3a5f;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>IARA Deep Trace Visualization</h1>
+            </div>
+            <div class="header-controls">
+                <div class="control-group">
+                    <input type="text" id="prompt-input" placeholder="Enter prompt..." value="Hello world">
+                    <button onclick="tracePrompt()">Trace</button>
+                </div>
+                <div class="control-group">
+                    <select id="token-select" onchange="selectToken()">
+                        <option value="">Select a token...</option>
+                    </select>
+                </div>
+                <div class="mock-toggle">
+                    <input type="checkbox" id="use-mock" checked>
+                    <label for="use-mock">Mock Data</label>
+                </div>
+            </div>
+        </div>
+
+        <div class="error" id="error-msg"></div>
+
+        <div class="main-content">
+            <div class="left-panel">
+                <div class="panel">
+                    <div class="panel-title">Layer Flow Graph (28 Layers)</div>
+                    <div id="layer-flow"></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">MLP Neuron Activation Map</div>
+                    <div id="mlp-neurons"></div>
+                </div>
+            </div>
+
+            <div class="right-panel">
+                <div class="panel">
+                    <div class="panel-title">Summary Statistics</div>
+                    <div class="stats-grid" id="stats-grid"></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Attention Heatmap</div>
+                    <div id="attention-heatmap"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <script>
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Data Storage
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        let currentTrace = null;
+        let selectedTokenIdx = 0;
+        let selectedLayerIdx = null;
+
+        const NUM_LAYERS = 28;
+        const LAYER_THRESHOLD = 0.3;
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Mock Data Generator
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        function generateMockTrace(prompt) {
+            const words = prompt.split(' ');
+            const steps = [];
+
+            for (let i = 0; i < words.length; i++) {
+                const layerTraces = [];
+                const activeLayersSet = new Set();
+
+                for (let layerIdx = 0; layerIdx < NUM_LAYERS; layerIdx++) {
+                    // Generate realistic per-layer metrics
+                    const residualDelta = Math.random() * (0.8 - 0.1) + 0.1;
+                    const mlpActivationRate = Math.sin(layerIdx / NUM_LAYERS * Math.PI) * 0.8 + 0.2;
+                    const phaseCoherence = 0.5 + Math.sin((i + layerIdx) / 5) * 0.3;
+
+                    const trace = {
+                        layer_idx: layerIdx,
+                        attention_energy: Math.random() * 0.5,
+                        mlp_energy: Math.random() * 0.7,
+                        residual_norm: residualDelta,
+                        max_activation: residualDelta * 2,
+                        hot_neurons: Array.from({ length: Math.floor(Math.random() * 8) }, () =>
+                            Math.floor(Math.random() * 256)
+                        ),
+                        time_us: Math.floor(Math.random() * 100 + 50),
+                        // Extended metrics for visualization
+                        mlp_activation_rate: mlpActivationRate,
+                        phase_coherence: phaseCoherence,
+                        hidden_norm: 1.0 + Math.sin(layerIdx / 5) * 0.3
+                    };
+
+                    layerTraces.push(trace);
+
+                    if (residualDelta > LAYER_THRESHOLD) {
+                        activeLayersSet.add(layerIdx);
+                    }
+                }
+
+                const step = {
+                    token_id: Math.floor(Math.random() * 100000),
+                    token_str: words[i],
+                    top_logits: Array.from({ length: 5 }, (_, idx) => [
+                        idx,
+                        Math.random() * 10 - 5
+                    ]),
+                    layer_traces: layerTraces,
+                    active_layers: Array.from(activeLayersSet),
+                    time_ms: Math.floor(Math.random() * 50 + 20)
+                };
+
+                steps.push(step);
+            }
+
+            return {
+                prompt: prompt,
+                response: words.join(' '),
+                steps: steps,
+                iara_snapshots: [],
+                layer_activation_path: [],
+                energy_trajectory: [],
+                attention_heatmap: [],
+                finalized_at: new Date().toISOString()
+            };
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // API & Trace Loading
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        async function tracePrompt() {
+            const prompt = document.getElementById('prompt-input').value.trim();
+            if (!prompt) {
+                showError('Please enter a prompt');
+                return;
+            }
+
+            const useMock = document.getElementById('use-mock').checked;
+
+            try {
+                if (useMock) {
+                    currentTrace = generateMockTrace(prompt);
+                } else {
+                    const response = await fetch('/api/trace', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Server error: ${response.status}`);
+                    }
+
+                    currentTrace = await response.json();
+                }
+
+                selectedTokenIdx = 0;
+                selectedLayerIdx = null;
+                updateVisualization();
+            } catch (error) {
+                showError(`Failed to trace: ${error.message}`);
+            }
+        }
+
+        function selectToken() {
+            const select = document.getElementById('token-select');
+            selectedTokenIdx = parseInt(select.value) || 0;
+            selectedLayerIdx = null;
+            updateVisualization();
+        }
+
+        function showError(msg) {
+            const el = document.getElementById('error-msg');
+            el.textContent = msg;
+            el.classList.add('show');
+            setTimeout(() => el.classList.remove('show'), 5000);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Visualization Updates
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        function updateVisualization() {
+            if (!currentTrace || currentTrace.steps.length === 0) {
+                showError('No trace data available');
+                return;
+            }
+
+            updateTokenSelector();
+            updateLayerFlow();
+            updateMlpNeurons();
+            updateAttentionHeatmap();
+            updateStats();
+        }
+
+        function updateTokenSelector() {
+            const select = document.getElementById('token-select');
+            select.innerHTML = '';
+
+            currentTrace.steps.forEach((step, idx) => {
+                const option = document.createElement('option');
+                option.value = idx;
+                option.textContent = `Token ${idx}: "${step.token_str}"`;
+                select.appendChild(option);
+            });
+
+            select.value = selectedTokenIdx;
+        }
+
+        function updateLayerFlow() {
+            const container = document.getElementById('layer-flow');
+            container.innerHTML = '';
+
+            if (!currentTrace.steps[selectedTokenIdx]) return;
+
+            const step = currentTrace.steps[selectedTokenIdx];
+            const layerTraces = step.layer_traces;
+
+            // Find max residual delta for normalization
+            const maxResidual = Math.max(...layerTraces.map(t => t.residual_norm || 1));
+
+            layerTraces.forEach((trace, idx) => {
+                const layerEl = document.createElement('div');
+                layerEl.className = 'layer-bar' + (selectedLayerIdx === idx ? ' selected' : '');
+                layerEl.onclick = () => selectLayer(idx);
+
+                const residualDelta = trace.residual_norm || 0;
+                const mlpActivationRate = trace.mlp_activation_rate || Math.random();
+                const phaseCoherence = trace.phase_coherence || 0.5;
+
+                // Determine color based on residual delta (0=blue/cold, 1=red/hot)
+                let colorClass = 'cold';
+                if (residualDelta > maxResidual * 0.7) colorClass = 'hot';
+                else if (residualDelta > maxResidual * 0.4) colorClass = 'moderate';
+
+                // Phase coherence color
+                let phaseDotClass = 'coherent';
+                if (phaseCoherence < 0.4) phaseDotClass = 'chaotic';
+                else if (phaseCoherence < 0.6) phaseDotClass = 'medium';
+
+                const barWidth = (mlpActivationRate * 100).toFixed(0);
+
+                layerEl.innerHTML = `
+                    <div class="layer-index">${idx}</div>
+                    <div class="layer-bar-container">
+                        <div class="layer-bar-fill ${colorClass}" style="width: ${barWidth}%"></div>
+                    </div>
+                    <div class="phase-dot ${phaseDotClass}"></div>
+                `;
+
+                layerEl.addEventListener('mouseenter', (e) => showLayerTooltip(e, trace));
+                layerEl.addEventListener('mouseleave', hideTooltip);
+
+                container.appendChild(layerEl);
+            });
+        }
+
+        function updateMlpNeurons() {
+            const container = document.getElementById('mlp-neurons');
+            container.innerHTML = '';
+
+            if (!currentTrace.steps[selectedTokenIdx] || selectedLayerIdx === null) {
+                container.innerHTML = '<div style="color: #666; font-size: 12px; padding: 8px;">Select a layer to view neuron activations</div>';
+                return;
+            }
+
+            const step = currentTrace.steps[selectedTokenIdx];
+            const trace = step.layer_traces[selectedLayerIdx];
+
+            const grid = document.createElement('div');
+            grid.className = 'neuron-grid';
+
+            const hotNeurons = new Set(trace.hot_neurons || []);
+            const totalNeurons = 256;
+
+            for (let i = 0; i < totalNeurons; i++) {
+                const neuron = document.createElement('div');
+                neuron.className = 'neuron';
+
+                if (hotNeurons.has(i)) {
+                    neuron.classList.add('alive');
+                } else if (Math.random() > 0.7) {
+                    neuron.classList.add('dormant');
+                } else {
+                    neuron.classList.add('dead');
+                }
+
+                neuron.title = `Neuron ${i}`;
+                grid.appendChild(neuron);
+            }
+
+            container.appendChild(grid);
+        }
+
+        function updateAttentionHeatmap() {
+            const container = document.getElementById('attention-heatmap');
+            container.innerHTML = '';
+
+            if (!currentTrace.steps[selectedTokenIdx] || selectedLayerIdx === null) {
+                container.innerHTML = '<div style="color: #666; font-size: 12px; padding: 8px;">Select a layer to view attention</div>';
+                return;
+            }
+
+            const step = currentTrace.steps[selectedTokenIdx];
+            const trace = step.layer_traces[selectedLayerIdx];
+
+            // Generate synthetic attention matrix: positions x heads
+            const numHeads = 8;
+            const contextLen = Math.min(selectedTokenIdx + 1, 32);
+            const grid = document.createElement('div');
+            grid.className = 'heatmap-grid';
+            grid.style.gridTemplateColumns = `repeat(${contextLen}, 1fr)`;
+
+            for (let head = 0; head < numHeads; head++) {
+                for (let pos = 0; pos < contextLen; pos++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'heatmap-cell';
+
+                    // Synthetic attention: higher for recent positions
+                    const attention = Math.exp(-(contextLen - 1 - pos) / 4) * (0.5 + Math.sin(head / 4) * 0.2);
+                    const intensity = Math.floor(attention * 255);
+                    cell.style.background = `hsl(200, 100%, ${50 - intensity / 10}%)`;
+                    cell.title = `Head ${head}, Pos ${pos}: ${(attention * 100).toFixed(1)}%`;
+
+                    grid.appendChild(cell);
+                }
+            }
+
+            container.appendChild(grid);
+        }
+
+        function updateStats() {
+            const container = document.getElementById('stats-grid');
+            container.innerHTML = '';
+
+            if (!currentTrace.steps[selectedTokenIdx]) return;
+
+            const step = currentTrace.steps[selectedTokenIdx];
+            const layerTraces = step.layer_traces;
+
+            // Calculate stats
+            const totalActiveLayers = step.active_layers.length;
+            const avgActivationRate = (layerTraces.reduce((sum, t) => sum + (t.mlp_activation_rate || 0), 0) / NUM_LAYERS * 100).toFixed(1);
+            const logitEntropy = (step.top_logits.reduce((sum, [_, v]) => sum + v * v, 0) / step.top_logits.length).toFixed(2);
+            const topTokens = step.top_logits.slice(0, 5);
+
+            // Active layers stat
+            const activeStat = document.createElement('div');
+            activeStat.className = 'stat-item';
+            activeStat.innerHTML = `
+                <div class="stat-label">Active Layers</div>
+                <div class="stat-value">${totalActiveLayers}/${NUM_LAYERS}</div>
+                <div class="stat-bar">
+                    <div class="stat-bar-fill" style="width: ${(totalActiveLayers / NUM_LAYERS * 100).toFixed(0)}%"></div>
+                </div>
+            `;
+            container.appendChild(activeStat);
+
+            // Activation rate stat
+            const activationStat = document.createElement('div');
+            activationStat.className = 'stat-item';
+            activationStat.innerHTML = `
+                <div class="stat-label">Avg MLP Activation</div>
+                <div class="stat-value">${avgActivationRate}%</div>
+                <div class="stat-bar">
+                    <div class="stat-bar-fill" style="width: ${avgActivationRate}%"></div>
+                </div>
+            `;
+            container.appendChild(activationStat);
+
+            // Entropy stat
+            const entropyStat = document.createElement('div');
+            entropyStat.className = 'stat-item';
+            entropyStat.innerHTML = `
+                <div class="stat-label">Logit Entropy</div>
+                <div class="stat-value">${logitEntropy}</div>
+            `;
+            container.appendChild(entropyStat);
+
+            // Confidence stat
+            const topLogit = step.top_logits[0]?.[1] || 0;
+            const confidence = (Math.exp(topLogit) / (Math.exp(topLogit) + Math.exp(step.top_logits[1]?.[1] || 0)) * 100).toFixed(1);
+            const confStat = document.createElement('div');
+            confStat.className = 'stat-item';
+            confStat.innerHTML = `
+                <div class="stat-label">Confidence</div>
+                <div class="stat-value">${confidence}%</div>
+                <div class="stat-bar">
+                    <div class="stat-bar-fill" style="width: ${confidence}%"></div>
+                </div>
+            `;
+            container.appendChild(confStat);
+
+            // Top tokens
+            const topStat = document.createElement('div');
+            topStat.className = 'stat-item';
+            topStat.innerHTML = '<div class="stat-label">Top Predictions</div>';
+            topTokens.forEach(([id, logit], idx) => {
+                const prob = Math.exp(logit) / topTokens.reduce((sum, [_, l]) => sum + Math.exp(l), 0);
+                const item = document.createElement('div');
+                item.style.marginTop = '4px';
+                item.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; font-size: 11px;">
+                        <span>#${id}</span>
+                        <span style="color: #00ff99;">${(prob * 100).toFixed(1)}%</span>
+                    </div>
+                    <div class="stat-bar" style="margin-top: 2px;">
+                        <div class="stat-bar-fill" style="width: ${prob * 100}%"></div>
+                    </div>
+                `;
+                topStat.appendChild(item);
+            });
+            container.appendChild(topStat);
+
+            // Timing
+            const timingStat = document.createElement('div');
+            timingStat.className = 'stat-item';
+            timingStat.innerHTML = `
+                <div class="stat-label">Forward Time</div>
+                <div class="stat-value">${step.time_ms}ms</div>
+            `;
+            container.appendChild(timingStat);
+        }
+
+        function selectLayer(idx) {
+            selectedLayerIdx = (selectedLayerIdx === idx) ? null : idx;
+            updateVisualization();
+        }
+
+        function showLayerTooltip(e, trace) {
+            const tooltip = document.getElementById('tooltip');
+            tooltip.innerHTML = `
+                <strong>Layer ${trace.layer_idx}</strong><br>
+                Residual: ${(trace.residual_norm || 0).toFixed(3)}<br>
+                Attention: ${(trace.attention_energy || 0).toFixed(3)}<br>
+                MLP: ${(trace.mlp_energy || 0).toFixed(3)}<br>
+                MLP Rate: ${((trace.mlp_activation_rate || 0) * 100).toFixed(1)}%<br>
+                Phase: ${(trace.phase_coherence || 0).toFixed(2)}<br>
+                Hot Neurons: ${trace.hot_neurons?.length || 0}
+            `;
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 10) + 'px';
+            tooltip.style.top = (e.clientY + 10) + 'px';
+        }
+
+        function hideTooltip() {
+            document.getElementById('tooltip').style.display = 'none';
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Initialization
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Load mock data on startup
+            if (document.getElementById('use-mock').checked) {
+                currentTrace = generateMockTrace(document.getElementById('prompt-input').value);
+                updateVisualization();
+            }
+        });
+
+        document.getElementById('prompt-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') tracePrompt();
+        });
+    </script>
+</body>
+</html>

@@ -251,3 +251,46 @@ pub struct KvCacheInt8ReadParams<'a> {
     pub head_dim: usize,
     pub n_kv_heads: usize,
 }
+
+// ── Sparse MLP (Kuramoto Router) ────────────────────────────────────────────
+
+/// Gather selected rows from a BF16 weight matrix into contiguous output.
+/// src[total_rows, cols] → dst[n_indices, cols], selected by indices.
+pub struct GatherRowsBf16Params<'a> {
+    pub src: &'a AnyTensor,       // [total_rows, cols] BF16
+    pub dst: &'a AnyTensor,       // [n_indices, cols] BF16
+    pub indices: &'a AnyTensor,   // [n_indices] I32
+    pub n_indices: usize,
+    pub cols: usize,
+}
+
+/// Gather selected columns from a BF16 weight matrix into contiguous output.
+/// src[rows, total_cols] → dst[rows, n_indices], selected by indices.
+pub struct GatherColsBf16Params<'a> {
+    pub src: &'a AnyTensor,       // [rows, total_cols] BF16
+    pub dst: &'a AnyTensor,       // [rows, n_indices] BF16
+    pub indices: &'a AnyTensor,   // [n_indices] I32
+    pub rows: usize,
+    pub total_cols: usize,
+    pub n_indices: usize,
+}
+
+/// GPU-side Kuramoto coherence computation.
+/// hidden[hidden_dim] F32 × tuning_forks[n_neurons, phase_dim] F32 → coherences[n_neurons] F32
+pub struct KuramotoCoherenceParams<'a> {
+    pub hidden: &'a AnyTensor,        // [hidden_dim] F32
+    pub tuning_forks: &'a AnyTensor,  // [n_neurons, phase_dim] F32
+    pub coherences: &'a AnyTensor,    // [n_neurons] F32 — output
+    pub n_neurons: usize,
+    pub hidden_dim: usize,
+    pub phase_dim: usize,
+}
+
+/// GPU-side top-K selection from coherences.
+/// coherences[n_neurons] F32 → indices[top_k] I32
+pub struct TopkSelectParams<'a> {
+    pub coherences: &'a AnyTensor,  // [n_neurons] F32
+    pub indices: &'a AnyTensor,     // [top_k] I32 — output
+    pub n_neurons: usize,
+    pub top_k: usize,
+}

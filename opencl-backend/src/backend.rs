@@ -266,6 +266,10 @@ impl ComputeBackend for OpenClBackend {
     }
 
     fn upload_bf16(&self, data: &[u16], shape: &[usize]) -> AnyTensor {
+        let expected: usize = shape.iter().product();
+        assert_eq!(data.len(), expected,
+            "upload_bf16: data.len()={} != shape.product()={} shape={:?}",
+            data.len(), expected, shape);
         let mut buf = self
             .alloc_u16_buf(data.len())
             .expect("OpenCL: falha ao alocar U16 para upload");
@@ -350,6 +354,46 @@ impl ComputeBackend for OpenClBackend {
         }
 
         result
+    }
+
+    fn download_bf16_as_f32(&self, t: &AnyTensor) -> Vec<f32> {
+        let buf = Self::u16_buf(t);
+        let mut u16_host = vec![0u16; buf.len];
+
+        if self.is_uma {
+            self.ctx.queue.finish().expect("UMA: falha ao sincronizar queue");
+            let byte_size = buf.len * std::mem::size_of::<u16>();
+            let mut mapped_ptr: cl_mem = std::ptr::null_mut();
+            let _ev = unsafe {
+                self.ctx.queue.enqueue_map_buffer(
+                    &buf.buf, CL_BLOCKING,
+                    CL_MAP_READ,
+                    0, byte_size,
+                    &mut mapped_ptr,
+                    &[],
+                ).expect("UMA: falha ao mapear buffer BF16 para leitura")
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mapped_ptr as *const u16,
+                    u16_host.as_mut_ptr(),
+                    buf.len,
+                );
+            }
+            let _ = unsafe {
+                self.ctx.queue.enqueue_unmap_mem_object(buf.buf.get(), mapped_ptr, &[])
+            };
+        } else {
+            let ev = unsafe {
+                self.ctx
+                    .queue
+                    .enqueue_read_buffer(&buf.buf, CL_BLOCKING, 0, &mut u16_host, &[])
+                    .expect("OpenCL: falha ao ler buffer BF16")
+            };
+            ev.wait().expect("OpenCL: wait download BF16");
+        }
+
+        u16_host.iter().map(|&bits| f32::from_bits((bits as u32) << 16)).collect()
     }
 
     // ── GEMM ─────────────────────────────────────────────────────────────

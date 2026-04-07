@@ -250,6 +250,30 @@ impl KuramotoRouter {
             .collect()
     }
 
+    /// Get flattened tuning forks for a layer (for GPU upload).
+    /// Returns (flat_data, n_neurons, phase_dim) where flat_data is [n_neurons * phase_dim].
+    pub fn get_tuning_forks_flat(&self, layer_idx: usize) -> Option<(Vec<f32>, usize, usize)> {
+        if layer_idx >= self.layers.len() { return None; }
+        let layer = &self.layers[layer_idx];
+        if layer.tuning_forks.is_empty() { return None; }
+        let phase_dim = layer.tuning_forks[0].len();
+        let n_neurons = layer.n_neurons;
+        let mut flat = Vec::with_capacity(n_neurons * phase_dim);
+        for fork in &layer.tuning_forks {
+            flat.extend_from_slice(fork);
+            // Pad if shorter
+            if fork.len() < phase_dim {
+                flat.extend(std::iter::repeat(0.0f32).take(phase_dim - fork.len()));
+            }
+        }
+        Some((flat, n_neurons, phase_dim))
+    }
+
+    /// Get top_k for a layer
+    pub fn top_k(&self, layer_idx: usize) -> usize {
+        if layer_idx < self.layers.len() { self.layers[layer_idx].top_k } else { 0 }
+    }
+
     /// Calibrate router by comparing predicted vs actual active neurons
     ///
     /// Call during inference to measure and improve prediction accuracy.

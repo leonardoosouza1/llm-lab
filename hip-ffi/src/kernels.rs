@@ -59,6 +59,10 @@ pub struct GpuKernels {
     fn_fused_norm_bias_rope: hipFunction_t,
     fn_kv_cache_int8_quantize_append: hipFunction_t,
     fn_kv_cache_int8_dequantize: hipFunction_t,
+    fn_gather_rows_bf16: hipFunction_t,
+    fn_gather_cols_bf16: hipFunction_t,
+    fn_kuramoto_coherence: hipFunction_t,
+    fn_topk_select: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -97,6 +101,10 @@ impl GpuKernels {
         let fn_fused_norm_bias_rope = get_fn!("fused_norm_bias_rope");
         let fn_kv_cache_int8_quantize_append = get_fn!("kv_cache_int8_quantize_append");
         let fn_kv_cache_int8_dequantize = get_fn!("kv_cache_int8_dequantize");
+        let fn_gather_rows_bf16 = get_fn!("gather_rows_bf16");
+        let fn_gather_cols_bf16 = get_fn!("gather_cols_bf16");
+        let fn_kuramoto_coherence = get_fn!("kuramoto_coherence");
+        let fn_topk_select = get_fn!("topk_select");
 
         Ok(Self {
             module,
@@ -117,6 +125,10 @@ impl GpuKernels {
             fn_fused_norm_bias_rope,
             fn_kv_cache_int8_quantize_append,
             fn_kv_cache_int8_dequantize,
+            fn_gather_rows_bf16,
+            fn_gather_cols_bf16,
+            fn_kuramoto_coherence,
+            fn_topk_select,
         })
     }
 }
@@ -1011,6 +1023,171 @@ impl GpuKernels {
                 &mut p_kv_dim as *mut i32 as *mut std::ffi::c_void,
                 &mut p_head_dim as *mut i32 as *mut std::ffi::c_void,
                 &mut p_n_kv_heads as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Sparse MLP: gather_rows_bf16
+    //
+    // Gathers selected rows from BF16 weight matrix [total_rows, cols]
+    // into contiguous output [n_indices, cols].
+    //
+    // Grid : (n_indices, 1, 1)
+    // Block: (256, 1, 1)
+    // -------------------------------------------------------------------------
+    pub unsafe fn gather_rows_bf16(
+        &self,
+        src: *const u16,       // [total_rows, cols] BF16 on GPU
+        dst: *mut u16,         // [n_indices, cols] BF16 on GPU
+        indices: *const i32,   // [n_indices] on GPU
+        n_indices: i32,
+        cols: i32,
+    ) -> Result<(), HipError> {
+        let grid = (n_indices as u32, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_indices = indices;
+        let mut p_n_indices = n_indices;
+        let mut p_cols = cols;
+
+        hip_launch_kernel(
+            self.fn_gather_rows_bf16,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_src as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
+                &mut p_indices as *mut *const i32 as *mut std::ffi::c_void,
+                &mut p_n_indices as *mut i32 as *mut std::ffi::c_void,
+                &mut p_cols as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Sparse MLP: gather_cols_bf16
+    //
+    // Gathers selected columns from BF16 weight matrix [rows, total_cols]
+    // into contiguous output [rows, n_indices].
+    //
+    // Grid : (rows, 1, 1)
+    // Block: (256, 1, 1)
+    // -------------------------------------------------------------------------
+    pub unsafe fn gather_cols_bf16(
+        &self,
+        src: *const u16,       // [rows, total_cols] BF16 on GPU
+        dst: *mut u16,         // [rows, n_indices] BF16 on GPU
+        indices: *const i32,   // [n_indices] on GPU
+        rows: i32,
+        total_cols: i32,
+        n_indices: i32,
+    ) -> Result<(), HipError> {
+        let grid = (rows as u32, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_indices = indices;
+        let mut p_rows = rows;
+        let mut p_total_cols = total_cols;
+        let mut p_n_indices = n_indices;
+
+        hip_launch_kernel(
+            self.fn_gather_cols_bf16,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_src as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
+                &mut p_indices as *mut *const i32 as *mut std::ffi::c_void,
+                &mut p_rows as *mut i32 as *mut std::ffi::c_void,
+                &mut p_total_cols as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_indices as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Kuramoto GPU-side prediction: coherence computation
+    //
+    // Grid : (n_neurons, 1, 1) — one block per neuron
+    // Block: (256, 1, 1)
+    // -------------------------------------------------------------------------
+    pub unsafe fn kuramoto_coherence(
+        &self,
+        hidden: *const f32,          // [hidden_dim] F32 on GPU
+        tuning_forks: *const f32,    // [n_neurons, phase_dim] F32 on GPU
+        coherences: *mut f32,        // [n_neurons] F32 on GPU
+        n_neurons: i32,
+        hidden_dim: i32,
+        phase_dim: i32,
+    ) -> Result<(), HipError> {
+        let grid = (n_neurons as u32, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_hidden = hidden;
+        let mut p_forks = tuning_forks;
+        let mut p_coh = coherences;
+        let mut p_nn = n_neurons;
+        let mut p_hd = hidden_dim;
+        let mut p_pd = phase_dim;
+
+        hip_launch_kernel(
+            self.fn_kuramoto_coherence,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_hidden as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_forks as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_coh as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_nn as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hd as *mut i32 as *mut std::ffi::c_void,
+                &mut p_pd as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Kuramoto GPU-side prediction: top-K selection
+    //
+    // Grid : (1, 1, 1) — single block
+    // Block: (256, 1, 1)
+    // -------------------------------------------------------------------------
+    pub unsafe fn topk_select(
+        &self,
+        coherences: *const f32,  // [n_neurons] F32 on GPU
+        indices: *mut i32,       // [top_k] I32 on GPU — output
+        n_neurons: i32,
+        top_k: i32,
+    ) -> Result<(), HipError> {
+        let grid = (1u32, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_coh = coherences;
+        let mut p_idx = indices;
+        let mut p_nn = n_neurons;
+        let mut p_tk = top_k;
+
+        hip_launch_kernel(
+            self.fn_topk_select,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_coh as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_idx as *mut *mut i32 as *mut std::ffi::c_void,
+                &mut p_nn as *mut i32 as *mut std::ffi::c_void,
+                &mut p_tk as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }

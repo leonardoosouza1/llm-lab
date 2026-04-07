@@ -231,6 +231,187 @@ impl ForwardScratchpad {
     }
 }
 
+// ── Sparse MLP Scratchpad (Kuramoto Router) ─────────────────────────────────
+
+/// Pre-allocated GPU buffers for sparse MLP forward pass.
+/// Sized for max_active_neurons (e.g. 25% of intermediate_size).
+pub struct SparseMlpScratch {
+    /// Sparse gate output [max_seq, max_active] F32
+    pub sparse_gate: AnyTensor,
+    /// Sparse up output [max_seq, max_active] F32
+    pub sparse_up: AnyTensor,
+    /// Max active neurons this scratchpad supports
+    pub max_active: usize,
+    /// Hidden size
+    pub hidden: usize,
+    /// Intermediate size (total neurons per layer)
+    pub intermediate_size: usize,
+    /// Cached n_active per layer
+    pub cached_n_active: Vec<usize>,
+    /// Token counter for logging
+    pub token_counter: usize,
+    /// Pre-gathered weight matrices per layer (persistent across all tokens)
+    /// Format: (gathered_gate, gathered_up, gathered_down) per layer
+    pub cached_weights: Vec<Option<(AnyTensor, AnyTensor, AnyTensor)>>,
+    /// Whether cached weights are valid
+    pub weights_valid: Vec<bool>,
+    /// GPU-side tuning forks per layer [n_neurons, phase_dim] F32
+    pub gpu_tuning_forks: Vec<Option<AnyTensor>>,
+    /// GPU coherence buffer [n_neurons] F32 — reused across layers
+    pub gpu_coherences: Option<AnyTensor>,
+    /// GPU indices buffer [max_active] I32 — reused across layers
+    pub gpu_indices: Option<AnyTensor>,
+    /// Static hot neuron indices per layer (computed from calibration)
+    pub static_hot_indices: Vec<Option<AnyTensor>>,
+    /// Calibration state: accumulates |activation| per neuron during prefill
+    /// Vec<Vec<f32>> — [n_layers][intermediate_size], sum of |SiLU(gate)*up| per neuron
+    pub calibration_accum: Option<Vec<Vec<f32>>>,
+    /// Number of tokens used for calibration
+    pub calibration_tokens: usize,
+    /// Whether calibration is complete and sparse mode is ready
+    pub calibrated: bool,
+}
+
+impl SparseMlpScratch {
+    fn new(cfg: &ModelCfg, backend: &Arc<dyn ComputeBackend>, active_ratio: f32) -> Self {
+        let ms = cfg.max_seq_len;
+        let h = cfg.hidden_size;
+        let it = cfg.intermediate_size;
+        let n_layers = cfg.num_layers;
+        let max_active = (it as f32 * active_ratio).ceil() as usize;
+
+        // Initialize calibration accumulators (zeroed)
+        let calibration_accum: Vec<Vec<f32>> = (0..n_layers)
+            .map(|_| vec![0.0f32; it])
+            .collect();
+
+        Self {
+            sparse_gate:   backend.alloc_f32(&[ms, max_active]),
+            sparse_up:     backend.alloc_f32(&[ms, max_active]),
+            max_active,
+            hidden: h,
+            intermediate_size: it,
+            cached_n_active: vec![0; n_layers],
+            token_counter: 0,
+            cached_weights: (0..n_layers).map(|_| None).collect(),
+            weights_valid: vec![false; n_layers],
+            gpu_tuning_forks: (0..n_layers).map(|_| None).collect(),
+            gpu_coherences: Some(backend.alloc_f32(&[it])),
+            gpu_indices: Some(backend.upload_i32(&vec![0i32; max_active], &[max_active])),
+            static_hot_indices: (0..n_layers).map(|_| None).collect(),
+            calibration_accum: Some(calibration_accum),
+            calibration_tokens: 0,
+            calibrated: false,
+        }
+    }
+
+    /// Set sequential indices (0..max_active) for all layers and mark as calibrated.
+    /// Used for debugging to verify the gather/GEMM pipeline works correctly.
+    fn set_sequential_indices(
+        &mut self,
+        n_layers: usize,
+        backend: &Arc<dyn ComputeBackend>,
+    ) {
+        let top_k = self.max_active;
+        let indices: Vec<i32> = (0..top_k as i32).collect();
+        for layer_idx in 0..n_layers {
+            let gpu_idx = backend.upload_i32(&indices, &[top_k]);
+            self.static_hot_indices[layer_idx] = Some(gpu_idx);
+            self.cached_n_active[layer_idx] = top_k;
+        }
+        self.calibration_accum = None;
+        self.calibrated = true;
+        log::info!(
+            "🔧 Sequential indices set: 0..{} for {} layers (debug mode)",
+            top_k, n_layers,
+        );
+    }
+
+    /// Accumulate activation statistics for one layer during calibration.
+    /// Called from the dense MLP path after SiLU*mul (gate tensor contains activated values).
+    /// Downloads gate activations and adds |value| per neuron to the accumulator.
+    fn accumulate_calibration(
+        &mut self,
+        layer_idx: usize,
+        gate_tensor: &AnyTensor,
+        backend: &Arc<dyn ComputeBackend>,
+        n_tokens: usize,
+        intermediate_size: usize,
+    ) {
+        if let Some(ref mut accum) = self.calibration_accum {
+            let gate_data = backend.download_f32(gate_tensor);
+            let layer_accum = &mut accum[layer_idx];
+
+            // For each token, add |activation| per neuron
+            for tok in 0..n_tokens {
+                let offset = tok * intermediate_size;
+                for neuron in 0..intermediate_size {
+                    if offset + neuron < gate_data.len() {
+                        layer_accum[neuron] += gate_data[offset + neuron].abs();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Finalize calibration: select top-K neurons per layer based on accumulated
+    /// activation magnitudes, upload indices to GPU.
+    fn finalize_calibration(
+        &mut self,
+        backend: &Arc<dyn ComputeBackend>,
+    ) {
+        let accum = match self.calibration_accum.take() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let n_tokens = self.calibration_tokens.max(1) as f32;
+
+        for (layer_idx, layer_accum) in accum.iter().enumerate() {
+            let it = layer_accum.len();
+            let top_k = self.max_active.min(it);
+
+            // Average activation magnitude per neuron
+            let mut scored: Vec<(usize, f32)> = layer_accum.iter()
+                .enumerate()
+                .map(|(i, &sum)| (i, sum / n_tokens))
+                .collect();
+
+            // Sort by activation magnitude descending
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Take top-K, then sort by index for memory locality in gather
+            let mut hot_indices: Vec<i32> = scored[..top_k]
+                .iter()
+                .map(|(idx, _)| *idx as i32)
+                .collect();
+            hot_indices.sort();
+
+            let gpu_idx = backend.upload_i32(&hot_indices, &[top_k]);
+            self.static_hot_indices[layer_idx] = Some(gpu_idx);
+            self.cached_n_active[layer_idx] = top_k;
+
+            if layer_idx == 0 {
+                let active_pct = scored[..top_k].iter().map(|(_, v)| *v).sum::<f32>()
+                    / scored.iter().map(|(_, v)| *v).sum::<f32>().max(1e-8) * 100.0;
+                log::info!(
+                    "🔥 Calibrated hot neurons: top-{} of {} cover {:.1}% of total activation energy \
+                     (avg magnitude range: {:.6}..{:.6}, calibrated on {} tokens)",
+                    top_k, it, active_pct,
+                    scored[top_k - 1].1, scored[0].1,
+                    self.calibration_tokens,
+                );
+            }
+        }
+
+        self.calibrated = true;
+        log::info!(
+            "✅ Calibration complete: hot neuron indices computed for {} layers from {} prefill tokens",
+            accum.len(), self.calibration_tokens,
+        );
+    }
+}
+
 // ── Variante de peso para suportar BF16 ou INT4 ───────────────────────────────
 
 /// Peso de uma camada: pode ser BF16 original (padrão) ou Q4 (quantizado INT4).
@@ -293,6 +474,11 @@ pub struct CausalLM {
     pub gravity: Option<crate::lnn::gravity::GravitySystem>,
     /// Flag: se true, pesos estão em Q4 (quantizados INT4).
     pub quantized: bool,
+    /// Kuramoto Phase Router for sparse MLP neuron selection (opcional).
+    /// If Some, enabled via IARA_ROUTING=1 env var during model load.
+    pub kuramoto_router: Option<crate::inference::KuramotoRouter>,
+    /// Pre-allocated GPU buffers for sparse MLP computation.
+    pub sparse_scratch: Option<SparseMlpScratch>,
     /// Optional channel to send layer stimulus signals to the orchestrator.
     #[cfg(feature = "experimental")]
     pub stimulus_tx: Option<tokio::sync::mpsc::Sender<crate::experimental::orchestrator::LayerStimulus>>,
@@ -607,6 +793,21 @@ impl CausalLM {
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
 
+        // Initialize calibration-based sparse MLP if enabled via IARA_ROUTING=1
+        let (kuramoto_router, sparse_scratch) = if std::env::var("IARA_ROUTING").unwrap_or_default() == "1" {
+            let active_ratio = std::env::var("IARA_ROUTING_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.25);
+
+            log::info!("🔥 Sparse MLP enabled (active_ratio={:.0}%), will calibrate during first prefill...", active_ratio * 100.0);
+            let ss = SparseMlpScratch::new(&cfg, &backend, active_ratio);
+
+            (None::<crate::inference::KuramotoRouter>, Some(ss))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             embed,
             layers,
@@ -621,6 +822,8 @@ impl CausalLM {
             cfc: None,
             gravity: None,
             quantized: false,
+            kuramoto_router,
+            sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
         })
@@ -948,6 +1151,21 @@ impl CausalLM {
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
 
+        // Initialize calibration-based sparse MLP if enabled via IARA_ROUTING=1
+        let (kuramoto_router, sparse_scratch) = if std::env::var("IARA_ROUTING").unwrap_or_default() == "1" {
+            let active_ratio = std::env::var("IARA_ROUTING_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.25);
+
+            log::info!("🔥 Sparse MLP enabled (active_ratio={:.0}%), will calibrate during first prefill...", active_ratio * 100.0);
+            let ss = SparseMlpScratch::new(&cfg, &backend, active_ratio);
+
+            (None::<crate::inference::KuramotoRouter>, Some(ss))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             embed,
             layers,
@@ -962,6 +1180,8 @@ impl CausalLM {
             cfc,
             gravity,
             quantized: true,
+            kuramoto_router,
+            sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
         })
@@ -1009,6 +1229,41 @@ impl CausalLM {
                 .collect())
         };
 
+        // Dtype-aware decoder: converts any .iara tensor data to Vec<f32>
+        let decode_to_f32 = |name: &str| -> ModelResult<Vec<f32>> {
+            use crate::storage::iara_format::IaraDtype;
+            let meta = reader.tensor_meta(name)
+                .map_err(|e| ModelError::Model(format!("Tensor '{}' meta: {}", name, e)))?;
+            let data = reader.tensor_data(name)
+                .map_err(|e| ModelError::Model(format!("Tensor '{}' data: {}", name, e)))?;
+            match meta.dtype {
+                IaraDtype::Bf16 => {
+                    // BF16: 2 bytes per element → f32
+                    let bits = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2)
+                    };
+                    Ok(bits.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect())
+                }
+                IaraDtype::Fp8E4m3 => {
+                    // FP8: 1 byte per element, may have per-row scales
+                    let scales = reader.tensor_scales_f32(name).ok();
+                    let total = meta.shape.iter().product::<usize>();
+                    let cols = if meta.shape.len() >= 2 { meta.shape[1] } else { total };
+                    Ok(data.iter().enumerate().map(|(idx, &byte)| {
+                        let row = if cols > 0 { idx / cols } else { 0 };
+                        let scale = scales.as_ref()
+                            .and_then(|s| s.get(row).copied())
+                            .unwrap_or(1.0);
+                        fp8_e4m3_to_f32(byte) * scale
+                    }).collect())
+                }
+                _ => {
+                    // Assume F32 raw bytes
+                    f32_from_f32_bytes(data)
+                }
+            }
+        };
+
         // ── Embedding ────────────────────────────────────────────────────────
         log::info!("  → embed_tokens");
         let embed_meta = reader.tensor_meta(&tmap.embed)
@@ -1029,24 +1284,12 @@ impl CausalLM {
                 log::info!("  → layers {}/{}", i, cfg.num_layers);
             }
 
-            // ── Norms (sempre F32) ───────────────────────────────────────────
+            // ── Norms (dtype-aware: may be BF16 in .iara) ──────────────────
             let in_norm_name = &tmap.layer_tensor(i, &tmap.input_norm);
-            let (in_w, _) = {
-                let meta = reader.tensor_meta(in_norm_name)
-                    .map_err(|e| ModelError::Model(format!("Norm de entrada layer {}: {}", i, e)))?;
-                let data = reader.tensor_data(in_norm_name)
-                    .map_err(|e| ModelError::Model(format!("Dados norm entrada layer {}: {}", i, e)))?;
-                (f32_from_f32_bytes(data)?, meta.shape.clone())
-            };
+            let in_w = decode_to_f32(in_norm_name)?;
 
             let pa_norm_name = &tmap.layer_tensor(i, &tmap.post_attn_norm);
-            let (pa_w, _) = {
-                let meta = reader.tensor_meta(pa_norm_name)
-                    .map_err(|e| ModelError::Model(format!("Norm pós-attn layer {}: {}", i, e)))?;
-                let data = reader.tensor_data(pa_norm_name)
-                    .map_err(|e| ModelError::Model(format!("Dados norm pós-attn layer {}: {}", i, e)))?;
-                (f32_from_f32_bytes(data)?, meta.shape.clone())
-            };
+            let pa_w = decode_to_f32(pa_norm_name)?;
 
             let gpu_f32 = |data: &[f32]| -> AnyTensor {
                 backend.upload_f32(data, &[data.len()])
@@ -1071,7 +1314,6 @@ impl CausalLM {
                         Ok(LayerWeight::Bf16(tensor))
                     }
                     IaraDtype::Fp8E4m3 => {
-                        // FP8: each byte is one FP8 E4M3 value, scales are per-row f32
                         let scales = reader.tensor_scales_f32(name)
                             .map_err(|e| ModelError::Model(format!("Escalas FP8 layer {}: {}", i, e)))?;
 
@@ -1080,20 +1322,29 @@ impl CausalLM {
                         let cols = if meta.shape.len() >= 2 { meta.shape[1] } else { total_elements };
                         let rows = if cols > 0 { total_elements / cols } else { 1 };
 
-                        // Dequantize FP8→F32 using per-row scales, then convert F32→BF16
-                        let mut bf16_bits = Vec::with_capacity(total_elements);
+                        if fp8_bytes.len() != total_elements {
+                            log::warn!("FP8 tensor '{}': data_length={} vs shape_elements={} (delta={})",
+                                name, fp8_bytes.len(), total_elements,
+                                fp8_bytes.len() as i64 - total_elements as i64);
+                        }
+
+                        // Decode FP8→F32 using per-row scales, then F32→BF16
+                        // CRITICAL: must produce EXACTLY total_elements values for GPU shape match
+                        let mut bf16_bits = vec![0u16; total_elements];
                         for row in 0..rows {
                             let scale = if row < scales.len() { scales[row] } else { 1.0 };
-                            let start = row * cols;
-                            let end = (start + cols).min(fp8_bytes.len());
-                            for i in start..end {
-                                let f32_val = fp8_e4m3_to_f32(fp8_bytes[i]) * scale;
-                                bf16_bits.push((f32_val.to_bits() >> 16) as u16);
+                            for col in 0..cols {
+                                let idx = row * cols + col;
+                                if idx < fp8_bytes.len() {
+                                    let f32_val = fp8_e4m3_to_f32(fp8_bytes[idx]) * scale;
+                                    bf16_bits[idx] = (f32_val.to_bits() >> 16) as u16;
+                                }
+                                // else: stays 0 (zero-padded) — safe for GPU
                             }
                         }
 
-                        log::info!("✅ FP8 tensor '{}' decodificado: {} elementos, {} rows × {} cols",
-                            name, bf16_bits.len(), rows, cols);
+                        log::info!("✅ FP8 tensor '{}' decoded: {}×{} = {} elements, {} scales",
+                            name, rows, cols, total_elements, scales.len());
                         let tensor = backend.upload_bf16(&bf16_bits, &meta.shape);
                         Ok(LayerWeight::Bf16(tensor))
                     }
@@ -1155,13 +1406,10 @@ impl CausalLM {
             let get_optional_f32 = |name_opt: &Option<String>| -> ModelResult<Option<AnyTensor>> {
                 match name_opt {
                     Some(name) => {
-                        let meta = reader.tensor_meta(name).ok();
-                        if meta.is_none() {
+                        if reader.tensor_meta(name).is_err() {
                             return Ok(None);
                         }
-                        let data = reader.tensor_data(name)
-                            .map_err(|e| ModelError::Model(format!("Dados tensor opcional {}: {}", name, e)))?;
-                        let f32_data = f32_from_f32_bytes(data)?;
+                        let f32_data = decode_to_f32(name)?;
                         Ok(Some(gpu_f32(&f32_data)))
                     }
                     None => Ok(None),
@@ -1193,25 +1441,15 @@ impl CausalLM {
             log::info!("  → QK Normalization detectada: q_norm + k_norm em todas as camadas");
         }
 
-        // ── Final norm ───────────────────────────────────────────────────────
-        let (nw, _) = {
-            let meta = reader.tensor_meta(&tmap.final_norm)
-                .map_err(|e| ModelError::Model(format!("Final norm não encontrado: {}", e)))?;
-            let data = reader.tensor_data(&tmap.final_norm)
-                .map_err(|e| ModelError::Model(format!("Dados final norm não acessíveis: {}", e)))?;
-            (f32_from_f32_bytes(data)?, meta.shape.clone())
-        };
+        // ── Final norm (dtype-aware) ──────────────────────────────────────
+        let nw = decode_to_f32(&tmap.final_norm)?;
         let norm_w = backend.upload_f32(&nw, &[nw.len()]);
 
         let norm_b = match &tmap.final_norm_bias {
             Some(name) => {
-                if let Ok(meta) = reader.tensor_meta(name) {
-                    if let Ok(data) = reader.tensor_data(name) {
-                        let f32_data = f32_from_f32_bytes(data)?;
-                        Some(backend.upload_f32(&f32_data, &[f32_data.len()]))
-                    } else {
-                        None
-                    }
+                if reader.tensor_meta(name).is_ok() {
+                    let f32_data = decode_to_f32(name)?;
+                    Some(backend.upload_f32(&f32_data, &[f32_data.len()]))
                 } else {
                     None
                 }
@@ -1280,6 +1518,28 @@ impl CausalLM {
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
 
+        // Initialize calibration-based sparse MLP if enabled via IARA_ROUTING=1
+        let (kuramoto_router, sparse_scratch) = if std::env::var("IARA_ROUTING").unwrap_or_default() == "1" {
+            let active_ratio = std::env::var("IARA_ROUTING_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.25);
+
+            let routing_mode = std::env::var("IARA_ROUTING_MODE").unwrap_or_default();
+            let mut ss = SparseMlpScratch::new(&cfg, &backend, active_ratio);
+
+            if routing_mode == "sequential" {
+                log::info!("🔧 Sequential routing mode (debug): {:.0}% of neurons", active_ratio * 100.0);
+                ss.set_sequential_indices(cfg.num_layers, &backend);
+            } else {
+                log::info!("🔥 Sparse MLP enabled (active_ratio={:.0}%), will calibrate during first tokens...", active_ratio * 100.0);
+            }
+
+            (None::<crate::inference::KuramotoRouter>, Some(ss))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             embed,
             layers,
@@ -1293,7 +1553,9 @@ impl CausalLM {
             scratch,
             cfc: None,
             gravity: None,
-            quantized: false, // Será true se modelos Q4/FP8, por enquanto false
+            quantized: false,
+            kuramoto_router,
+            sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
         })
@@ -1706,20 +1968,162 @@ impl CausalLM {
                 &self.scratch.normed, n, h, eps,
             )?;
 
-            // ── MLP: gate_proj + up_proj (buffers independentes → sem sync entre) ──
-            log::trace!("layer {layer_idx}: wgate+wup n={n} it={it} h={h}");
-            Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+            // ── MLP: Dense, Calibration, or Sparse path ─────────────────────────
+            //
+            // Calibration: during first prefill (n > 1), run dense MLP but intercept
+            // gate activations after SiLU*mul to build per-neuron firing statistics.
+            // After calibration, use static hot neuron indices for sparse decode.
+            //
+            // Sparse path: pre-gathered hot neuron weights (from calibration),
+            // reused for all decode tokens. Zero per-token overhead.
 
-            // Activation: gate = activation(gate) * up (SiLU/SwiGLU ou GELU conforme arquitetura)
-            Self::apply_activation(
-                &self.backend, activation,
-                &self.scratch.gate, &self.scratch.up, n, it,
-            )?;
+            // Calibration threshold: number of tokens to calibrate on before switching to sparse.
+            // Prefill tokens + first few decode tokens provide good activation statistics.
+            const CALIBRATION_MIN_TOKENS: usize = 16;
 
-            // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
-            log::trace!("layer {layer_idx}: wdown n={n} h={h} it={it}");
-            Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+            // Auto-finalize calibration after enough tokens
+            if let Some(ref mut ss) = self.sparse_scratch {
+                if !ss.calibrated && ss.calibration_accum.is_some()
+                    && ss.calibration_tokens >= CALIBRATION_MIN_TOKENS
+                    && layer_idx == 0
+                {
+                    log::info!("🔄 Finalizing calibration ({} tokens processed)...", ss.calibration_tokens);
+                    ss.finalize_calibration(&self.backend);
+                }
+            }
+
+            let use_sparse = self.sparse_scratch.is_some()
+                && n == 1  // sparse path only for single-token decode
+                && self.sparse_scratch.as_ref().map_or(false, |ss| ss.calibrated)
+                && matches!(&layer.wgate, LayerWeight::Bf16(_));
+
+            let is_calibrating = self.sparse_scratch.is_some()
+                && self.sparse_scratch.as_ref().map_or(false, |ss| {
+                    ss.calibration_accum.is_some() && !ss.calibrated
+                });
+
+            if use_sparse {
+                // ── CALIBRATED-SPARSE MLP PATH ──────────────────────────────
+                let ss = self.sparse_scratch.as_mut().unwrap();
+                let n_active = ss.cached_n_active[layer_idx];
+
+                // One-time gather: use calibrated hot indices to pre-gather weights
+                if !ss.weights_valid[layer_idx] && ss.static_hot_indices[layer_idx].is_some() {
+                    if let (LayerWeight::Bf16(wg), LayerWeight::Bf16(wu), LayerWeight::Bf16(wd)) =
+                        (&layer.wgate, &layer.wup, &layer.wdown)
+                    {
+                        use compute_core::params::{GatherRowsBf16Params, GatherColsBf16Params};
+                        let idx_buf = ss.static_hot_indices[layer_idx].as_ref().unwrap();
+
+                        let g_buf = self.backend.alloc_bf16(&[n_active, h]);
+                        let u_buf = self.backend.alloc_bf16(&[n_active, h]);
+                        let d_buf = self.backend.alloc_bf16(&[h, n_active]);
+
+                        self.backend.gather_rows_bf16(&GatherRowsBf16Params {
+                            src: wg, dst: &g_buf, indices: idx_buf,
+                            n_indices: n_active, cols: h,
+                        })?;
+                        self.backend.gather_rows_bf16(&GatherRowsBf16Params {
+                            src: wu, dst: &u_buf, indices: idx_buf,
+                            n_indices: n_active, cols: h,
+                        })?;
+                        self.backend.gather_cols_bf16(&GatherColsBf16Params {
+                            src: wd, dst: &d_buf, indices: idx_buf,
+                            rows: h, total_cols: it, n_indices: n_active,
+                        })?;
+
+                        ss.cached_weights[layer_idx] = Some((g_buf, u_buf, d_buf));
+                        ss.weights_valid[layer_idx] = true;
+
+                        if layer_idx == 0 {
+                            log::info!(
+                                "🔥 Calibrated sparse MLP: gathered {}/{} hot neurons ({:.0}%)",
+                                n_active, it, 100.0 * n_active as f32 / it as f32,
+                            );
+                        }
+                    }
+                }
+
+                if layer_idx == 0 {
+                    ss.token_counter += 1;
+                    if ss.token_counter % 64 == 0 {
+                        log::info!(
+                            "⚡ SPARSE MLP (calibrated) — {}/{} neurons ({:.0}%), token: {}",
+                            n_active, it,
+                            100.0 * n_active as f32 / it as f32,
+                            ss.token_counter
+                        );
+                    }
+                }
+
+                if n_active > 0 && ss.weights_valid[layer_idx] && ss.cached_weights[layer_idx].is_some() {
+                    // ── FAST PATH: pre-gathered calibrated weights ──
+                    let (ref cg, ref cu, ref cd) = ss.cached_weights[layer_idx].as_ref().unwrap();
+
+                    self.backend.gemm_bf16_f32(&compute_core::params::GemmBf16Params {
+                        m: n, n: n_active, k: h,
+                        alpha: 1.0, beta: 0.0,
+                        a: &self.scratch.normed, a_offset: 0,
+                        b: cg, c: &ss.sparse_gate,
+                    })?;
+                    self.backend.gemm_bf16_f32(&compute_core::params::GemmBf16Params {
+                        m: n, n: n_active, k: h,
+                        alpha: 1.0, beta: 0.0,
+                        a: &self.scratch.normed, a_offset: 0,
+                        b: cu, c: &ss.sparse_up,
+                    })?;
+
+                    Self::apply_activation(
+                        &self.backend, activation,
+                        &ss.sparse_gate, &ss.sparse_up, n, n_active,
+                    )?;
+
+                    self.backend.gemm_bf16_f32(&compute_core::params::GemmBf16Params {
+                        m: n, n: h, k: n_active,
+                        alpha: 1.0, beta: 1.0,
+                        a: &ss.sparse_gate, a_offset: 0,
+                        b: cd, c: &self.scratch.x,
+                    })?;
+
+                } else {
+                    // Weights not ready yet — fallback to dense for this layer
+                    Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
+                    Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+                    Self::apply_activation(&self.backend, activation, &self.scratch.gate, &self.scratch.up, n, it)?;
+                    Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+                }
+            } else {
+                // ── DENSE MLP PATH (also used for calibration) ─────────────────
+                log::trace!("layer {layer_idx}: wgate+wup n={n} it={it} h={h}");
+                Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
+                Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+
+                Self::apply_activation(
+                    &self.backend, activation,
+                    &self.scratch.gate, &self.scratch.up, n, it,
+                )?;
+
+                // Calibration: intercept gate activations after SiLU*mul
+                if is_calibrating {
+                    if let Some(ref mut ss) = self.sparse_scratch {
+                        ss.accumulate_calibration(
+                            layer_idx, &self.scratch.gate, &self.backend, n, it,
+                        );
+                        if layer_idx == n_layers - 1 {
+                            ss.calibration_tokens += n;
+                            if ss.calibration_tokens <= 2 || ss.calibration_tokens % 8 == 0 {
+                                log::info!(
+                                    "📊 Calibration: {} tokens accumulated",
+                                    ss.calibration_tokens,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
+                Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+            }
             log::trace!("layer {layer_idx}: done");
 
             // ── Phase coherence check for early exit (decode-only) ────────────────
@@ -1904,6 +2308,525 @@ impl CausalLM {
         let logits = self.backend.download_f32(&self.scratch.logits);
 
         Ok((logits, layer_traces))
+    }
+
+    /// Forward pass with deep per-token trace capturing rich telemetry.
+    /// Only operates on single token (n == 1). For sequence, use standard forward().
+    ///
+    /// Captures per-layer:
+    /// - hidden_norm: L2 norm of hidden state
+    /// - attn_entropy: Shannon entropy of attention scores
+    /// - attn_top_positions: top-5 positions by attention weight
+    /// - mlp_activation_rate: % of neurons non-zero after SiLU
+    /// - mlp_top_neurons: top-10 activated neurons
+    /// - residual_delta: L2 norm of (output - input)
+    /// - phase_coherence: Kuramoto order parameter
+    ///
+    /// NOTE: This requires multiple GPU→CPU downloads and will be ~2-3x slower
+    /// than standard forward. Only use when explicitly requested for debugging.
+    pub fn forward_deep_trace(&mut self, token_ids: &[u32]) -> ModelResult<crate::inference::DeepTrace> {
+        use crate::inference::tracer;
+
+        let token_start = std::time::Instant::now();
+        let n = token_ids.len();
+
+        if n != 1 {
+            return Err(ModelError::Model(
+                "forward_deep_trace only supports single tokens (n=1)".into()
+            ));
+        }
+
+        let h = self.cfg.hidden_size;
+        let nh = self.cfg.num_heads;
+        let nk = self.cfg.num_kv_heads;
+        let hd = self.cfg.head_dim;
+        let qd = nh * hd;
+        let kd = nk * hd;
+        let it = self.cfg.intermediate_size;
+        let eps = self.cfg.rms_eps;
+        let theta = self.cfg.rope_theta;
+        let scale = 1.0_f32 / (hd as f32).sqrt();
+        let vocab = self.cfg.vocab_size;
+
+        // Embedding lookup
+        self.backend.embed_lookup(&EmbedParams {
+            token_ids,
+            vocab: &self.embed,
+            out: &self.scratch.x,
+            n_tokens: n,
+            hidden_size: h,
+        })?;
+
+        let mut layer_traces: Vec<crate::inference::LayerDeepTrace> = Vec::new();
+        let norm_type = self.arch.norm_type;
+        let activation = self.arch.activation;
+
+        // Store input hidden state for residual delta computation
+        let mut prev_hidden = vec![0.0f32; h];
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // ── Download input hidden state (before layer input norm) ──
+            let x_data = self.backend.download_f32(&self.scratch.x);
+            let hidden_len = h.min(x_data.len());
+
+            // Compute hidden_norm: L2 norm of input
+            let hidden_norm = x_data[..hidden_len].iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+
+            // Save for residual_delta computation
+            let copy_len = h.min(prev_hidden.len());
+            prev_hidden[..copy_len].copy_from_slice(&x_data[..copy_len]);
+
+            // ── Input Normalization ──
+            Self::apply_norm(
+                &self.backend, norm_type,
+                &self.scratch.x, &layer.input_norm_w, None,
+                &self.scratch.normed, n, h, eps,
+            )?;
+
+            // ── Q, K, V projections ──
+            Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0)?;
+            Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0)?;
+            Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0)?;
+
+            // ── Optional biases ──
+            if let Some(ref bias) = layer.q_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.q,
+                    bias,
+                    n_tokens: n,
+                    dim: qd,
+                })?;
+            }
+            if let Some(ref bias) = layer.k_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.k,
+                    bias,
+                    n_tokens: n,
+                    dim: kd,
+                })?;
+            }
+            if let Some(ref bias) = layer.v_bias {
+                self.backend.add_bias_inplace(&AddBiasParams {
+                    tensor: &self.scratch.v,
+                    bias,
+                    n_tokens: n,
+                    dim: kd,
+                })?;
+            }
+
+            // ── QK Normalization (Qwen3) ──
+            if let Some(ref qnw) = layer.q_norm_w {
+                self.backend.rms_norm(&RmsNormParams {
+                    input: &self.scratch.q,
+                    weight: qnw,
+                    output: &self.scratch.q,
+                    n_tokens: n * nh,
+                    hidden_size: hd,
+                    eps,
+                })?;
+            }
+            if let Some(ref knw) = layer.k_norm_w {
+                self.backend.rms_norm(&RmsNormParams {
+                    input: &self.scratch.k,
+                    weight: knw,
+                    output: &self.scratch.k,
+                    n_tokens: n * nk,
+                    hidden_size: hd,
+                    eps,
+                })?;
+            }
+
+            // ── RoPE ──
+            let pos_start = layer.kv_k.current_len;
+            self.backend.rope_inplace(&RopeParams {
+                tensor: &self.scratch.q,
+                pos_offset: pos_start,
+                n_tokens: n,
+                n_heads: nh,
+                head_dim: hd,
+                theta,
+            })?;
+            self.backend.rope_inplace(&RopeParams {
+                tensor: &self.scratch.k,
+                pos_offset: pos_start,
+                n_tokens: n,
+                n_heads: nk,
+                head_dim: hd,
+                theta,
+            })?;
+
+            // ── Append K, V to KV-cache ──
+            match layer.kv_k.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    self.backend.copy_to_kv_cache(&KvCacheParams {
+                        cache: &layer.kv_k.data,
+                        new_kv: &self.scratch.k,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
+                kv_cache::KvCacheMode::Int8 => {
+                    let scales = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but no scales".into()))?;
+                    self.backend.kv_cache_int8_append(&compute_core::KvCacheInt8AppendParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.k,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
+            }
+            layer.kv_k.current_len += n;
+
+            match layer.kv_v.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    self.backend.copy_to_kv_cache(&KvCacheParams {
+                        cache: &layer.kv_v.data,
+                        new_kv: &self.scratch.v,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
+                kv_cache::KvCacheMode::Int8 => {
+                    let scales = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but no scales".into()))?;
+                    self.backend.kv_cache_int8_append(&compute_core::KvCacheInt8AppendParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.v,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
+            }
+            layer.kv_v.current_len += n;
+
+            let seq = layer.kv_k.current_len;
+
+            // ── Dequantize KV cache if INT8 ──
+            let (kv_k_use, kv_v_use) = match layer.kv_k.mode {
+                kv_cache::KvCacheMode::F32 => {
+                    (&layer.kv_k.data, &layer.kv_v.data)
+                }
+                kv_cache::KvCacheMode::Int8 => {
+                    let kv_k_deq = self.scratch.kv_k_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_k_deq not allocated".into()))?;
+                    let kv_v_deq = self.scratch.kv_v_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but kv_v_deq not allocated".into()))?;
+
+                    let scales_k = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but scales not allocated".into()))?;
+                    self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales_k,
+                        output: kv_k_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    let scales_v = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("INT8 mode but scales not allocated".into()))?;
+                    self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales_v,
+                        output: kv_v_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    (kv_k_deq, kv_v_deq)
+                }
+            };
+
+            // ── Attention: Q × K^T → softmax → × V ──
+            let use_batched = nk == nh;
+
+            if use_batched {
+                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
+                    trans_a: false,
+                    trans_b: true,
+                    m: n,
+                    n: seq,
+                    k: hd,
+                    alpha: scale,
+                    beta: 0.0,
+                    a: &self.scratch.q,
+                    lda: hd,
+                    stride_a: hd,
+                    b: kv_k_use,
+                    ldb: hd,
+                    stride_b: hd,
+                    c: &self.scratch.scores,
+                    ldc: seq,
+                    stride_c: n * seq,
+                    batch_count: nh,
+                })?;
+
+                for hi in 0..nh {
+                    self.backend.softmax_rows(&SoftmaxParams {
+                        scores: &self.scratch.scores,
+                        offset_elems: hi * n * seq,
+                        n_rows: n,
+                        row_len: seq,
+                    })?;
+                }
+
+                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
+                    trans_a: false,
+                    trans_b: false,
+                    m: n,
+                    n: hd,
+                    k: seq,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    a: &self.scratch.scores,
+                    lda: seq,
+                    stride_a: n * seq,
+                    b: kv_v_use,
+                    ldb: hd,
+                    stride_b: hd,
+                    c: &self.scratch.attn_out,
+                    ldc: hd,
+                    stride_c: hd,
+                    batch_count: nh,
+                })?;
+            } else {
+                // GQA fallback
+                for hi in 0..nh {
+                    let kv_h = hi * nk / nh;
+                    self.backend.sgemm(&SgemmParams {
+                        trans_a: false,
+                        trans_b: true,
+                        m: n,
+                        n: seq,
+                        k: hd,
+                        alpha: scale,
+                        beta: 0.0,
+                        a: &self.scratch.q,
+                        lda: qd,
+                        a_offset: hi * hd,
+                        b: kv_k_use,
+                        ldb: kd,
+                        b_offset: kv_h * hd,
+                        c: &self.scratch.scores,
+                        ldc: seq,
+                        c_offset: hi * n * seq,
+                    })?;
+
+                    self.backend.softmax_rows(&SoftmaxParams {
+                        scores: &self.scratch.scores,
+                        offset_elems: hi * n * seq,
+                        n_rows: n,
+                        row_len: seq,
+                    })?;
+
+                    self.backend.sgemm(&SgemmParams {
+                        trans_a: false,
+                        trans_b: false,
+                        m: n,
+                        n: hd,
+                        k: seq,
+                        alpha: 1.0,
+                        beta: 0.0,
+                        a: &self.scratch.scores,
+                        lda: seq,
+                        a_offset: hi * n * seq,
+                        b: kv_v_use,
+                        ldb: kd,
+                        b_offset: kv_h * hd,
+                        c: &self.scratch.attn_out,
+                        ldc: qd,
+                        c_offset: hi * hd,
+                    })?;
+                }
+            }
+
+            // ── Download attention scores to compute entropy and top positions ──
+            let scores_data = self.backend.download_f32(&self.scratch.scores);
+            let attn_entropy: f32;
+            let attn_top_positions: Vec<(usize, f32)>;
+
+            if seq > 0 && nh > 0 {
+                // Average entropy across all heads
+                let mut total_entropy = 0.0f32;
+                for hi in 0..nh {
+                    let offset = hi * n * seq;
+                    if offset + seq <= scores_data.len() {
+                        let head_scores = &scores_data[offset..offset + seq];
+                        // Scores are already softmaxed
+                        total_entropy += tracer::entropy(head_scores);
+                    }
+                }
+                attn_entropy = total_entropy / nh.max(1) as f32;
+
+                // Top positions from first head
+                if seq > 0 {
+                    let first_head_scores = &scores_data[..seq.min(scores_data.len())];
+                    attn_top_positions = tracer::top_k(first_head_scores, 5);
+                } else {
+                    attn_top_positions = vec![];
+                }
+            } else {
+                attn_entropy = 0.0;
+                attn_top_positions = vec![];
+            }
+
+            // ── Output projection ──
+            Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0)?;
+
+            // ── Post-attention Normalization ──
+            Self::apply_norm(
+                &self.backend, norm_type,
+                &self.scratch.x, &layer.post_attn_norm_w, None,
+                &self.scratch.normed, n, h, eps,
+            )?;
+
+            // ── MLP: gate_proj + up_proj ──
+            Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
+            Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+
+            // ── Activation: gate = activation(gate) * up ──
+            Self::apply_activation(
+                &self.backend, activation,
+                &self.scratch.gate, &self.scratch.up, n, it,
+            )?;
+
+            // ── Download gate to compute MLP activation rate and top neurons ──
+            let gate_data = self.backend.download_f32(&self.scratch.gate);
+            let mlp_activation_rate: f32;
+            let mlp_top_neurons: Vec<(usize, f32)>;
+
+            if it > 0 {
+                let non_zero = gate_data.iter()
+                    .filter(|v| v.abs() > 1e-10)
+                    .count();
+                mlp_activation_rate = (non_zero as f32 / it as f32) * 100.0;
+
+                // Top-10 by absolute value
+                mlp_top_neurons = tracer::top_k(
+                    &gate_data.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+                    10
+                );
+            } else {
+                mlp_activation_rate = 0.0;
+                mlp_top_neurons = vec![];
+            }
+
+            // ── Down projection: residual add ──
+            Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+
+            // ── Download output hidden state to compute residual_delta and phase_coherence ──
+            let x_data = self.backend.download_f32(&self.scratch.x);
+            let output_hidden = if h <= x_data.len() {
+                &x_data[..h]
+            } else {
+                &x_data
+            };
+
+            // Compute residual_delta: L2 norm of (output - input)
+            let residual_delta = prev_hidden.iter().zip(output_hidden)
+                .map(|(a, b)| (b - a) * (b - a))
+                .sum::<f32>()
+                .sqrt();
+
+            // Compute phase_coherence
+            let phase_coherence = tracer::phase_coherence(output_hidden);
+
+            layer_traces.push(crate::inference::LayerDeepTrace {
+                layer_idx,
+                hidden_norm,
+                attn_entropy,
+                attn_top_positions,
+                mlp_activation_rate,
+                mlp_top_neurons,
+                residual_delta,
+                phase_coherence,
+                time_us: 0,
+            });
+        }
+
+        // ── Final Normalization ──
+        Self::apply_norm(
+            &self.backend, norm_type,
+            &self.scratch.x, &self.norm_w, self.norm_b.as_ref(),
+            &self.scratch.normed, n, h, eps,
+        )?;
+
+        // ── lm_head ──
+        self.backend.gemm_bf16_f32(&GemmBf16Params {
+            m: 1,
+            n: vocab,
+            k: h,
+            alpha: 1.0,
+            beta: 0.0,
+            a: &self.scratch.normed,
+            a_offset: (n - 1) * h,
+            b: &self.lm_head,
+            c: &self.scratch.logits,
+        })?;
+
+        // ── Download logits ──
+        let logits = self.backend.download_f32(&self.scratch.logits);
+
+        // ── Compute output trace ──
+        let probs = tracer::softmax(&logits);
+        let logit_entropy = tracer::entropy(&probs);
+
+        let top_tokens_raw = tracer::top_k(&probs, 10);
+        let top_tokens: Vec<(u32, f32)> = top_tokens_raw.into_iter()
+            .map(|(idx, prob)| (idx as u32, prob))
+            .collect();
+
+        // Find chosen token (highest probability)
+        let (chosen_idx, confidence) = if !probs.is_empty() {
+            let (idx, &prob) = probs.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &0.0));
+            (idx as u32, prob)
+        } else {
+            (0, 0.0)
+        };
+
+        // Find rank of chosen token in top-10
+        let chosen_token_rank = top_tokens.iter()
+            .position(|(id, _)| *id == chosen_idx)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
+        let token_str = crate::tokenizer::token_id_to_text(chosen_idx);
+
+        Ok(crate::inference::DeepTrace {
+            token_id: chosen_idx,
+            token_str,
+            layers: layer_traces,
+            output: crate::inference::OutputDeepTrace {
+                logit_entropy,
+                top_tokens,
+                confidence,
+                chosen_token_rank,
+            },
+            time_ms: token_start.elapsed().as_millis(),
+        })
     }
 }
 

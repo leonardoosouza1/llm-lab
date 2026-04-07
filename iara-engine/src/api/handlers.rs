@@ -602,6 +602,88 @@ pub async fn debug_trace_handler(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeepTraceRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub token_index: usize,
+}
+
+/// POST /api/trace — Deep inference trace for a single token
+/// Captures rich per-layer telemetry: attention entropy, MLP activation rates,
+/// phase coherence, residual deltas, and more.
+///
+/// Request: {"prompt": "...", "token_index": 0}
+/// Response: Full DeepTrace JSON
+///
+/// NOTE: This is slow (~2-3x slower than normal forward) and should only be
+/// used when explicitly requested for debugging. Use for single tokens only.
+pub async fn deep_trace_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DeepTraceRequest>,
+) -> impl IntoResponse {
+    if !state.model_ready.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "No model loaded" })),
+        ).into_response();
+    }
+
+    // Tokenize prompt
+    let tokens = crate::tokenizer::tokenize_qa(&req.prompt);
+    let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+
+    if prompt_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Empty prompt" })),
+        ).into_response();
+    }
+
+    // Determine which token to trace: if token_index >= prompt length, trace the next generated token
+    let trace_token_idx = if req.token_index < prompt_ids.len() {
+        req.token_index
+    } else {
+        prompt_ids.len() - 1  // trace last token of prompt by default
+    };
+
+    // Hold the lock for the entire operation
+    let mut model_guard = state.qwen_model.lock().await;
+    let model = match model_guard.as_mut() {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Model lock failed" })),
+            ).into_response();
+        }
+    };
+
+    // Reset cache
+    model.reset_cache();
+
+    // Prefill: process all tokens before the trace target
+    for i in 0..trace_token_idx {
+        if let Err(e) = model.forward(&[prompt_ids[i]], None) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Prefill error at token {}: {}", i, e) })),
+            ).into_response();
+        }
+    }
+
+    // Deep trace the target token
+    let trace_result = model.forward_deep_trace(&[prompt_ids[trace_token_idx]]);
+
+    match trace_result {
+        Ok(deep_trace) => (StatusCode::OK, Json(deep_trace)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Deep trace failed: {}", e) })),
+        ).into_response(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal
 // ─────────────────────────────────────────────────────────────────────────────

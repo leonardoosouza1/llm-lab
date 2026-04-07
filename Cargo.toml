@@ -6,6 +6,7 @@ members = [
     "rocm-backend",
     "opencl-backend",
     "ck-backend",
+    "metaverse-core",
 ]
 resolver = "2"
 
