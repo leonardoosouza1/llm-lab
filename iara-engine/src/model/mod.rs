@@ -23,7 +23,7 @@ pub(crate) use kv_cache::GpuKvCache;
 use std::sync::Arc;
 use compute_core::{
     ComputeBackend, AnyTensor,
-    GemmBf16Params, SgemmParams, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
+    GemmBf16Params, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
     AddBiasParams, GemvQ4Params,
 };
@@ -482,6 +482,9 @@ pub struct CausalLM {
     /// Optional channel to send layer stimulus signals to the orchestrator.
     #[cfg(feature = "experimental")]
     pub stimulus_tx: Option<tokio::sync::mpsc::Sender<crate::experimental::orchestrator::LayerStimulus>>,
+    /// When false (default), per-layer telemetry download_f32 calls are skipped entirely.
+    /// Set to true only when the dashboard/debug UI needs live layer traces.
+    pub telemetry_enabled: bool,
 }
 
 impl CausalLM {
@@ -826,6 +829,7 @@ impl CausalLM {
             sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
+            telemetry_enabled: false,
         })
     }
 
@@ -1184,6 +1188,7 @@ impl CausalLM {
             sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
+            telemetry_enabled: false,
         })
     }
 
@@ -1558,6 +1563,7 @@ impl CausalLM {
             sparse_scratch,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
+            telemetry_enabled: false,
         })
     }
 
@@ -1577,7 +1583,8 @@ impl CausalLM {
     }
 
     /// Forward pass via ComputeBackend with optional early exit via phase coherence.
-    /// Único download_f32(): logits finais [vocab_size] → CPU para sampling.
+    /// GPU→CPU syncs: 1 mandatory (logits) + up to 2 at boundary layers (coherence check).
+    /// Telemetry downloads are ZERO when `self.telemetry_enabled == false` (default).
     /// Returns: (logits, layer_traces) onde layer_traces contém telemetria por camada.
     ///
     /// Parâmetros:
@@ -1862,12 +1869,15 @@ impl CausalLM {
                     a: &self.scratch.q,
                     lda: hd,      // leading dim of Q sub-block [n, hd]
                     stride_a: hd,  // stride between Q heads: next head starts at +hd
+                    a_offset: 0,
                     b: kv_k_use,
                     ldb: hd,      // leading dim of K sub-block [seq, hd]
                     stride_b: hd,  // stride between K heads (MHA: uniform)
+                    b_offset: 0,
                     c: &self.scratch.scores,
                     ldc: seq,     // leading dim of scores sub-block [n, seq]
                     stride_c: n * seq,  // stride between score heads
+                    c_offset: 0,
                     batch_count: nh,
                 })?;
 
@@ -1894,64 +1904,88 @@ impl CausalLM {
                     a: &self.scratch.scores,
                     lda: seq,     // leading dim of scores sub-block [n, seq]
                     stride_a: n * seq,  // stride between score heads
+                    a_offset: 0,
                     b: kv_v_use,
                     ldb: hd,      // leading dim of V sub-block [seq, hd]
                     stride_b: hd,  // stride between V heads (MHA: uniform)
+                    b_offset: 0,
                     c: &self.scratch.attn_out,
                     ldc: hd,      // leading dim of attn_out sub-block [n, hd]
                     stride_c: hd,  // stride between output heads
+                    c_offset: 0,
                     batch_count: nh,
                 })?;
             } else {
-                // GQA fallback: non-uniform strides between K/V heads
-                // Multiple Q heads map to same K/V head: kv_h = hi * nk / nh
-                // When nk < nh, different Q heads have different strides to K/V
-                // sgemm_strided_batched cannot handle this, so revert to per-head loop
-                log::trace!("layer {layer_idx}: attn FALLBACK (GQA) — {nh} Q heads → {nk} KV heads");
+                // GQA grouped batched: group Q heads that share the same KV head
+                // For Qwen2.5-1.5b: 12 Q heads / 2 KV heads = 6 Q heads per group
+                // Instead of 12×3 = 36 sgemm calls, do 2×2 = 4 sgemm_strided_batched + 12 softmax
+                // stride_b = 0 broadcasts the same K/V head to all Q heads in the group
+                let heads_per_group = nh / nk;
+                log::trace!("layer {layer_idx}: attn GQA GROUPED — {nk} groups × {heads_per_group} Q heads/group");
 
-                for hi in 0..nh {
-                    let kv_h = hi * nk / nh;
+                for kv_h in 0..nk {
+                    let q_start = kv_h * heads_per_group;
 
-                    log::trace!("layer {layer_idx}: attn QK hi={hi} kv_h={kv_h} m={n} n={seq} k={hd} lda={qd} ldb={kd} ldc={seq}");
-                    self.backend.sgemm(&SgemmParams {
+                    // T7a-GQA: Batched Q×K^T for all Q heads in this KV group
+                    // Q heads [q_start..q_start+heads_per_group] all multiply by K[kv_h]
+                    log::trace!("layer {layer_idx}: attn QK GQA kv_h={kv_h} q_start={q_start} batch={heads_per_group}");
+                    self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                         trans_a: false,
                         trans_b: true,
-                        m: n, n: seq, k: hd,
-                        alpha: scale, beta: 0.0,
+                        m: n,
+                        n: seq,
+                        k: hd,
+                        alpha: scale,
+                        beta: 0.0,
                         a: &self.scratch.q,
-                        lda: qd,
-                        a_offset: hi * hd,
+                        lda: qd,           // physical stride between token rows in Q
+                        stride_a: hd,      // stride between Q heads within a row
+                        a_offset: q_start * hd,  // first Q head in this group
                         b: kv_k_use,
-                        ldb: kd,
-                        b_offset: kv_h * hd,
+                        ldb: kd,           // physical stride between token rows in K
+                        stride_b: 0,       // broadcast: same K head for all Q heads
+                        b_offset: kv_h * hd,     // this KV group's K head
                         c: &self.scratch.scores,
-                        ldc: seq,
-                        c_offset: hi * n * seq,
+                        ldc: seq,          // leading dim of each score block [n, seq]
+                        stride_c: n * seq, // stride between score blocks per Q head
+                        c_offset: q_start * n * seq,  // scores start for this group
+                        batch_count: heads_per_group,
                     })?;
 
-                    // Softmax row-wise
-                    self.backend.softmax_rows(&SoftmaxParams {
-                        scores: &self.scratch.scores,
-                        offset_elems: hi * n * seq,
-                        n_rows: n,
-                        row_len: seq,
-                    })?;
+                    // T7b-GQA: Softmax per Q head (still individual, fast on GPU)
+                    for gi in 0..heads_per_group {
+                        let hi = q_start + gi;
+                        self.backend.softmax_rows(&SoftmaxParams {
+                            scores: &self.scratch.scores,
+                            offset_elems: hi * n * seq,
+                            n_rows: n,
+                            row_len: seq,
+                        })?;
+                    }
 
-                    log::trace!("layer {layer_idx}: attn AV hi={hi} m={n} n={hd} k={seq} lda={seq} ldb={kd} ldc={qd}");
-                    self.backend.sgemm(&SgemmParams {
+                    // T7c-GQA: Batched Attn×V for all Q heads in this KV group
+                    log::trace!("layer {layer_idx}: attn AV GQA kv_h={kv_h} q_start={q_start} batch={heads_per_group}");
+                    self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                         trans_a: false,
                         trans_b: false,
-                        m: n, n: hd, k: seq,
-                        alpha: 1.0, beta: 0.0,
+                        m: n,
+                        n: hd,
+                        k: seq,
+                        alpha: 1.0,
+                        beta: 0.0,
                         a: &self.scratch.scores,
-                        lda: seq,
-                        a_offset: hi * n * seq,
+                        lda: seq,          // leading dim of score block
+                        stride_a: n * seq, // stride between score blocks
+                        a_offset: q_start * n * seq,
                         b: &layer.kv_v.data,
-                        ldb: kd,
-                        b_offset: kv_h * hd,
+                        ldb: kd,           // physical stride between token rows in V
+                        stride_b: 0,       // broadcast: same V head for all Q heads
+                        b_offset: kv_h * hd,     // this KV group's V head
                         c: &self.scratch.attn_out,
-                        ldc: qd,
-                        c_offset: hi * hd,
+                        ldc: qd,           // physical stride between token rows in output
+                        stride_c: hd,      // stride between output heads within a row
+                        c_offset: q_start * hd,  // output start for this group
+                        batch_count: heads_per_group,
                     })?;
                 }
             }
@@ -2127,9 +2161,11 @@ impl CausalLM {
             log::trace!("layer {layer_idx}: done");
 
             // ── Phase coherence check for early exit (decode-only) ────────────────
-            // Only check for early exit during token generation (n == 1)
+            // Only check at the 2 boundary layers (fast and medium) to avoid
+            // GPU→CPU sync on every layer. This reduces from 28 downloads to at most 2.
             let mut early_exit_flag = false;
-            if n == 1 && layer_budget.is_none() {
+            let is_boundary = layer_idx + 1 == fast_layer_count || layer_idx + 1 == medium_layer_count;
+            if n == 1 && layer_budget.is_none() && is_boundary {
                 let x_data = self.backend.download_f32(&self.scratch.x);
                 let start_idx = (n - 1) * h;
                 let end_idx = start_idx + h;
@@ -2159,9 +2195,9 @@ impl CausalLM {
 
             // ── Per-layer telemetry (sampled, decode-only) ─────────────────────
             // download_f32 é um sync implícito que para o pipeline GPU.
-            // Amostramos apenas a cada 8 camadas + última para manter o dashboard
-            // funcional sem destruir a performance (~4 downloads vs 28).
-            let should_sample = n <= 1 && (layer_idx % 8 == 0 || layer_idx == n_layers - 1);
+            // Telemetry is ZERO-COST when disabled (default). Enable via
+            // model.telemetry_enabled = true when the dashboard needs live traces.
+            let should_sample = self.telemetry_enabled && n <= 1 && (layer_idx % 8 == 0 || layer_idx == n_layers - 1);
 
             let trace = if should_sample {
                 let x_data = self.backend.download_f32(&self.scratch.x);
@@ -2573,12 +2609,15 @@ impl CausalLM {
                     a: &self.scratch.q,
                     lda: hd,
                     stride_a: hd,
+                    a_offset: 0,
                     b: kv_k_use,
                     ldb: hd,
                     stride_b: hd,
+                    b_offset: 0,
                     c: &self.scratch.scores,
                     ldc: seq,
                     stride_c: n * seq,
+                    c_offset: 0,
                     batch_count: nh,
                 })?;
 
@@ -2602,19 +2641,27 @@ impl CausalLM {
                     a: &self.scratch.scores,
                     lda: seq,
                     stride_a: n * seq,
+                    a_offset: 0,
                     b: kv_v_use,
                     ldb: hd,
                     stride_b: hd,
+                    b_offset: 0,
                     c: &self.scratch.attn_out,
                     ldc: hd,
                     stride_c: hd,
+                    c_offset: 0,
                     batch_count: nh,
                 })?;
             } else {
-                // GQA fallback
-                for hi in 0..nh {
-                    let kv_h = hi * nk / nh;
-                    self.backend.sgemm(&SgemmParams {
+                // GQA grouped batched: group Q heads sharing the same KV head
+                let heads_per_group = nh / nk;
+                log::trace!("layer {layer_idx}: attn GQA GROUPED — {nk} groups × {heads_per_group} Q heads/group");
+
+                for kv_h in 0..nk {
+                    let q_start = kv_h * heads_per_group;
+
+                    // Batched Q×K^T for all Q heads in this KV group
+                    self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                         trans_a: false,
                         trans_b: true,
                         m: n,
@@ -2624,23 +2671,31 @@ impl CausalLM {
                         beta: 0.0,
                         a: &self.scratch.q,
                         lda: qd,
-                        a_offset: hi * hd,
+                        stride_a: hd,
+                        a_offset: q_start * hd,
                         b: kv_k_use,
                         ldb: kd,
+                        stride_b: 0,       // broadcast same K head
                         b_offset: kv_h * hd,
                         c: &self.scratch.scores,
                         ldc: seq,
-                        c_offset: hi * n * seq,
+                        stride_c: n * seq,
+                        c_offset: q_start * n * seq,
+                        batch_count: heads_per_group,
                     })?;
 
-                    self.backend.softmax_rows(&SoftmaxParams {
-                        scores: &self.scratch.scores,
-                        offset_elems: hi * n * seq,
-                        n_rows: n,
-                        row_len: seq,
-                    })?;
+                    for gi in 0..heads_per_group {
+                        let hi = q_start + gi;
+                        self.backend.softmax_rows(&SoftmaxParams {
+                            scores: &self.scratch.scores,
+                            offset_elems: hi * n * seq,
+                            n_rows: n,
+                            row_len: seq,
+                        })?;
+                    }
 
-                    self.backend.sgemm(&SgemmParams {
+                    // Batched Attn×V for all Q heads in this KV group
+                    self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
                         trans_a: false,
                         trans_b: false,
                         m: n,
@@ -2650,13 +2705,17 @@ impl CausalLM {
                         beta: 0.0,
                         a: &self.scratch.scores,
                         lda: seq,
-                        a_offset: hi * n * seq,
+                        stride_a: n * seq,
+                        a_offset: q_start * n * seq,
                         b: kv_v_use,
                         ldb: kd,
+                        stride_b: 0,       // broadcast same V head
                         b_offset: kv_h * hd,
                         c: &self.scratch.attn_out,
                         ldc: qd,
-                        c_offset: hi * hd,
+                        stride_c: hd,
+                        c_offset: q_start * hd,
+                        batch_count: heads_per_group,
                     })?;
                 }
             }

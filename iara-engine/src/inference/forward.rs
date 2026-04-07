@@ -8,7 +8,7 @@
 // ============================================================================
 
 use crate::model::{CausalLM, ModelResult};
-use crate::inference::sampling::{SamplingParams, sample_token};
+use crate::inference::sampling::{SamplingParams, sample_token, sample_token_buffered, SamplingBuffer};
 use crate::tokenizer;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -49,14 +49,15 @@ pub struct GenerationStep {
 
 // ── Forward com tracing ───────────────────────────────────────────────────────
 
-/// Forward pass GPU-only instrumentado.
+/// Forward pass GPU-only instrumentado (with reusable sampling buffer).
 /// Toda computação é executada em GPU via hipBLAS + kernels HIP.
 /// O único to_host() é dos logits finais para sampling.
-pub fn forward_traced(
+pub fn forward_traced_buffered(
     model: &mut CausalLM,
     token_ids: &[u32],
     sampling: &SamplingParams,
     layer_budget: Option<crate::lnn::esn::LayerBudget>,
+    sampling_buf: &mut SamplingBuffer,
 ) -> ModelResult<GenerationStep> {
     let total_start = Instant::now();
     let num_layers  = model.cfg.num_layers;
@@ -85,8 +86,8 @@ pub fn forward_traced(
     top_slice.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top_logits = top_slice;
 
-    // Token amostrado
-    let token_id  = sample_token(&logits, sampling);
+    // Token amostrado (zero-alloc via reusable buffer)
+    let token_id  = sample_token_buffered(&logits, sampling, sampling_buf);
     let token_str = tokenizer::token_id_to_text(token_id);
 
     let active_layers: Vec<usize> = (0..num_layers).collect(); // todos ativos
@@ -99,5 +100,17 @@ pub fn forward_traced(
         active_layers,
         time_ms: total_start.elapsed().as_millis(),
     })
+}
+
+/// Legacy wrapper — allocates a SamplingBuffer per call.
+/// Use `forward_traced_buffered` for hot decode loops.
+pub fn forward_traced(
+    model: &mut CausalLM,
+    token_ids: &[u32],
+    sampling: &SamplingParams,
+    layer_budget: Option<crate::lnn::esn::LayerBudget>,
+) -> ModelResult<GenerationStep> {
+    let mut buf = SamplingBuffer::new();
+    forward_traced_buffered(model, token_ids, sampling, layer_budget, &mut buf)
 }
 

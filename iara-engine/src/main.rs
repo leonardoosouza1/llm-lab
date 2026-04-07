@@ -31,7 +31,7 @@ use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
 use crate::lnn::train::LnnTrainer;
 use crate::model::CausalLM;
-use crate::inference::{forward_traced, SamplingParams};
+use crate::inference::{forward_traced, forward_traced_buffered, SamplingParams, SamplingBuffer};
 use crate::transport::{start_ws_server, EngineCommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -434,23 +434,18 @@ async fn run_engine_loop(
                 let mut esn = EsnObserver::new(ESN_SEED);
                 esn.reset();
 
-                // Prefill sequencial: tokens 0..n-2 apenas populam o KV cache.
-                // Garante atenção causal sem máscara explícita.
+                // Prefill em batch: tokens 0..n-2 em um único forward pass para popular KV cache.
                 let mut prefill_ok = true;
                 if prompt_ids.len() > 1 {
                     let mut guard = model.lock().await;
                     if let Some(m) = guard.as_mut() {
-                        for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-                            if let Err(e) = m.forward(&[tok], None) {
-                                log::error!("Prefill error: {}", e);
-                                let _ = frame_tx.send(serde_json::json!({
-                                    "type": "status",
-                                    "message": format!("❌ Erro no prefill: {}", e)
-                                }).to_string());
-                                prefill_ok = false;
-                                break;
-                            }
-                            // Discard logits and traces from prefill
+                        if let Err(e) = m.forward(&prompt_ids[..prompt_ids.len() - 1], None) {
+                            log::error!("Prefill error: {}", e);
+                            let _ = frame_tx.send(serde_json::json!({
+                                "type": "status",
+                                "message": format!("❌ Erro no prefill: {}", e)
+                            }).to_string());
+                            prefill_ok = false;
                         }
                     }
                 }
@@ -462,6 +457,13 @@ async fn run_engine_loop(
                     None => continue,
                 };
 
+                // Pre-allocate sampling buffer for zero-alloc decode
+                let vocab_size = {
+                    let guard = model.lock().await;
+                    guard.as_ref().map(|m| m.cfg.vocab_size).unwrap_or(152_000)
+                };
+                let mut sampling_buf = SamplingBuffer::with_vocab_size(vocab_size);
+
                 for step in 0..MAX_STEPS {
                     let (gen_step, layer_budget) = {
                         let mut guard = model.lock().await;
@@ -470,7 +472,7 @@ async fn run_engine_loop(
                             None => break,
                         };
                         let budget = esn.layer_budget();
-                        match forward_traced(m, &[decode_token], &sampling, Some(budget)) {
+                        match forward_traced_buffered(m, &[decode_token], &sampling, Some(budget), &mut sampling_buf) {
                             Ok(s) => (s, budget),
                             Err(e) => {
                                 log::error!("Forward error step {}: {}", step, e);

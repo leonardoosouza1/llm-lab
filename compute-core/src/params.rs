@@ -41,6 +41,10 @@ pub struct SgemmParams<'a> {
 
 /// Params para SGEMM batched (todas as cabeças de atenção em 1 chamada)
 /// Usa hipblasSgemmStridedBatched para substituir 32 chamadas sequenciais por 1.
+///
+/// Offsets: `a_offset`, `b_offset`, `c_offset` são em elementos e definem o ponto
+/// inicial do batch 0 dentro do tensor. Batch `i` começa em `offset + i * stride`.
+/// Para broadcast (mesma matriz para todos os batches), use `stride = 0`.
 pub struct SgemmStridedBatchedParams<'a> {
     pub trans_a: bool,
     pub trans_b: bool,
@@ -52,12 +56,15 @@ pub struct SgemmStridedBatchedParams<'a> {
     pub a: &'a AnyTensor,
     pub lda: usize,
     pub stride_a: usize,  // stride entre batches em A
+    pub a_offset: usize,  // offset em elementos do batch 0 em A
     pub b: &'a AnyTensor,
     pub ldb: usize,
-    pub stride_b: usize,  // stride entre batches em B
+    pub stride_b: usize,  // stride entre batches em B (0 = broadcast)
+    pub b_offset: usize,  // offset em elementos do batch 0 em B
     pub c: &'a AnyTensor,
     pub ldc: usize,
     pub stride_c: usize,  // stride entre batches em C
+    pub c_offset: usize,  // offset em elementos do batch 0 em C
     pub batch_count: usize,
 }
 

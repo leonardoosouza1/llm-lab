@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::debug::brain::BrainTrace;
 use crate::model::{CausalLM, ModelCfg, ModelArchitecture};
-use crate::inference::forward_traced;
+use crate::inference::{forward_traced, forward_traced_buffered, SamplingBuffer};
 use crate::inference::SamplingParams;
 use crate::storage::iara_format::IaraV2Reader;
 use compute_core::ComputeBackend;
@@ -770,29 +770,31 @@ async fn generate_internal(
         model.reset_cache();
     }
 
-    // Prefill sequencial: processa tokens 0..n-2 apenas para popular o KV cache.
-    // Isso garante atenção causal (cada token só vê os anteriores), como no treinamento.
+    // Prefill em batch: processa tokens 0..n-2 em um único forward pass para popular o KV cache.
+    // forward() já suporta n > 1, processando todos os tokens e atualizando o KV cache por posição.
     // O último token do prompt é processado pela primeira iteração do decode loop,
     // que retorna os logits para amostrar o primeiro token gerado.
     if prompt_ids.len() > 1 {
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
-        for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-            let _ = model.forward(&[tok], None)
-                .map_err(|e| format!("Prefill error: {}", e))?;
-            // Discard logits and traces from prefill
-        }
+        let _ = model.forward(&prompt_ids[..prompt_ids.len() - 1], None)
+            .map_err(|e| format!("Prefill error: {}", e))?;
     }
 
     // Decode: a primeira iteração processa o último token do prompt → logits para 1º token gerado.
     // Iterações seguintes processam cada token gerado → logits para o próximo.
     let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
 
+    // Pre-allocate sampling buffer — reused across all decode tokens (zero-alloc hot path)
+    let mut sampling_buf = SamplingBuffer::with_vocab_size(
+        state.qwen_model.lock().await.as_ref().map(|m| m.cfg.vocab_size).unwrap_or(152_000)
+    );
+
     for step in 0..req.max_tokens {
         let gen_step = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced(model, &[decode_token], &sampling, None)
+            forward_traced_buffered(model, &[decode_token], &sampling, None, &mut sampling_buf)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
@@ -931,13 +933,10 @@ pub async fn train_lnn_handler(
 
         m.reset_cache();
 
-        // Prefill
+        // Prefill em batch: todos os tokens do prompt (exceto o último) em um único forward pass
         if prompt_ids.len() > 1 {
-            for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-                if let Err(e) = m.forward(&[tok], None) {
-                    log::error!("Train prefill error: {}", e);
-                    break;
-                }
+            if let Err(e) = m.forward(&prompt_ids[..prompt_ids.len() - 1], None) {
+                log::error!("Train prefill error: {}", e);
             }
         }
 
@@ -947,9 +946,10 @@ pub async fn train_lnn_handler(
         let mut sampling = SamplingParams::default();
         let mut decode_token = *prompt_ids.last().unwrap();
         let mut generated_tokens = Vec::new();
+        let mut sampling_buf = SamplingBuffer::with_vocab_size(m.cfg.vocab_size);
 
         for step in 0..max_tokens {
-            let gen_step = match crate::inference::forward_traced(m, &[decode_token], &sampling, None) {
+            let gen_step = match crate::inference::forward_traced_buffered(m, &[decode_token], &sampling, None, &mut sampling_buf) {
                 Ok(s) => s,
                 Err(_) => break,
             };

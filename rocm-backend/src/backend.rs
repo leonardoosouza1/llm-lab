@@ -256,9 +256,9 @@ impl ComputeBackend for RocmBackend {
     }
 
     fn sgemm_strided_batched(&self, p: &SgemmStridedBatchedParams) -> Result<(), BackendError> {
-        let a_ptr = unsafe { f32_ptr(p.a).add(0) };  // Base pointer for batch
-        let b_ptr = unsafe { f32_ptr(p.b).add(0) };  // Base pointer for batch
-        let c_ptr = unsafe { f32_mut_ptr(p.c).add(0) };  // Base pointer for batch
+        let a_ptr = unsafe { f32_ptr(p.a).add(p.a_offset) };
+        let b_ptr = unsafe { f32_ptr(p.b).add(p.b_offset) };
+        let c_ptr = unsafe { f32_mut_ptr(p.c).add(p.c_offset) };
 
         hip_ffi::sgemm_strided_batched(
             &self.blas,

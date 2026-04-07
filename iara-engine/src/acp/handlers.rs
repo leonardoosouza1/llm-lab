@@ -467,16 +467,13 @@ async fn execute_inference(
         model.reset_cache();
     }
 
-    // Prefill: processa tokens 0..n-2 apenas para popular KV cache
+    // Prefill em batch: todos os tokens do prompt (exceto o último) em um único forward pass
     if prompt_ids.len() > 1 {
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
-        for &tok in &prompt_ids[..prompt_ids.len() - 1] {
-            let _ = model
-                .forward(&[tok], None)
-                .map_err(|e| format!("Prefill error: {}", e))?;
-            // Discard logits and traces from prefill
-        }
+        let _ = model
+            .forward(&prompt_ids[..prompt_ids.len() - 1], None)
+            .map_err(|e| format!("Prefill error: {}", e))?;
     }
 
     // Decode: começa com último token do prompt, gera até max_tokens novos

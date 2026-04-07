@@ -54,7 +54,7 @@ else
 
     echo ""
     echo "⏳ Aguardando modelo carregar..."
-    for i in $(seq 1 5); do
+    for i in $(seq 1 10); do
         IS_READY=$(curl -s localhost:3000/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('status')=='ok' else '')" 2>/dev/null || echo "")
         if [ -n "$IS_READY" ]; then
             echo ""
