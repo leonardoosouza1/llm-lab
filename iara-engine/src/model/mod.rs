@@ -31,6 +31,7 @@ use half::bf16;
 use std::collections::HashMap;
 use std::path::Path;
 use crate::storage::quantized::{QuantizedTensor, quantize_bf16_to_q4, upload_quantized, QuantizationCpuResult, save_quantized_cache, load_quantized_cache};
+use crate::storage::fp8::fp8_e4m3_to_f32;
 use crate::inference::forward::LayerTrace;
 use crate::lnn::esn::LayerBudget;
 
@@ -1070,25 +1071,30 @@ impl CausalLM {
                         Ok(LayerWeight::Bf16(tensor))
                     }
                     IaraDtype::Fp8E4m3 => {
-                        // FP8: dados + scales (f32 por linha)
+                        // FP8: each byte is one FP8 E4M3 value, scales are per-row f32
                         let scales = reader.tensor_scales_f32(name)
                             .map_err(|e| ModelError::Model(format!("Escalas FP8 layer {}: {}", i, e)))?;
 
-                        // Upload FP8 diretamente como BF16 por enquanto
-                        // (conversão real de FP8→F32 seria feita no forward)
-                        // Para agora, fazer uma conversão simples: fp8 → f32 via scales
                         let fp8_bytes = data;
+                        let total_elements: usize = meta.shape.iter().product();
+                        let cols = if meta.shape.len() >= 2 { meta.shape[1] } else { total_elements };
+                        let rows = if cols > 0 { total_elements / cols } else { 1 };
 
-                        // Aproximação: dados FP8 estão compactados, precisamos expandir
-                        // Por segurança, vamos fazer upload como BF16 usando a escala
-                        log::warn!("⚠️  FP8 tensor '{}' — usando aproximação BF16 (FP8 decodificação será adicionada)", name);
-                        let bits = unsafe {
-                            std::slice::from_raw_parts(
-                                fp8_bytes.as_ptr() as *const u16,
-                                (fp8_bytes.len() / 2).min(meta.shape.iter().product::<usize>())
-                            )
-                        };
-                        let tensor = backend.upload_bf16(bits, &meta.shape);
+                        // Dequantize FP8→F32 using per-row scales, then convert F32→BF16
+                        let mut bf16_bits = Vec::with_capacity(total_elements);
+                        for row in 0..rows {
+                            let scale = if row < scales.len() { scales[row] } else { 1.0 };
+                            let start = row * cols;
+                            let end = (start + cols).min(fp8_bytes.len());
+                            for i in start..end {
+                                let f32_val = fp8_e4m3_to_f32(fp8_bytes[i]) * scale;
+                                bf16_bits.push((f32_val.to_bits() >> 16) as u16);
+                            }
+                        }
+
+                        log::info!("✅ FP8 tensor '{}' decodificado: {} elementos, {} rows × {} cols",
+                            name, bf16_bits.len(), rows, cols);
+                        let tensor = backend.upload_bf16(&bf16_bits, &meta.shape);
                         Ok(LayerWeight::Bf16(tensor))
                     }
                     IaraDtype::Q4 => {

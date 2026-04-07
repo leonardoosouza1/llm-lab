@@ -97,6 +97,8 @@ pub enum IaraDtype {
     Fp8E4m3,
     /// BitNet ternary {-1, 0, +1} packed 2-bit (0.25 bytes per element + 4 bytes scale)
     Ternary,
+    /// Pin + Terrain + Ternary compression (top 1-5% BF16 pins + ternary terrain)
+    Ptt,
 }
 
 impl IaraDtype {
@@ -108,6 +110,7 @@ impl IaraDtype {
             IaraDtype::Q4 => 0.5,
             IaraDtype::Fp8E4m3 => 1.0,
             IaraDtype::Ternary => 0.25,
+            IaraDtype::Ptt => 0.29, // ~2 bits terrain + ~1-5% BF16 pins + overhead
         }
     }
 
@@ -119,6 +122,7 @@ impl IaraDtype {
             IaraDtype::Q4 => "Q4",
             IaraDtype::Fp8E4m3 => "FP8-E4M3",
             IaraDtype::Ternary => "Ternary-1.58b",
+            IaraDtype::Ptt => "P+T+T-6.9x",
         }
     }
 }
@@ -139,7 +143,7 @@ pub struct IaraV2TensorMeta {
     /// Length of packed/quantized data in bytes
     pub data_length: u64,
 
-    /// Offset of scales array (for Q4, FP8, Ternary)
+    /// Offset of scales array (for Q4, FP8, Ternary, P+T+T terrain scales)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scales_offset: Option<u64>,
 
@@ -155,6 +159,22 @@ pub struct IaraV2TensorMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zeros_length: Option<u64>,
 
+    /// Offset of pin indices array (for P+T+T)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_indices_offset: Option<u64>,
+
+    /// Length of pin indices array in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_indices_length: Option<u64>,
+
+    /// Offset of pin values array (for P+T+T)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_values_offset: Option<u64>,
+
+    /// Length of pin values array in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_values_length: Option<u64>,
+
     /// Group size for Q4 quantization (0 = not applicable)
     #[serde(default)]
     pub group_size: usize,
@@ -162,6 +182,44 @@ pub struct IaraV2TensorMeta {
     /// Additional quantization parameters
     #[serde(default)]
     pub quant_params: HashMap<String, String>,
+}
+
+// ── Epigenome metadata ─────────────────────────────────────────────────────
+
+/// Layer execution modes for adaptive inference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerMode {
+    /// Fast: ternary only, skip complex operations
+    Fast,
+    /// Medium: P+T+T, normal compute
+    Medium,
+    /// Slow: full precision for critical paths
+    Slow,
+}
+
+/// Epigenome metadata for calibrated model behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpigenomeMetadata {
+    /// Per-layer importance score (0-1, from TensorImportance)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_importance: Option<Vec<f32>>,
+
+    /// Per-layer recommended compute mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_mode: Option<Vec<LayerMode>>,
+
+    /// Hot channels (mycelium) — which hidden dimensions carry most pins
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_channels: Option<Vec<usize>>,
+
+    /// Dead neuron ratio per layer (from calibration)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_neuron_ratios: Option<Vec<f32>>,
+
+    /// Calibration timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_at: Option<String>,
 }
 
 // ── File-level metadata ─────────────────────────────────────────────────────
@@ -213,6 +271,10 @@ pub struct IaraV2Metadata {
 
     /// Compression ratio
     pub compression_ratio: f64,
+
+    /// Epigenome metadata (initially empty, filled by calibration)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epigenome: Option<EpigenomeMetadata>,
 }
 
 // ── Complete header ─────────────────────────────────────────────────────────
@@ -276,6 +338,10 @@ impl IaraV2Writer {
             scales_length: None,
             zeros_offset: None,
             zeros_length: None,
+            pin_indices_offset: None,
+            pin_indices_length: None,
+            pin_values_offset: None,
+            pin_values_length: None,
             group_size: 0,
             quant_params: HashMap::new(),
         });
@@ -308,6 +374,10 @@ impl IaraV2Writer {
             scales_length: Some(scales_bytes.len() as u64),
             zeros_offset: None,
             zeros_length: None,
+            pin_indices_offset: None,
+            pin_indices_length: None,
+            pin_values_offset: None,
+            pin_values_length: None,
             group_size: 0,
             quant_params: params,
         });
@@ -337,6 +407,10 @@ impl IaraV2Writer {
             scales_length: Some(scales_bytes.len() as u64),
             zeros_offset: Some(zeros_offset),
             zeros_length: Some(zeros_bytes.len() as u64),
+            pin_indices_offset: None,
+            pin_indices_length: None,
+            pin_values_offset: None,
+            pin_values_length: None,
             group_size,
             quant_params: HashMap::new(),
         });
@@ -366,6 +440,62 @@ impl IaraV2Writer {
             scales_length: Some(4),
             zeros_offset: None,
             zeros_length: None,
+            pin_indices_offset: None,
+            pin_indices_length: None,
+            pin_values_offset: None,
+            pin_values_length: None,
+            group_size: 0,
+            quant_params: params,
+        });
+
+        Ok(())
+    }
+
+    /// Write a P+T+T (Pin + Terrain + Ternary) encoded tensor
+    pub fn write_ptt_tensor(
+        &mut self, name: &str, shape: &[usize],
+        terrain_packed: &[u8],
+        terrain_scales: &[f32],
+        pin_indices: &[u32],
+        pin_values: &[u16],
+        pin_threshold_sigma: f32,
+        pin_ratio: f32,
+        terrain_sparsity: f32,
+    ) -> IaraResult<()> {
+        // Write terrain packed data
+        let terrain_data_offset = self.write_aligned_data(terrain_packed)?;
+
+        // Write terrain scales
+        let scales_bytes: Vec<u8> = terrain_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let scales_offset = self.write_aligned_data(&scales_bytes)?;
+
+        // Write pin indices as u32 LE
+        let pin_indices_bytes: Vec<u8> = pin_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let pin_indices_offset = self.write_aligned_data(&pin_indices_bytes)?;
+
+        // Write pin values as u16 LE (BF16)
+        let pin_values_bytes: Vec<u8> = pin_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pin_values_offset = self.write_aligned_data(&pin_values_bytes)?;
+
+        // Build metadata
+        let mut params = HashMap::new();
+        params.insert("pin_ratio".to_string(), format!("{:.4}", pin_ratio));
+        params.insert("terrain_sparsity".to_string(), format!("{:.4}", terrain_sparsity));
+        params.insert("pin_threshold_sigma".to_string(), format!("{:.2}", pin_threshold_sigma));
+
+        self.tensors.insert(name.to_string(), IaraV2TensorMeta {
+            dtype: IaraDtype::Ptt,
+            shape: shape.to_vec(),
+            data_offset: terrain_data_offset,
+            data_length: terrain_packed.len() as u64,
+            scales_offset: Some(scales_offset),
+            scales_length: Some(scales_bytes.len() as u64),
+            zeros_offset: None,
+            zeros_length: None,
+            pin_indices_offset: Some(pin_indices_offset),
+            pin_indices_length: Some(pin_indices_bytes.len() as u64),
+            pin_values_offset: Some(pin_values_offset),
+            pin_values_length: Some(pin_values_bytes.len() as u64),
             group_size: 0,
             quant_params: params,
         });
@@ -550,6 +680,44 @@ impl IaraV2Reader {
             .collect())
     }
 
+    /// Get raw bytes for P+T+T pin indices (zero-copy from mmap)
+    pub fn tensor_pin_indices(&self, name: &str) -> IaraResult<&[u8]> {
+        let meta = self.tensor_meta(name)?;
+        let offset = meta.pin_indices_offset.ok_or_else(||
+            IaraFormatError::InvalidFormat(format!("Tensor '{}' has no pin_indices", name)))?;
+        let length = meta.pin_indices_length.ok_or_else(||
+            IaraFormatError::InvalidFormat(format!("Tensor '{}' has no pin_indices_length", name)))?;
+
+        let start = offset as usize;
+        let end = start + length as usize;
+
+        if end > self.mmap.len() {
+            return Err(IaraFormatError::InvalidFormat(
+                format!("Tensor '{}' pin_indices exceed file bounds", name)));
+        }
+
+        Ok(&self.mmap[start..end])
+    }
+
+    /// Get raw bytes for P+T+T pin values (zero-copy from mmap)
+    pub fn tensor_pin_values(&self, name: &str) -> IaraResult<&[u8]> {
+        let meta = self.tensor_meta(name)?;
+        let offset = meta.pin_values_offset.ok_or_else(||
+            IaraFormatError::InvalidFormat(format!("Tensor '{}' has no pin_values", name)))?;
+        let length = meta.pin_values_length.ok_or_else(||
+            IaraFormatError::InvalidFormat(format!("Tensor '{}' has no pin_values_length", name)))?;
+
+        let start = offset as usize;
+        let end = start + length as usize;
+
+        if end > self.mmap.len() {
+            return Err(IaraFormatError::InvalidFormat(
+                format!("Tensor '{}' pin_values exceed file bounds", name)));
+        }
+
+        Ok(&self.mmap[start..end])
+    }
+
     /// List all tensor names
     pub fn tensor_names(&self) -> Vec<&str> {
         self.header.tensors.keys().map(|s| s.as_str()).collect()
@@ -673,6 +841,22 @@ impl QuantRecipe {
                 ("rotary_emb".into(), IaraDtype::Bf16),
             ],
             _pulse_n_layers: Some(n_layers),
+        }
+    }
+
+    /// P+T+T (Pin + Terrain + Ternary) recipe: 6.9x compression
+    /// Uses P+T+T for weight matrices, BF16 for embeddings and norms
+    pub fn ptt_standard() -> Self {
+        Self {
+            default_dtype: IaraDtype::Ptt,
+            overrides: vec![
+                ("embed_tokens".into(), IaraDtype::Bf16),
+                ("lm_head".into(), IaraDtype::Bf16),
+                ("layernorm".into(), IaraDtype::Bf16),
+                ("norm.weight".into(), IaraDtype::Bf16),
+                ("rotary_emb".into(), IaraDtype::Bf16),
+            ],
+            _pulse_n_layers: None,
         }
     }
 
@@ -895,6 +1079,34 @@ pub fn convert_safetensors_to_iara(
                         &ternary.packed, ternary.scale, ternary.sparsity,
                     )?;
                 }
+                IaraDtype::Ptt => {
+                    // Convert BF16 → P+T+T (Pin + Terrain + Ternary)
+                    let rows = if meta.shape.len() >= 2 { meta.shape[0] } else { 1 };
+                    let cols = n_elements / rows;
+
+                    let bf16_u16: Vec<u16> = tensor_bytes.chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+
+                    // Convert BF16 to F32 for P+T+T encoding
+                    let f32_data: Vec<f32> = bf16_u16.iter()
+                        .map(|&b| f32::from_bits((b as u32) << 16))
+                        .collect();
+
+                    // Encode with P+T+T (sigma_threshold = 2.0 standard deviations)
+                    let sigma_threshold = 2.0f32;
+                    let ptt = crate::storage::ptt::encode(&f32_data, rows, cols, sigma_threshold);
+                    let ptt_stats = crate::storage::ptt::stats(&ptt, None);
+
+                    writer.write_ptt_tensor(
+                        tensor_name, &meta.shape,
+                        &ptt.terrain_packed, &ptt.terrain_scales,
+                        &ptt.pin_indices, &ptt.pin_values,
+                        ptt.pin_threshold_sigma,
+                        ptt_stats.pin_ratio,
+                        ptt_stats.terrain_sparsity,
+                    )?;
+                }
             }
 
             log::debug!("  ✅ {} [{:?}] → {}", tensor_name,
@@ -938,6 +1150,7 @@ mod tests {
             original_size_bytes: 0,
             converted_size_bytes: 0,
             compression_ratio: 1.0,
+            epigenome: None,
         }
     }
 

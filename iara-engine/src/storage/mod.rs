@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod quantized;
 pub mod bitnet;
 pub mod fp8;
+pub mod ptt;
 pub mod iara_format;
 pub mod surgery;
 

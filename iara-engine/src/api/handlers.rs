@@ -23,6 +23,7 @@ use crate::debug::brain::BrainTrace;
 use crate::model::{CausalLM, ModelCfg, ModelArchitecture};
 use crate::inference::forward_traced;
 use crate::inference::SamplingParams;
+use crate::storage::iara_format::IaraV2Reader;
 use compute_core::ComputeBackend;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +187,41 @@ pub async fn models_handler(
 
     for entry in entries.flatten() {
         let path = entry.path();
+
+        // ── .iara files: read metadata directly from file header ──
+        if path.extension().and_then(|e| e.to_str()) == Some("iara") && path.is_file() {
+            let name = path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            if let Ok(reader) = IaraV2Reader::open(&path) {
+                let meta = &reader.header.metadata;
+                let compression = format!("{:.1}×", meta.compression_ratio);
+                let recipe = meta.quant_recipe.get("default")
+                    .cloned()
+                    .unwrap_or_else(|| "mixed".to_string());
+
+                models.push(ModelInfo {
+                    name: name.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    hidden_size:       Some(meta.hidden_dim as u64),
+                    num_layers:        Some(meta.n_layers as u64),
+                    vocab_size:        Some(meta.vocab_size as u64),
+                    num_heads:         Some(meta.n_heads as u64),
+                    num_kv_heads:      Some(meta.n_kv_heads as u64),
+                    head_dim:          None,
+                    intermediate_size: Some(meta.intermediate_dim as u64),
+                    architecture:      Some(format!("{} [.iara {} {}]", meta.architecture, recipe, compression)),
+                    torch_dtype:       Some(recipe),
+                    model_kind:        "causal_lm".to_string(),
+                    has_vision:        false,
+                });
+            }
+            continue;
+        }
+
+        // ── Standard directory models: read from config.json ──
         if !path.is_dir() { continue; }
 
         let config_path = path.join("config.json");
@@ -195,6 +231,14 @@ pub async fn models_handler(
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
+
+        // Check if there's a sibling .iara file — if so, mark it
+        let has_iara = path.with_extension("iara").exists()
+            || std::fs::read_dir(&path).ok().map(|entries| {
+                entries.flatten().any(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("iara")
+                })
+            }).unwrap_or(false);
 
         let info = match std::fs::read_to_string(&config_path) {
             Ok(content) => {
@@ -221,8 +265,9 @@ pub async fn models_handler(
                 };
                 let has_vision = v["vision_config"].is_object();
 
+                let iara_suffix = if has_iara { " [.iara disponível]" } else { "" };
                 let display_arch = arch.as_deref().map(|a| {
-                    if model_kind == "causal_lm" { a.to_string() }
+                    if model_kind == "causal_lm" { format!("{}{}", a, iara_suffix) }
                     else if model_kind == "vlm" { format!("{} [VLM — suporte parcial]", a) }
                     else { format!("{} ⚠ não suportado", a) }
                 });
@@ -279,11 +324,45 @@ pub async fn load_model_handler(
 
     let model_path = state.models_dir.join(&req.name);
 
-    // Check for .iara file or config.json (safetensors)
-    let iara_file = model_path.with_extension("iara");
-    let use_iara = iara_file.exists();
+    // Check for .iara file: could be {name}.iara directly or {name}/... dir with sibling .iara
+    let iara_file = if model_path.extension().and_then(|e| e.to_str()) == Some("iara") && model_path.exists() {
+        // Name already includes .iara extension (shouldn't happen but handle it)
+        Some(model_path.clone())
+    } else {
+        // Standard: check for {name}.iara in models dir
+        let candidate = state.models_dir.join(format!("{}.iara", &req.name));
+        if candidate.exists() { Some(candidate) }
+        else {
+            // Also check: model_path is a dir, and there's a sibling .iara
+            let sibling = model_path.with_extension("iara");
+            if sibling.exists() { Some(sibling) } else { None }
+        }
+    };
+    let use_iara = iara_file.is_some();
 
-    if !use_iara && !model_path.join("config.json").exists() {
+    // For .iara standalone files, config.json may be in a base model dir
+    // e.g., qwen2.5-1.5b-fp8.iara → look for config.json in qwen2.5-1.5b/
+    let config_dir = if model_path.is_dir() {
+        model_path.clone()
+    } else {
+        // Try to find a related model directory (strip suffixes like -fp8, -q4, -ptt)
+        let name_str = req.name.as_str();
+        let base_names = [
+            name_str.to_string(),
+            name_str.rsplitn(2, '-').last().unwrap_or(name_str).to_string(),
+        ];
+        let mut found = None;
+        for base in &base_names {
+            let candidate = state.models_dir.join(base);
+            if candidate.is_dir() && candidate.join("config.json").exists() {
+                found = Some(candidate);
+                break;
+            }
+        }
+        found.unwrap_or(model_path.clone())
+    };
+
+    if !use_iara && !config_dir.join("config.json").exists() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado (nem .iara nem config.json)", req.name) })),
@@ -291,7 +370,7 @@ pub async fn load_model_handler(
     }
 
     // Detect VLM before spawning load
-    let arch_check = std::fs::read_to_string(model_path.join("config.json"))
+    let arch_check = std::fs::read_to_string(config_dir.join("config.json"))
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| v["architectures"].as_array()
@@ -333,6 +412,8 @@ pub async fn load_model_handler(
     let backend       = state.backend.clone();
     let quantize_on_load = state.quantize_on_load;
     let enable_cfc    = state.enable_cfc;
+    let resolved_iara_file = iara_file.clone();
+    let resolved_config_dir = config_dir.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -354,9 +435,14 @@ pub async fn load_model_handler(
             }
         });
 
-        // Load tokenizer
-        log::info!("🔤 Carregando tokenizer de '{}'...", model_name);
-        if let Err(e) = crate::tokenizer::load_tokenizer(&model_path) {
+        // Load tokenizer — use config_dir (which has tokenizer.json)
+        let tokenizer_dir = if resolved_config_dir.join("tokenizer.json").exists() {
+            resolved_config_dir.clone()
+        } else {
+            model_path.clone()
+        };
+        log::info!("🔤 Carregando tokenizer de '{}'...", tokenizer_dir.display());
+        if let Err(e) = crate::tokenizer::load_tokenizer(&tokenizer_dir) {
             log::error!("❌ Falha no tokenizer: {}", e);
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
@@ -370,16 +456,15 @@ pub async fn load_model_handler(
         log::info!("⏳ Carregando pesos de '{}'...", model_name);
 
         // Check if we should load from .iara v2 format
-        let iara_file = model_path.with_extension("iara");
-        let load_result = if iara_file.exists() {
-            log::info!("📦 Detectado arquivo .iara v2: {}", iara_file.display());
+        let load_result = if let Some(ref iara_path) = resolved_iara_file {
+            log::info!("📦 Detectado arquivo .iara v2: {}", iara_path.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
                 "message": format!("Carregando '{}' do formato .iara v2...", model_name)
             }).to_string());
 
-            // Para .iara, precisamos de config.json para cfg e arch
-            let config_path = model_path.join("config.json");
+            // Para .iara, config.json pode estar no dir base do modelo
+            let config_path = resolved_config_dir.join("config.json");
             let cfg = match ModelCfg::from_config_json(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -406,7 +491,7 @@ pub async fn load_model_handler(
                 }
             };
 
-            CausalLM::load_from_iara(&iara_file, cfg, arch, backend)
+            CausalLM::load_from_iara(iara_path, cfg, arch, backend)
         } else {
             // Load from safetensors (traditional path)
             let config_path = model_path.join("config.json");

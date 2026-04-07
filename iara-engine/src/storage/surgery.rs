@@ -122,6 +122,41 @@ impl TensorSurgeon {
 
                     writer.write_ternary_tensor(tensor_name, &tensor_meta.shape, tensor_data, scale_f32, sparsity)?;
                 }
+                IaraDtype::Ptt => {
+                    // Copy P+T+T tensor as-is (can't re-encode efficiently)
+                    let scales = self.reader.tensor_scales(tensor_name)?;
+                    let pin_indices_data = self.reader.tensor_pin_indices(tensor_name)?;
+                    let pin_values_data = self.reader.tensor_pin_values(tensor_name)?;
+
+                    let pin_threshold = tensor_meta.quant_params
+                        .get("pin_threshold_sigma")
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .unwrap_or(2.0);
+                    let pin_ratio = tensor_meta.quant_params
+                        .get("pin_ratio")
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .unwrap_or(0.0);
+                    let terrain_sparsity = tensor_meta.quant_params
+                        .get("terrain_sparsity")
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .unwrap_or(0.0);
+
+                    // Parse pin indices as u32 array
+                    let pin_indices: Vec<u32> = pin_indices_data.chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    // Parse pin values as u16 array (BF16)
+                    let pin_values: Vec<u16> = pin_values_data.chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+
+                    writer.write_ptt_tensor(
+                        tensor_name, &tensor_meta.shape,
+                        tensor_data, &convert_scales(scales)?,
+                        &pin_indices, &pin_values,
+                        pin_threshold, pin_ratio, terrain_sparsity,
+                    )?;
+                }
             }
 
             if self.requantized.contains_key(tensor_name) {

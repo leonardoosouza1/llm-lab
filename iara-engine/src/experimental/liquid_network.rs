@@ -25,34 +25,27 @@ use log::{info, warn};
 use serde::{Serialize, Deserialize};
 // rocm_rs removido — usando hip_ffi nativo
 
-#[cfg(feature = "circadian")]
-mod circadian_phase {
-    use serde::{Serialize, Deserialize};
+// Circadian phase tracking — always available in struct, conditionally used
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CircadianPhase {
+    Awake,
+    Drowsy,
+    LightSleep,
+    DeepSleep,
+    Waking,
+}
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum CircadianPhase {
-        Awake,
-        Drowsy,
-        LightSleep,
-        DeepSleep,
-        Waking,
-    }
-
-    impl std::fmt::Display for CircadianPhase {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Awake => write!(f, "Awake"),
-                Self::Drowsy => write!(f, "Drowsy"),
-                Self::LightSleep => write!(f, "LightSleep"),
-                Self::DeepSleep => write!(f, "DeepSleep"),
-                Self::Waking => write!(f, "Waking"),
-            }
+impl std::fmt::Display for CircadianPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Awake => write!(f, "Awake"),
+            Self::Drowsy => write!(f, "Drowsy"),
+            Self::LightSleep => write!(f, "LightSleep"),
+            Self::DeepSleep => write!(f, "DeepSleep"),
+            Self::Waking => write!(f, "Waking"),
         }
     }
 }
-
-#[cfg(feature = "circadian")]
-pub use circadian_phase::CircadianPhase;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Type Aliases (CONTRACTS.md)
@@ -220,18 +213,30 @@ pub struct LiquidNetwork {
     stdp_lr: f64,
 
     // ── Circadian State (Phase 2) ──────────────────────────────────────────
-    #[cfg(feature = "circadian")]
     pub circadian_state: CircadianPhase,
-    #[cfg(feature = "circadian")]
     pub idle_ticks: u64,
     /// HIP device id (0 = RX 6750 XT).
     pub device_id: i32,
 
     // ── GPU Physics State (hip_ffi) ───────────────────────────────────────
+    #[cfg(feature = "rocm")]
     pub gpu_states: Option<hip_ffi::DeviceBuffer<f32>>,
+    #[cfg(feature = "rocm")]
     pub gpu_weights: Option<hip_ffi::DeviceBuffer<f32>>,
+    #[cfg(feature = "rocm")]
     pub gpu_weights_plastic: Option<hip_ffi::DeviceBuffer<f32>>,
+    #[cfg(feature = "rocm")]
     pub gpu_output: Option<hip_ffi::DeviceBuffer<f32>>,
+
+    // Placeholder fields for non-rocm builds
+    #[cfg(not(feature = "rocm"))]
+    pub gpu_states: Option<()>,
+    #[cfg(not(feature = "rocm"))]
+    pub gpu_weights: Option<()>,
+    #[cfg(not(feature = "rocm"))]
+    pub gpu_weights_plastic: Option<()>,
+    #[cfg(not(feature = "rocm"))]
+    pub gpu_output: Option<()>,
 }
 
 impl LiquidNetwork {
@@ -288,9 +293,7 @@ impl LiquidNetwork {
             bcm_threshold: vec![1.0; n_actual],
             #[cfg(feature = "stdp")]
             stdp_lr: 0.05,
-            #[cfg(feature = "circadian")]
             circadian_state: CircadianPhase::Awake,
-            #[cfg(feature = "circadian")]
             idle_ticks: 0,
             device_id,
             gpu_states: None,
@@ -301,6 +304,7 @@ impl LiquidNetwork {
     }
 
     /// Initializes GPU buffers via hip_ffi.
+    #[cfg(feature = "rocm")]
     pub fn init_gpu(&mut self) -> anyhow::Result<()> {
         let n = self.nodes.len();
         let states_f32: Vec<f32> = self.nodes.iter().map(|n| n.state as f32).collect();
@@ -320,7 +324,15 @@ impl LiquidNetwork {
         Ok(())
     }
 
+    /// Initializes GPU buffers (CPU fallback when rocm feature not enabled).
+    #[cfg(not(feature = "rocm"))]
+    pub fn init_gpu(&mut self) -> anyhow::Result<()> {
+        // CPU fallback: no GPU buffers initialized
+        Ok(())
+    }
+
     /// Física na GPU — CPU fallback até kernels .hip compilados.
+    #[cfg(feature = "rocm")]
     pub fn step_gpu(&mut self, dt: f64) -> anyhow::Result<()> {
         let n = self.nodes.len();
 
@@ -347,6 +359,13 @@ impl LiquidNetwork {
 
         self.time += dt;
         Ok(())
+    }
+
+    /// Física na GPU (CPU fallback when rocm feature not enabled).
+    #[cfg(not(feature = "rocm"))]
+    pub fn step_gpu(&mut self, dt: f64) -> anyhow::Result<()> {
+        // CPU fallback: use standard CPU physics
+        self.step_rk4(dt)
     }
 
     /// Injects `LlmTelemetry` into the mesh, updating stress and viscosity.

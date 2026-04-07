@@ -88,8 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "q4" => storage::iara_format::QuantRecipe::q4_standard(),
             "aggressive" => storage::iara_format::QuantRecipe::aggressive(),
             "pulse" => storage::iara_format::QuantRecipe::pulse(n_layers),
+            "ptt" => storage::iara_format::QuantRecipe::ptt_standard(),
             _ => {
-                eprintln!("Unknown recipe: {}. Use: fp8, q4, aggressive, pulse", recipe_name);
+                eprintln!("Unknown recipe: {}. Use: fp8, q4, aggressive, pulse, ptt", recipe_name);
                 std::process::exit(1);
             }
         };
@@ -123,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             original_size_bytes: 0,
             converted_size_bytes: 0,
             compression_ratio: 1.0,
+            epigenome: None,
         };
 
         println!("🔄 Converting: {} → {}", model_dir.display(), output);
@@ -414,6 +416,9 @@ async fn run_engine_loop(
                 let mut generated_token_ids: Vec<u32> = Vec::new();
                 let mut sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
 
+                // Layer budget tracking: [Fast, Medium, Slow]
+                let mut budget_counts = [0u32; 3];
+
                 // Extract EOS token IDs from model architecture
                 let eos_ids = {
                     let guard = model.lock().await;
@@ -456,15 +461,15 @@ async fn run_engine_loop(
                 };
 
                 for step in 0..MAX_STEPS {
-                    let gen_step = {
+                    let (gen_step, layer_budget) = {
                         let mut guard = model.lock().await;
                         let m = match guard.as_mut() {
                             Some(m) => m,
                             None => break,
                         };
-                        let layer_budget = esn.layer_budget();
-                        match forward_traced(m, &[decode_token], &sampling, Some(layer_budget)) {
-                            Ok(s) => s,
+                        let budget = esn.layer_budget();
+                        match forward_traced(m, &[decode_token], &sampling, Some(budget)) {
+                            Ok(s) => (s, budget),
                             Err(e) => {
                                 log::error!("Forward error step {}: {}", step, e);
                                 let _ = frame_tx.send(serde_json::json!({
@@ -475,6 +480,14 @@ async fn run_engine_loop(
                             }
                         }
                     };
+
+                    // Track layer budget usage
+                    match layer_budget {
+                        crate::lnn::esn::LayerBudget::Fast => budget_counts[0] += 1,
+                        crate::lnn::esn::LayerBudget::Medium => budget_counts[1] += 1,
+                        crate::lnn::esn::LayerBudget::Slow => budget_counts[2] += 1,
+                    }
+
                     decode_token = gen_step.token_id;
 
                     // ── Orchestrator tick (experimental) ────────────────────
@@ -524,6 +537,8 @@ async fn run_engine_loop(
                         "temp_delta": esn_tel.temp_delta,
                         "temperature": sampling.temperature,
                         "readout_trained": esn_tel.readout_trained,
+                        "budget_score": esn_tel.budget_score,
+                        "layer_budget": format!("{:?}", layer_budget),
                     }).to_string());
 
                     // ── Gravity + CfC + Q4 telemetry (Fase 2) ────────────
@@ -653,6 +668,18 @@ async fn run_engine_loop(
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
                     "message": format!("Geração completa: {} tokens", generated_text.split_whitespace().count())
+                }).to_string());
+
+                // Log layer budget statistics
+                log::info!(
+                    "Layer budget stats: Fast={}, Medium={}, Slow={}",
+                    budget_counts[0], budget_counts[1], budget_counts[2]
+                );
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "budget_stats",
+                    "fast": budget_counts[0],
+                    "medium": budget_counts[1],
+                    "slow": budget_counts[2],
                 }).to_string());
 
                 // ── LNN Training: treina após cada geração ───────────────

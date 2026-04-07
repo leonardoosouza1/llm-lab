@@ -229,6 +229,110 @@ pub fn train_esn_readout(esn: &EsnObserver, reward: &RewardSignal) -> Option<Vec
     result
 }
 
+/// Treina o readout de budget W_out_budget do ESN via ridge regression.
+///
+/// Usa a mesma abordagem que train_esn_readout, mas com targets baseados
+/// nas decisões de layer budget (Fast=1, Medium=0.5, Slow=0).
+///
+/// Minimiza ||H · w - y||² + λ||w||²
+/// Solução: w = (H^T H + λI)^{-1} H^T y
+///
+/// H: [N × R] — histórico de estados do reservatório
+/// y: [N] — budget targets por token
+/// w: [R] — pesos do readout de budget (saída)
+///
+/// Retorna os novos pesos W_out_budget ou None se dados insuficientes.
+pub fn train_esn_budget(esn: &EsnObserver, reward: &RewardSignal) -> Option<Vec<f32>> {
+    let n = esn.state_history.len();
+
+    if n < MIN_STEPS_FOR_TRAINING {
+        log::debug!("ESN budget training: dados insuficientes ({} steps, min {})", n, MIN_STEPS_FOR_TRAINING);
+        return None;
+    }
+
+    // Cria targets de budget:
+    // - High reward (top 1/3) → Fast (1.0)
+    // - Medium reward (middle 1/3) → Medium (0.5)
+    // - Low reward (bottom 1/3) → Slow (0.0)
+    let per_token = &reward.per_token;
+    let mut indexed_rewards: Vec<(usize, f32)> = per_token.iter().enumerate()
+        .map(|(i, &r)| (i, r))
+        .collect();
+    indexed_rewards.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let threshold_third = n / 3;
+    let targets: Vec<f32> = (0..n)
+        .map(|i| {
+            let pos = indexed_rewards.iter().position(|&(idx, _)| idx == i).unwrap_or(0);
+            if pos < threshold_third {
+                1.0 // Fast
+            } else if pos < 2 * threshold_third {
+                0.5 // Medium
+            } else {
+                0.0 // Slow
+            }
+        })
+        .collect();
+
+    let r = esn.state[0..].len(); // R = 256
+
+    // H^T H: [R × R]
+    let mut hth = vec![0.0f32; r * r];
+    for t in 0..n {
+        let h = &esn.state_history[t];
+        for i in 0..r {
+            for j in 0..r {
+                hth[i * r + j] += h[i] * h[j];
+            }
+        }
+    }
+
+    // Regularização: H^T H + λI
+    for i in 0..r {
+        hth[i * r + i] += ESN_RIDGE_LAMBDA;
+    }
+
+    // H^T y: [R]
+    let mut hty = vec![0.0f32; r];
+    for t in 0..n {
+        let h = &esn.state_history[t];
+        let y = targets[t];
+        for i in 0..r {
+            hty[i] += h[i] * y;
+        }
+    }
+
+    // Resolve (H^T H + λI) w = H^T y via Cholesky
+    let lambdas = [ESN_RIDGE_LAMBDA, 1e-3, 1e-2, 1e-1];
+    let mut result: Option<Vec<f32>> = None;
+
+    for (attempt, &lambda) in lambdas.iter().enumerate() {
+        if attempt > 0 {
+            let extra = lambda - lambdas[attempt - 1];
+            for i in 0..r {
+                hth[i * r + i] += extra;
+            }
+        }
+
+        if let Some(w) = solve_positive_definite(&hth, &hty, r) {
+            log::info!(
+                "ESN budget readout treinado: {} steps, mean_target={:.4}, ||w||={:.4}, λ={:.0e}",
+                n,
+                targets.iter().sum::<f32>() / n as f32,
+                w.iter().map(|x| x * x).sum::<f32>().sqrt(),
+                lambda,
+            );
+            result = Some(w);
+            break;
+        }
+    }
+
+    if result.is_none() {
+        log::warn!("ESN budget ridge regression falhou após {} tentativas", lambdas.len());
+    }
+    result
+}
+
 /// Resolve Ax = b via Cholesky (A simétrica positiva-definida).
 /// A: [n × n] row-major, b: [n], retorna x: [n].
 fn solve_positive_definite(a: &[f32], b: &[f32], n: usize) -> Option<Vec<f32>> {
@@ -751,12 +855,18 @@ impl LnnTrainer {
             cfc_trained: None,
         };
 
-        // 2. Train ESN readout
+        // 2. Train ESN readout (temperature modulation)
         if self.auto_train_esn {
             if let Some(new_weights) = train_esn_readout(esn, &reward) {
                 esn.set_readout(new_weights);
                 result.esn_trained = true;
                 log::info!("ESN readout atualizado (gen #{})", self.generation_count);
+            }
+
+            // Also train w_out_budget (layer budget decision)
+            if let Some(new_budget_weights) = train_esn_budget(esn, &reward) {
+                esn.set_readout_budget(new_budget_weights);
+                log::info!("ESN budget readout atualizado (gen #{})", self.generation_count);
             }
         }
 
@@ -862,8 +972,9 @@ pub fn save_lnn_weights(
 
     let mut data = serde_json::Map::new();
 
-    // ESN readout
+    // ESN readouts
     data.insert("esn_w_out".into(), serde_json::json!(esn.w_out));
+    data.insert("esn_w_out_budget".into(), serde_json::json!(esn.w_out_budget));
 
     // CfC weights (download from GPU)
     if let Some(cfc) = cfc {

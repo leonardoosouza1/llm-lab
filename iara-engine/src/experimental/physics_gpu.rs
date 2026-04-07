@@ -6,6 +6,7 @@
 // Carregados em runtime via hip_ffi::hip_module_load_data
 // ============================================================================
 
+#[cfg(feature = "rocm")]
 use hip_ffi::{DeviceBuffer, HipError, hip_module_load_data, hip_module_get_function, hip_launch_kernel, hip_stream_create, hip_stream_sync};
 
 /// Binário HSA do kernel de física — compilado pelo build.rs
@@ -13,14 +14,32 @@ use hip_ffi::{DeviceBuffer, HipError, hip_module_load_data, hip_module_get_funct
 /// Por enquanto: placeholder até o kernel .hip estar pronto
 pub const PHYSICS_KERNEL: Option<&[u8]> = None; // será: Some(include_bytes!("../kernels/physics.co"))
 
+#[cfg(feature = "rocm")]
+use hip_ffi::HipError;
+
+#[cfg(not(feature = "rocm"))]
+type HipError = std::io::Error;
+
+#[cfg(feature = "rocm")]
 pub struct PhysicsGpu {
     stream: hip_ffi::raw::hipStream_t,
 }
 
+#[cfg(not(feature = "rocm"))]
+pub struct PhysicsGpu {
+    _phantom: std::marker::PhantomData<()>,
+}
+
 impl PhysicsGpu {
+    #[cfg(feature = "rocm")]
     pub fn new() -> Result<Self, HipError> {
         let stream = hip_stream_create()?;
         Ok(Self { stream })
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    pub fn new() -> Result<Self, HipError> {
+        Ok(Self { _phantom: std::marker::PhantomData })
     }
 
     /// Kernel: Repulsão de Pauli entre neurônios (CPU fallback por enquanto)
@@ -63,6 +82,7 @@ impl PhysicsGpu {
     }
 }
 
+#[cfg(feature = "rocm")]
 impl Drop for PhysicsGpu {
     fn drop(&mut self) {
         unsafe { hip_ffi::hip_stream_destroy(self.stream).ok(); }
