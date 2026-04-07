@@ -51,9 +51,9 @@ struct HealthResponse {
     #[serde(default)]
     model_vram_gb: f64,
     #[serde(default)]
-    vram_free_gb: f64,
+    vram_free_gb: Option<f64>,
     #[serde(default)]
-    vram_total_gb: f64,
+    vram_total_gb: Option<f64>,
 }
 
 struct BenchResult {
@@ -144,8 +144,8 @@ async fn main() {
     println!("  Status:     {}", health.status);
     println!("  Model:      {}", health.model);
     println!("  VRAM Model: {:.2} GB", health.model_vram_gb);
-    println!("  VRAM Free:  {:.2} GB", health.vram_free_gb);
-    println!("  VRAM Total: {:.2} GB", health.vram_total_gb);
+    println!("  VRAM Free:  {:.2} GB", health.vram_free_gb.unwrap_or(0.0));
+    println!("  VRAM Total: {:.2} GB", health.vram_total_gb.unwrap_or(0.0));
 
     if health.model.is_empty() || health.model == "none" {
         println!("\nFATAL: No model loaded. Load one first:");
@@ -302,8 +302,9 @@ async fn main() {
     println!("\n[7] Post-test VRAM check...");
     if let Ok(h) = check_health(&client).await {
         println!("  VRAM Used: {:.2} GB / {:.2} GB ({:.0}%)",
-            h.vram_total_gb - h.vram_free_gb, h.vram_total_gb,
-            (1.0 - h.vram_free_gb / h.vram_total_gb.max(0.01)) * 100.0);
+            h.vram_total_gb.unwrap_or(0.0) - h.vram_free_gb.unwrap_or(0.0),
+            h.vram_total_gb.unwrap_or(0.0),
+            (1.0 - h.vram_free_gb.unwrap_or(0.0) / h.vram_total_gb.unwrap_or(0.01).max(0.01)) * 100.0);
     }
 
     // ── Summary ──────────────────────────────────────────────────────────

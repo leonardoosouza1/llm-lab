@@ -168,6 +168,43 @@ pub async fn health_handler(
     })
 }
 
+/// POST /api/unload-model — descarrega modelo da VRAM
+pub async fn unload_model_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let was_ready = state.model_ready.load(std::sync::atomic::Ordering::Relaxed);
+    let is_loading = state.model_loading.load(std::sync::atomic::Ordering::Relaxed);
+
+    if is_loading {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Modelo está sendo carregado. Aguarde."
+        }))).into_response();
+    }
+
+    if !was_ready {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "ok",
+            "message": "Nenhum modelo carregado."
+        }))).into_response();
+    }
+
+    // Drop the model — libera VRAM
+    *state.qwen_model.lock().await = None;
+    state.model_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let _ = state.frame_tx.send(serde_json::json!({
+        "type": "status",
+        "message": "Modelo descarregado da VRAM"
+    }).to_string());
+
+    log::info!("🗑️  Modelo descarregado da VRAM via /api/unload-model");
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "ok",
+        "message": "Modelo descarregado. VRAM liberada."
+    }))).into_response()
+}
+
 /// GET /api/models — scan models_dir and return info for each
 pub async fn models_handler(
     State(state): State<AppState>,

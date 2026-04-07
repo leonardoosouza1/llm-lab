@@ -25,7 +25,7 @@ mod telemetry; // Adiciona o módulo de telemetria
 mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, debug_trace_handler, deep_trace_handler,
-                            models_handler, load_model_handler,
+                            models_handler, load_model_handler, unload_model_handler,
                             train_lnn_handler, lnn_status_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
@@ -322,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(telemetry_routes) // Merge telemetry routes (inclui /health)
         .route("/api/models",             get(models_handler))
         .route("/api/load-model",         post(load_model_handler))
+        .route("/api/unload-model",       post(unload_model_handler))
         .route("/api/generate",           post(generate_handler))
         .route("/api/trace",              post(deep_trace_handler))
         .route("/api/train-lnn",          post(train_lnn_handler))

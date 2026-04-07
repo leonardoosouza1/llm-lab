@@ -41,10 +41,10 @@ echo "✅ Servidor online"
 echo ""
 echo "[2/5] Verificando modelo: $MODEL"
 HEALTH_STATUS=$(curl -s localhost:3000/health 2>/dev/null)
-IS_OK=$(echo "$HEALTH_STATUS" | grep -o '"status":"ok"' || true)
+IS_OK=$(echo "$HEALTH_STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('status')=='ok' else '')" 2>/dev/null || echo "")
 
 if [ -n "$IS_OK" ]; then
-    CURRENT=$(echo "$HEALTH_STATUS" | grep -o '"model":"[^"]*"' | cut -d'"' -f4)
+    CURRENT=$(echo "$HEALTH_STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('model','?'))" 2>/dev/null || echo "?")
     echo "✅ Modelo já carregado: $CURRENT (pulando load)"
 else
     echo "📦 Carregando modelo: $MODEL"
@@ -54,8 +54,8 @@ else
 
     echo ""
     echo "⏳ Aguardando modelo carregar..."
-    for i in $(seq 1 10); do
-        IS_READY=$(curl -s localhost:3000/health 2>/dev/null | grep -o '"status":"ok"' || true)
+    for i in $(seq 1 5); do
+        IS_READY=$(curl -s localhost:3000/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('status')=='ok' else '')" 2>/dev/null || echo "")
         if [ -n "$IS_READY" ]; then
             echo ""
             echo "✅ Modelo carregado!"
