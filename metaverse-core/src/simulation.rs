@@ -9,6 +9,8 @@ use crate::{
     chemistry::Metabolism,
     world::{World, WorldConfig},
     Vec2, OrganismId, Tick,
+    fep::FreeEnergyMinimizer,
+    dream::{DreamEngine, Experience},
 };
 use crate::ecology::{EcosystemStats, RedQueenTracker};
 use rand::{SeedableRng, Rng};
@@ -46,7 +48,7 @@ impl Default for SimulationConfig {
 }
 
 /// A simplified organism representation for the simulation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SimulationOrganism {
     pub id: OrganismId,
     pub position: Vec2,
@@ -57,6 +59,8 @@ pub struct SimulationOrganism {
     pub complexity: f32,
     pub metabolism: Metabolism,
     pub age: u32,
+    pub fep: FreeEnergyMinimizer,
+    pub dream: DreamEngine,
 }
 
 impl SimulationOrganism {
@@ -71,6 +75,8 @@ impl SimulationOrganism {
             complexity,
             metabolism: Metabolism::new(complexity),
             age: 0,
+            fep: FreeEnergyMinimizer::new(6),
+            dream: DreamEngine::new(0.5, 0.02),
         }
     }
 
@@ -181,10 +187,26 @@ impl Simulation {
 
         // PHASE 2-3: PERCEPTION & DECISION
         let mut organism_actions: HashMap<OrganismId, (Vec2, bool)> = HashMap::new();
-        for org in self.organisms.iter() {
+        for org in self.organisms.iter_mut() {
             if !org.alive {
                 continue;
             }
+
+            // Create sensory input vector: [energy/100, light_after/20, is_producer_f32, x/W, y/H, age/5000]
+            let is_producer_f32 = if org.is_producer { 1.0 } else { 0.0 };
+            let sensory_input = vec![
+                org.energy / 100.0,
+                light_after / 20.0,
+                is_producer_f32,
+                org.position.x / self.config.world_width as f32,
+                org.position.y / self.config.world_height as f32,
+                org.age as f32 / 5000.0,
+            ];
+
+            // Update beliefs and compute free energy
+            org.fep.update_beliefs(&sensory_input);
+            let free_energy = org.fep.compute_free_energy(&sensory_input);
+
             let move_dir = if org.is_producer && light_after > 0.1 {
                 Vec2::new(
                     (self.rng.gen::<f32>() - 0.5) * 2.0,
@@ -197,15 +219,17 @@ impl Simulation {
                 ).normalized()
             };
 
+            // FEP influence: if free energy is high, organism explores more
             let speed = if org.is_producer { 0.3 } else { 0.5 };
-            let move_vec = move_dir * speed;
+            let speed_multiplier = if free_energy > 2.0 { 1.5 } else { 1.0 };
+            let move_vec = move_dir * speed * speed_multiplier;
             let can_reproduce = org.can_reproduce();
             organism_actions.insert(org.id, (move_vec, can_reproduce));
         }
 
         // PHASE 4: ACTION (Movement)
         for org in self.organisms.iter_mut() {
-            if !org.alive {
+            if !org.alive || org.dream.is_sleeping {
                 continue;
             }
             if let Some((move_vec, _)) = organism_actions.get(&org.id) {
@@ -229,7 +253,7 @@ impl Simulation {
         // PHASE 5: METABOLISM
         let org_positions: Vec<(usize, usize)> = self.organisms
             .iter()
-            .filter(|o| o.alive)
+            .filter(|o| o.alive && !o.dream.is_sleeping)
             .map(|o| {
                 let x = (o.position.x as usize) % self.config.world_width;
                 let y = (o.position.y as usize) % self.config.world_height;
@@ -237,8 +261,10 @@ impl Simulation {
             })
             .collect();
 
+        let mut sleep_skip_map: Vec<bool> = vec![false; self.organisms.len()];
         for (i, org) in self.organisms.iter_mut().enumerate() {
-            if !org.alive {
+            if !org.alive || org.dream.is_sleeping {
+                sleep_skip_map[i] = true;
                 continue;
             }
 
@@ -254,6 +280,56 @@ impl Simulation {
                 let report = org.metabolism.tick(cell);
                 org.energy += report.energy_gained;
                 org.energy -= report.energy_spent;
+            }
+        }
+
+        // DREAM PHASE (between Metabolism and Interactions)
+        for (i, org) in self.organisms.iter_mut().enumerate() {
+            if !org.alive {
+                continue;
+            }
+
+            // Record experience before sleep cycle
+            if !sleep_skip_map.get(i).copied().unwrap_or(false) {
+                // Sensory input for experience
+                let is_producer_f32 = if org.is_producer { 1.0 } else { 0.0 };
+                let sensory_input = vec![
+                    org.energy / 100.0,
+                    light_after / 20.0,
+                    is_producer_f32,
+                    org.position.x / self.config.world_width as f32,
+                    org.position.y / self.config.world_height as f32,
+                    org.age as f32 / 5000.0,
+                ];
+
+                // Get move direction from previous action (approximate)
+                let action = if let Some((move_vec, _)) = organism_actions.get(&org.id) {
+                    vec![move_vec.x, move_vec.y]
+                } else {
+                    vec![0.0, 0.0]
+                };
+
+                let reward = org.energy / 100.0; // Energy as reward signal
+                let surprise = org.fep.get_surprise();
+
+                let experience = Experience::new(
+                    sensory_input,
+                    action,
+                    reward,
+                    surprise,
+                    self.tick,
+                );
+                org.dream.experience_buffer.record(experience);
+            }
+
+            // Sleep/wake cycle management
+            if org.dream.is_sleeping {
+                org.dream.tick_sleep(light_after);
+            } else {
+                org.dream.tick_wakefulness();
+                if org.dream.should_sleep(light_after) {
+                    org.dream.is_sleeping = true;
+                }
             }
         }
 

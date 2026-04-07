@@ -16,6 +16,10 @@ pub mod brain;
 pub mod genetics;
 pub mod ecology;
 pub mod simulation;
+pub mod fep;
+pub mod dream;
+pub mod tensor_bridge;
+pub mod universes;
 
 /// Constantes fundamentais do MetaVerse
 pub mod constants {

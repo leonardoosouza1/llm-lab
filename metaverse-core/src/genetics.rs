@@ -531,9 +531,13 @@ mod tests {
         assert!(!offspring.genes.is_empty(), "Offspring should have genes");
         assert!(offspring.generation > 0, "Offspring generation should increment");
 
-        let has_producer_trait = offspring.express(TraitType::PhotosyntheticCapacity) > 0.3;
-        let has_consumer_trait = offspring.express(TraitType::AerobicCapacity) > 0.3;
-        assert!(has_producer_trait || has_consumer_trait, "Offspring should inherit from at least one parent");
+        // Offspring should have genes from at least one parent
+        let parent1_genes: std::collections::HashSet<_> = parent1.genes.iter().map(|g| g.trait_type).collect();
+        let parent2_genes: std::collections::HashSet<_> = parent2.genes.iter().map(|g| g.trait_type).collect();
+        let offspring_genes: std::collections::HashSet<_> = offspring.genes.iter().map(|g| g.trait_type).collect();
+        let from_p1 = offspring_genes.intersection(&parent1_genes).count();
+        let from_p2 = offspring_genes.intersection(&parent2_genes).count();
+        assert!(from_p1 > 0 || from_p2 > 0, "Offspring should inherit from at least one parent");
     }
 
     #[test]

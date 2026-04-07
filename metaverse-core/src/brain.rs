@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 
 // ============================================================================
 // Sensor and Motor Constants
@@ -640,14 +640,15 @@ mod tests {
         let mut brain = Brain::minimal();
         let initial_complexity = brain.complexity();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
 
-        for _ in 0..10 {
+        for _ in 0..20 {
             brain.mutate(&mut rng, 1.0);
         }
 
         let new_complexity = brain.complexity();
-        assert!(new_complexity >= initial_complexity);
+        assert!(new_complexity >= initial_complexity,
+            "Complexity should increase with mutations: {} >= {}", new_complexity, initial_complexity);
     }
 
     #[test]
