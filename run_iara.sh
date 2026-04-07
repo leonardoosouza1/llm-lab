@@ -33,7 +33,7 @@ MODELS_DIR="${2:-$SCRIPT_DIR/models}"
 CARGO_BIN="${HOME}/.cargo/bin/cargo"
 
 if [ "$1" == "release" ]; then
-    RUST_LOG=info "$CARGO_BIN" run --release -p iara-engine --features rocm -- "$MODELS_DIR" 
+    RUST_LOG=info "$CARGO_BIN" run --release -p iara-engine --bin iara-engine --features rocm -- "$MODELS_DIR"
 else
-    RUST_LOG=info "$CARGO_BIN" run -p iara-engine --features rocm -- "$MODELS_DIR"
+    RUST_LOG=info "$CARGO_BIN" run -p iara-engine --bin iara-engine --features rocm -- "$MODELS_DIR"
 fi
