@@ -246,8 +246,8 @@ impl MetabolicReaction for Photosynthesis {
 
     fn required_inputs(&self) -> Vec<(ResourceType, f32)> {
         vec![
-            (ResourceType::Light, 10.0),
-            (ResourceType::Water, 1.0),
+            (ResourceType::Light, 3.0),
+            (ResourceType::Water, 0.2),
         ]
     }
 
@@ -260,8 +260,8 @@ impl MetabolicReaction for Photosynthesis {
 
     fn energy_yield(&self) -> f32 {
         // Photosynthesis stores energy in NutrientA
-        // Net energy is the efficiency of light capture
-        constants::ETA_CAPTURE_BASE * 10.0 // proportional to light captured
+        // Must exceed basal metabolic cost to sustain autotrophs
+        5.0 // net energy from converting light + water
     }
 
     fn rate_at_temperature(&self, temp: f32) -> f32 {
@@ -324,8 +324,8 @@ impl Metabolism {
         let basal_rate = constants::KLEIBER_B0 * complexity.powf(constants::KLEIBER_EXPONENT);
 
         Self {
-            energy_reserve: 50.0,
-            max_energy: 100.0,
+            energy_reserve: 100.0,
+            max_energy: 200.0,
             has_aerobic: false,
             has_photosynthesis: false,
             metabolic_flexibility: 0.5,
@@ -643,15 +643,15 @@ mod tests {
         assert!(cell.get(ResourceType::Oxygen) > 0.0);
 
         // Should consume light and water
-        assert_eq!(cell.get(ResourceType::Light), 10.0);
-        assert_eq!(cell.get(ResourceType::Water), 9.0);
+        assert_eq!(cell.get(ResourceType::Light), 17.0); // 20 - 3
+        assert_eq!(cell.get(ResourceType::Water), 9.8); // 10 - 0.2
     }
 
     #[test]
     fn test_metabolism_new() {
         let m = Metabolism::new(10.0);
-        assert_eq!(m.energy_reserve, 50.0);
-        assert_eq!(m.max_energy, 100.0);
+        assert_eq!(m.energy_reserve, 100.0);
+        assert_eq!(m.max_energy, 200.0);
         assert!(!m.has_aerobic);
         assert!(!m.has_photosynthesis);
         assert!(m.basal_rate > 0.0);

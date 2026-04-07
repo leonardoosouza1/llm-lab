@@ -64,7 +64,7 @@ impl SimulationOrganism {
         Self {
             id,
             position,
-            energy: 50.0,
+            energy: 100.0,
             generation: 0,
             alive: true,
             is_producer,
@@ -75,7 +75,7 @@ impl SimulationOrganism {
     }
 
     pub fn can_reproduce(&self) -> bool {
-        self.alive && self.energy > 40.0
+        self.alive && self.energy > 60.0
     }
 
     pub fn take_damage(&mut self, damage: f32) {
@@ -121,7 +121,7 @@ impl Simulation {
             wrap_around: true,
             ticks_per_day: config.ticks_per_day,
             days_per_season: config.days_per_season,
-            base_light_intensity: 1.0,
+            base_light_intensity: 20.0,
             base_temperature: 20.0,
             resource_diffusion_rates: Default::default(),
             pheromone_decay_rate: 0.02,
@@ -138,7 +138,7 @@ impl Simulation {
             let y = rng.gen_range(0..config.world_height) as f32;
             let pos = Vec2::new(x, y);
 
-            let organism = SimulationOrganism::new(next_id, pos, true, 5.0);
+            let organism = SimulationOrganism::new(next_id, pos, true, 2.0);
             organisms.push(organism);
             next_id += 1;
         }
@@ -149,7 +149,7 @@ impl Simulation {
             let y = rng.gen_range(0..config.world_height) as f32;
             let pos = Vec2::new(x, y);
 
-            let mut organism = SimulationOrganism::new(next_id, pos, false, 8.0);
+            let mut organism = SimulationOrganism::new(next_id, pos, false, 3.0);
             organism.metabolism.has_aerobic = true;
             organisms.push(organism);
             next_id += 1;
@@ -222,7 +222,7 @@ impl Simulation {
                 }
 
                 // Movement costs energy
-                org.energy -= 0.5;
+                org.energy -= 0.1;
             }
         }
 
@@ -293,7 +293,7 @@ impl Simulation {
         // Second pass: attempt reproduction
         let mut to_spawn = Vec::new();
         for (parent_id, parent_pos, is_producer, parent_complexity, parent_gen) in reproduction_candidates {
-            let reproduction_prob = if is_producer { 0.01 } else { 0.005 };
+            let reproduction_prob = if is_producer { 0.05 } else { 0.02 };
             if self.rng.gen::<f32>() < reproduction_prob {
                 // Find parent and modify it
                 if let Some(parent) = self.organisms.iter_mut().find(|o| o.id == parent_id && o.alive) {
@@ -464,6 +464,7 @@ mod tests {
             sim.tick();
         }
 
-        assert!(sim.organisms.len() > 0);
+        assert!(sim.organisms.len() > 0,
+            "Population went extinct after 100 ticks!");
     }
 }

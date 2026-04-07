@@ -80,7 +80,7 @@ impl Default for WorldConfig {
             wrap_around: true,
             ticks_per_day: 100,
             days_per_season: 25,
-            base_light_intensity: 1.0,
+            base_light_intensity: 20.0,
             base_temperature: 20.0,
             resource_diffusion_rates: ResourceDiffusionRates::default(),
             pheromone_decay_rate: 0.02,
@@ -181,16 +181,16 @@ impl World {
                 // High terrain: less water, more minerals
                 // Low terrain: more water, more nutrients
                 if h > 0.7 {
-                    cell.water = 0.2;
-                    cell.mineral = 0.4;
+                    cell.water = 3.0;
+                    cell.mineral = 5.0;
                 } else if h > 0.4 {
-                    cell.water = 0.5;
-                    cell.nutrient_a = 0.5;
+                    cell.water = 8.0;
+                    cell.nutrient_a = 5.0;
                 } else {
-                    cell.water = 0.8;
-                    cell.nutrient_a = 0.7;
+                    cell.water = 12.0;
+                    cell.nutrient_a = 8.0;
                 }
-                cell.oxygen = 0.8;
+                cell.oxygen = 10.0;
                 cell.temperature = 20.0;
                 cell
             })
@@ -234,7 +234,7 @@ impl World {
                         for (px, py) in positions {
                             if px < self.config.width && py < self.config.height {
                                 let cell = self.cell_at_mut(px, py);
-                                cell.nutrient_a = (cell.nutrient_a + 0.3).min(1.0);
+                                cell.nutrient_a = (cell.nutrient_a + 3.0).min(20.0);
                             }
                         }
                     }
@@ -423,18 +423,18 @@ impl World {
             let height = self.topography[i];
 
             // Light → nutrient conversion for photosynthesis
-            let light_gen = light_intensity * 0.1;
+            let light_gen = light_intensity * 0.05;
             cell.light = light_intensity;
-            cell.nutrient_a = (cell.nutrient_a + light_gen).min(1.0);
+            cell.nutrient_a = (cell.nutrient_a + light_gen).min(20.0);
 
             // Height affects water availability
             if height < 0.5 {
-                cell.water = (cell.water + 0.02).min(1.0);
+                cell.water = (cell.water + 0.2).min(20.0);
             }
 
             // Oxygen regeneration
             if light_intensity > 0.2 && height < 0.8 {
-                cell.oxygen = (cell.oxygen + 0.01).min(1.0);
+                cell.oxygen = (cell.oxygen + 0.1).min(15.0);
             }
 
             // Temperature fluctuation with season

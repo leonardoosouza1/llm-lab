@@ -502,6 +502,14 @@ mod tests {
     fn test_mutation_changes_genome() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut genome = Genome::default_producer();
+        // Increase mutation rate for reliable test detection
+        genome.mutation_rate = 0.5;
+        // Update the MutationRate gene value as well (the mutate function uses express())
+        for gene in &mut genome.genes {
+            if gene.trait_type == TraitType::MutationRate {
+                gene.value = 0.5;
+            }
+        }
         let original_values: Vec<f32> = genome.genes.iter().map(|g| g.value).collect();
 
         genome.mutate(&mut rng);

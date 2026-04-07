@@ -47,8 +47,8 @@ pub fn diffuse_scalar_field(field: &mut Vec<f32>, width: usize, height: usize, d
             // Update: C_new = C + D * ∇²C
             new_field[idx] = field[idx] + diffusion_coeff * laplacian;
 
-            // Clamp to [0, 1]
-            new_field[idx] = new_field[idx].max(0.0).min(1.0);
+            // Clamp to non-negative (mass can't be negative)
+            new_field[idx] = new_field[idx].max(0.0);
         }
     }
 
