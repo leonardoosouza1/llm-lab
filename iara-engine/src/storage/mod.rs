@@ -9,6 +9,7 @@ pub mod fp8;
 pub mod ptt;
 pub mod iara_format;
 pub mod surgery;
+pub mod gguf;
 
 // ── Re-exports para fácil acesso ──
 #[allow(unused_imports)]

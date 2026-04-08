@@ -361,6 +361,27 @@ pub async fn load_model_handler(
 
     let model_path = state.models_dir.join(&req.name);
 
+    // Check for .gguf file: {name}.gguf in models_dir, or a single .gguf inside the model dir
+    let gguf_file = {
+        let ext_match = model_path.extension().and_then(|e| e.to_str()) == Some("gguf") && model_path.exists();
+        let direct_candidate = state.models_dir.join(format!("{}.gguf", &req.name));
+        if ext_match {
+            Some(model_path.clone())
+        } else if direct_candidate.exists() {
+            Some(direct_candidate)
+        } else if model_path.is_dir() {
+            // Look for a single .gguf file inside the model directory
+            std::fs::read_dir(&model_path).ok().and_then(|entries| {
+                let ggufs: Vec<_> = entries.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gguf"))
+                    .collect();
+                if ggufs.len() == 1 { Some(ggufs[0].path()) } else { None }
+            })
+        } else {
+            None
+        }
+    };
+
     // Check for .iara file: could be {name}.iara directly or {name}/... dir with sibling .iara
     let iara_file = if model_path.extension().and_then(|e| e.to_str()) == Some("iara") && model_path.exists() {
         // Name already includes .iara extension (shouldn't happen but handle it)
@@ -382,11 +403,13 @@ pub async fn load_model_handler(
     let config_dir = if model_path.is_dir() {
         model_path.clone()
     } else {
-        // Try to find a related model directory (strip suffixes like -fp8, -q4, -ptt)
+        // Try to find a related model directory (strip suffixes like -fp8, -q4, -q4km, -ptt)
         let name_str = req.name.as_str();
+        // Strip .gguf extension if present in name
+        let name_clean = name_str.trim_end_matches(".gguf").trim_end_matches(".iara");
         let base_names = [
-            name_str.to_string(),
-            name_str.rsplitn(2, '-').last().unwrap_or(name_str).to_string(),
+            name_clean.to_string(),
+            name_clean.rsplitn(2, '-').last().unwrap_or(name_clean).to_string(),
         ];
         let mut found = None;
         for base in &base_names {
@@ -399,10 +422,11 @@ pub async fn load_model_handler(
         found.unwrap_or(model_path.clone())
     };
 
-    if !use_iara && !config_dir.join("config.json").exists() {
+    let use_gguf = gguf_file.is_some();
+    if !use_iara && !use_gguf && !config_dir.join("config.json").exists() {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado (nem .iara nem config.json)", req.name) })),
+            Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado (nem .gguf, .iara nem config.json)", req.name) })),
         ).into_response();
     }
 
@@ -450,6 +474,7 @@ pub async fn load_model_handler(
     let quantize_on_load = state.quantize_on_load;
     let enable_cfc    = state.enable_cfc;
     let resolved_iara_file = iara_file.clone();
+    let resolved_gguf_file = gguf_file.clone();
     let resolved_config_dir = config_dir.clone();
 
     tokio::spawn(async move {
@@ -492,8 +517,66 @@ pub async fn load_model_handler(
         // Load model weights
         log::info!("⏳ Carregando pesos de '{}'...", model_name);
 
-        // Check if we should load from .iara v2 format
-        let load_result = if let Some(ref iara_path) = resolved_iara_file {
+        // Check format priority: GGUF > .iara > safetensors
+        let load_result = if let Some(ref gguf_path) = resolved_gguf_file {
+            log::info!("📦 Detectado arquivo GGUF: {}", gguf_path.display());
+            let _ = frame_tx.send(serde_json::json!({
+                "type": "status",
+                "message": format!("Carregando '{}' do formato GGUF (Q4_K_M → dequant → BF16)...", model_name)
+            }).to_string());
+
+            // Open GGUF to read metadata for ModelCfg + ModelArchitecture
+            let gguf = match crate::storage::gguf::GgufFile::open(gguf_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("❌ Falha ao abrir GGUF: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO GGUF '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let cfg = match ModelCfg::from_gguf(&gguf) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("❌ Falha ao ler config GGUF: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO config GGUF '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Try to load arch from tokenizer dir (has generation_config.json for EOS),
+            // fall back to GGUF metadata
+            let tokenizer_dir_ref = if tokenizer_dir.join("generation_config.json").exists() {
+                Some(tokenizer_dir.as_path())
+            } else {
+                None
+            };
+            let arch = match ModelArchitecture::from_gguf(&gguf, tokenizer_dir_ref) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("❌ Falha ao detectar arquitetura GGUF: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO arquitetura GGUF '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Drop the GgufFile — load_gguf will reopen it (it uses mmap internally)
+            drop(gguf);
+
+            CausalLM::load_gguf(gguf_path, cfg, arch, backend)
+        } else if let Some(ref iara_path) = resolved_iara_file {
             log::info!("📦 Detectado arquivo .iara v2: {}", iara_path.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
@@ -581,7 +664,7 @@ pub async fn load_model_handler(
                     let g = model_arc.lock().await;
                     g.as_ref().map(|m| m.backend.name().to_string()).unwrap_or_default()
                 };
-                let quant_str = if quantize_on_load { "q4" } else { "bf16" };
+                let quant_str = if resolved_gguf_file.is_some() { "gguf-q4km→bf16" } else if quantize_on_load { "q4" } else { "bf16" };
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "model_loaded",
                     "name": model_name,

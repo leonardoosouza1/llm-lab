@@ -163,6 +163,57 @@ impl ModelCfg {
         })
     }
 
+    /// Constrói ModelCfg a partir dos metadados de um arquivo GGUF.
+    /// Os keys seguem o padrão: "{arch}.embedding_length", "{arch}.block_count", etc.
+    pub fn from_gguf(gguf: &crate::storage::gguf::GgufFile) -> Result<Self, Box<dyn std::error::Error>> {
+        let arch_name = gguf.get_str("general.architecture")
+            .unwrap_or("qwen2");
+
+        let get = |suffix: &str| -> Result<usize, Box<dyn std::error::Error>> {
+            let key = format!("{}.{}", arch_name, suffix);
+            gguf.get_u32(&key)
+                .map(|v| v as usize)
+                .ok_or_else(|| format!("GGUF: key '{}' ausente", key).into())
+        };
+
+        let hidden_size = get("embedding_length")?;
+        let num_heads = get("attention.head_count")?;
+        let num_kv_heads = get("attention.head_count_kv").unwrap_or(num_heads);
+        let head_dim = hidden_size / num_heads;
+
+        let rms_eps = {
+            let key = format!("{}.attention.layer_norm_rms_epsilon", arch_name);
+            gguf.get_f32(&key).unwrap_or(1e-6)
+        };
+
+        let rope_theta = {
+            let key = format!("{}.rope.freq_base", arch_name);
+            gguf.get_f32(&key).unwrap_or(1_000_000.0)
+        };
+
+        let max_seq = {
+            let key = format!("{}.context_length", arch_name);
+            let raw = gguf.get_u32(&key).unwrap_or(2048) as usize;
+            raw.min(1024)
+        };
+
+        Ok(Self {
+            hidden_size,
+            num_layers: get("block_count")?,
+            intermediate_size: get("feed_forward_length")?,
+            vocab_size: gguf.get_u32(&format!("{}.vocab_size", arch_name))
+                .or_else(|| gguf.get_u32("tokenizer.ggml.vocab_size"))
+                .map(|v| v as usize)
+                .unwrap_or(151936), // fallback Qwen vocab
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rms_eps,
+            rope_theta,
+            max_seq_len: max_seq,
+        })
+    }
+
     #[allow(dead_code)]
     pub fn qwen_8b() -> Self {
         Self {
@@ -834,6 +885,211 @@ impl CausalLM {
         })
     }
 
+    /// Carrega modelo a partir de arquivo GGUF (formato Ollama/llama.cpp).
+    /// Dequantiza Q4_K/Q5_K/Q6_K → F32 → BF16 no load, usa pipeline BF16 existente.
+    /// Fase 1: output correto com pesos pré-quantizados profissionalmente.
+    /// Fase 2 (futuro): kernel Q4_K_GEMV nativo para velocidade máxima.
+    pub fn load_gguf(
+        gguf_path: &Path,
+        cfg: ModelCfg,
+        arch: ModelArchitecture,
+        backend: Arc<dyn ComputeBackend>,
+    ) -> ModelResult<Self> {
+        use crate::storage::gguf::GgufFile;
+
+        log::info!("⏳ Carregando modelo GGUF [{}]: {}", arch.family, gguf_path.display());
+
+        let gguf = GgufFile::open(gguf_path)
+            .map_err(|e| ModelError::Model(format!("Falha ao abrir GGUF: {}", e)))?;
+
+        // Log model info from GGUF metadata
+        if let Some(name) = gguf.get_str("general.name") {
+            log::info!("  → Nome: {}", name);
+        }
+        if let Some(arch_str) = gguf.get_str("general.architecture") {
+            log::info!("  → Arquitetura GGUF: {}", arch_str);
+        }
+
+        // Count tensor types
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        for t in gguf.tensors.values() {
+            *type_counts.entry(format!("{:?}", t.dtype)).or_insert(0) += 1;
+        }
+        log::info!("  → Tensores por tipo: {:?}", type_counts);
+
+        // ── Helper: dequantize GGUF tensor → upload as BF16 to GPU ──
+        let gpu_from_gguf = |gguf_name: &str| -> ModelResult<AnyTensor> {
+            let bf16_data = gguf.dequantize_bf16(gguf_name)
+                .ok_or_else(|| ModelError::Model(
+                    format!("Falha ao dequantizar tensor GGUF '{}'", gguf_name)))?;
+            let info = gguf.tensors.get(gguf_name)
+                .ok_or_else(|| ModelError::Model(format!("Tensor '{}' não encontrado", gguf_name)))?;
+            Ok(backend.upload_bf16(&bf16_data, &info.shape))
+        };
+
+        let gpu_f32_from_gguf = |gguf_name: &str| -> ModelResult<AnyTensor> {
+            let f32_data = gguf.dequantize_f32(gguf_name)
+                .ok_or_else(|| ModelError::Model(
+                    format!("Falha ao dequantizar tensor GGUF '{}'", gguf_name)))?;
+            Ok(backend.upload_f32(&f32_data, &[f32_data.len()]))
+        };
+
+        // ── Map GGUF tensor names to our architecture tensor names ──
+        // GGUF uses names like "blk.0.attn_q.weight" instead of "model.layers.0.self_attn.q_proj.weight"
+        let tmap = &arch.tensor_map;
+
+        // GGUF name mapping: try GGUF-style names first, fall back to HF-style
+        let gguf_name = |hf_name: &str| -> String {
+            // Convert HF-style "model.layers.X.self_attn.q_proj.weight" to GGUF "blk.X.attn_q.weight"
+            let s = hf_name
+                .replace("model.layers.", "blk.")
+                .replace("model.embed_tokens.weight", "token_embd.weight")
+                .replace("model.norm.weight", "output_norm.weight")
+                .replace("lm_head.weight", "output.weight")
+                .replace(".self_attn.q_proj.weight", ".attn_q.weight")
+                .replace(".self_attn.k_proj.weight", ".attn_k.weight")
+                .replace(".self_attn.v_proj.weight", ".attn_v.weight")
+                .replace(".self_attn.o_proj.weight", ".attn_output.weight")
+                .replace(".mlp.gate_proj.weight", ".ffn_gate.weight")
+                .replace(".mlp.up_proj.weight", ".ffn_up.weight")
+                .replace(".mlp.down_proj.weight", ".ffn_down.weight")
+                .replace(".input_layernorm.weight", ".attn_norm.weight")
+                .replace(".post_attention_layernorm.weight", ".ffn_norm.weight")
+                .replace(".self_attn.q_proj.bias", ".attn_q.bias")
+                .replace(".self_attn.k_proj.bias", ".attn_k.bias")
+                .replace(".self_attn.v_proj.bias", ".attn_v.bias");
+            s
+        };
+
+        // Try to find tensor by HF name (converted to GGUF), or direct GGUF name
+        let resolve_name = |hf_name: &str| -> String {
+            let gn = gguf_name(hf_name);
+            if gguf.tensors.contains_key(&gn) {
+                gn
+            } else if gguf.tensors.contains_key(hf_name) {
+                hf_name.to_string()
+            } else {
+                gn // will fail with clear error
+            }
+        };
+
+        // ── Embedding ──
+        let embed_name = resolve_name(&tmap.embed);
+        log::info!("  → embed_tokens: {}", embed_name);
+        let embed = gpu_from_gguf(&embed_name)?;
+
+        // ── Camadas ──
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let max_seq = cfg.max_seq_len;
+
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if i % 8 == 0 { log::info!("  → layers {}/{} (GGUF dequant→BF16)", i, cfg.num_layers); }
+
+            let wq_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_q));
+            let wk_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_k));
+            let wv_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_v));
+            let wo_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_o));
+            let wgate_name = resolve_name(&tmap.layer_tensor(i, &tmap.mlp_gate));
+            let wup_name = resolve_name(&tmap.layer_tensor(i, &tmap.mlp_up));
+            let wdown_name = resolve_name(&tmap.layer_tensor(i, &tmap.mlp_down));
+            let in_norm_name = resolve_name(&tmap.layer_tensor(i, &tmap.input_norm));
+            let pa_norm_name = resolve_name(&tmap.layer_tensor(i, &tmap.post_attn_norm));
+
+            // Optional biases
+            let qb_name = tmap.layer_tensor_opt(i, &tmap.attn_q_bias).map(|n| resolve_name(&n));
+            let kb_name = tmap.layer_tensor_opt(i, &tmap.attn_k_bias).map(|n| resolve_name(&n));
+            let vb_name = tmap.layer_tensor_opt(i, &tmap.attn_v_bias).map(|n| resolve_name(&n));
+
+            layers.push(TransformerLayer {
+                wq:    LayerWeight::Bf16(gpu_from_gguf(&wq_name)?),
+                wk:    LayerWeight::Bf16(gpu_from_gguf(&wk_name)?),
+                wv:    LayerWeight::Bf16(gpu_from_gguf(&wv_name)?),
+                wo:    LayerWeight::Bf16(gpu_from_gguf(&wo_name)?),
+                wgate: LayerWeight::Bf16(gpu_from_gguf(&wgate_name)?),
+                wup:   LayerWeight::Bf16(gpu_from_gguf(&wup_name)?),
+                wdown: LayerWeight::Bf16(gpu_from_gguf(&wdown_name)?),
+                q_bias: match &qb_name {
+                    Some(name) if gguf.tensors.contains_key(name) => Some(gpu_f32_from_gguf(name)?),
+                    _ => None,
+                },
+                k_bias: match &kb_name {
+                    Some(name) if gguf.tensors.contains_key(name) => Some(gpu_f32_from_gguf(name)?),
+                    _ => None,
+                },
+                v_bias: match &vb_name {
+                    Some(name) if gguf.tensors.contains_key(name) => Some(gpu_f32_from_gguf(name)?),
+                    _ => None,
+                },
+                q_norm_w: None, // Qwen2.5 GGUF doesn't have separate QK norms
+                k_norm_w: None,
+                input_norm_w: gpu_f32_from_gguf(&in_norm_name)?,
+                post_attn_norm_w: gpu_f32_from_gguf(&pa_norm_name)?,
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+            });
+        }
+
+        let norm_name = resolve_name(&tmap.final_norm);
+        let norm_w = gpu_f32_from_gguf(&norm_name)?;
+        let norm_b = None; // RMSNorm doesn't use bias
+
+        // lm_head (may be tied with embeddings)
+        let lm_head_name = resolve_name(&tmap.lm_head);
+        let lm_head = if gguf.tensors.contains_key(&lm_head_name) {
+            LayerWeight::Bf16(gpu_from_gguf(&lm_head_name)?)
+        } else {
+            log::info!("  → lm_head: usando embed_tokens (tied weights)");
+            LayerWeight::Bf16(gpu_from_gguf(&embed_name)?)
+        };
+
+        // ── VRAM accounting ──
+        let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
+        let f32_bytes = |t: &AnyTensor| t.numel() * 4;
+        let layer_weight_bytes = |w: &LayerWeight| match w {
+            LayerWeight::Bf16(t) => bf16_bytes(t),
+            LayerWeight::Q4(qt) => {
+                let [rows, cols] = qt.shape;
+                rows * cols / 2 + rows * (cols / qt.group_size) * 8
+            }
+        };
+
+        let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
+        for l in &layers {
+            vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk)
+                        + layer_weight_bytes(&l.wv) + layer_weight_bytes(&l.wo)
+                        + layer_weight_bytes(&l.wgate) + layer_weight_bytes(&l.wup)
+                        + layer_weight_bytes(&l.wdown);
+            vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
+            vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
+        }
+
+        let scratch = ForwardScratchpad::new(&cfg, &backend);
+
+        log::info!("✅ Modelo GGUF [{}] carregado — VRAM: {:.2} GB (dequant→BF16)", arch.family, vram_bytes as f64 / 1e9);
+
+        Ok(Self {
+            embed,
+            layers,
+            norm_w,
+            norm_b,
+            lm_head,
+            cfg,
+            arch,
+            vram_bytes,
+            backend,
+            scratch,
+            cfc: None,
+            gravity: None,
+            quantized: false,
+            kuramoto_router: None,
+            sparse_scratch: None,
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
+            telemetry_enabled: false,
+        })
+    }
+
     /// Carrega modelo com quantização INT4 on-the-fly.
     /// Pesos são quantizados de BF16→Q4 durante o carregamento.
     /// Reduz VRAM em ~4x (ex: 16GB → 4GB para Qwen3-8B).
@@ -853,7 +1109,7 @@ impl CausalLM {
         );
 
         // ── Tentar carregar cache pré-quantizado ──────────────────────────────
-        let group_size = 128usize;
+        let group_size = 32usize;
         let use_cache = if let Ok(Some((cached_tensors, cached_shapes, cached_group_size))) = load_quantized_cache(model_dir) {
             if cached_group_size == group_size {
                 log::info!("⚡ Cache quantizado encontrado e válido, usando...");
@@ -1080,15 +1336,13 @@ impl CausalLM {
             _ => None,
         };
 
-        // lm_head: Q4 quantizado (mesma otimização que pesos de camada)
-        let lm_head_name = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
-            tmap.lm_head.clone()
+        // lm_head em BF16 (NUNCA quantizar — muito sensível, corrompe distribuição de logits)
+        let lm_head = LayerWeight::Bf16(if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+            gpu_bf16(&tmap.lm_head)?
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            tmap.embed.clone()
-        };
-        log::info!("  → lm_head (Q4)");
-        let lm_head = quantize_weight(&lm_head_name)?;
+            gpu_bf16(&tmap.embed)?
+        });
 
         // ── Contabilidade de VRAM (com quantização) ──────────────────────────
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
@@ -1665,6 +1919,27 @@ impl CausalLM {
             Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0)?;
             Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0)?;
             Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0)?;
+
+            // ── DEBUG Q4: dump first layer's projections ──
+            if layer_idx == 0 && std::env::var("IARA_DEBUG_Q4").map(|v| v == "1").unwrap_or(false) {
+                static DEBUG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !DEBUG_DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let normed_data = self.backend.download_f32(&self.scratch.normed);
+                    let q_data = self.backend.download_f32(&self.scratch.q);
+                    let k_data = self.backend.download_f32(&self.scratch.k);
+                    log::info!("🔍 DEBUG Q4 layer 0 (n={}, qd={}, kd={}, h={}):", n, qd, kd, h);
+                    log::info!("  normed[0..8] = {:?}", &normed_data[..8.min(normed_data.len())]);
+                    log::info!("  q[0..8]      = {:?}", &q_data[..8.min(q_data.len())]);
+                    log::info!("  k[0..8]      = {:?}", &k_data[..8.min(k_data.len())]);
+                    let q_nans = q_data.iter().filter(|x| x.is_nan()).count();
+                    let q_infs = q_data.iter().filter(|x| x.is_infinite()).count();
+                    let q_zeros = q_data.iter().filter(|x| **x == 0.0).count();
+                    let q_max = q_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let q_min = q_data.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let q_mean = q_data.iter().sum::<f32>() / q_data.len() as f32;
+                    log::info!("  q stats: min={:.6}, max={:.6}, mean={:.6}, nans={}, infs={}, zeros={}/{}", q_min, q_max, q_mean, q_nans, q_infs, q_zeros, q_data.len());
+                }
+            }
 
             // Biases opcionais (Qwen2/2.5)
             if let Some(ref bias) = layer.q_bias {

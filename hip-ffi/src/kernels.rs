@@ -51,6 +51,8 @@ pub struct GpuKernels {
     fn_copy_kv_cache: hipFunction_t,
     fn_f32_to_bf16: hipFunction_t,
     fn_dequant_gemv_q4: hipFunction_t,
+    fn_dequant_gemv_q4_naive: hipFunction_t,
+    use_naive_gemv: bool,
     fn_gravity_score: hipFunction_t,
     fn_cfc_gate_update: hipFunction_t,
     fn_value_norms: hipFunction_t,
@@ -94,6 +96,11 @@ impl GpuKernels {
         let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
         let fn_f32_to_bf16 = get_fn!("f32_to_bf16");
         let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4");
+        let fn_dequant_gemv_q4_naive = get_fn!("dequant_gemv_q4_naive");
+        let use_naive_gemv = std::env::var("IARA_NAIVE_GEMV").map(|v| v == "1").unwrap_or(false);
+        if use_naive_gemv {
+            eprintln!("⚠️  IARA_NAIVE_GEMV=1: usando kernel GEMV Q4 naive (debug mode)");
+        }
         let fn_gravity_score = get_fn!("gravity_score");
         let fn_cfc_gate_update = get_fn!("cfc_gate_update");
         let fn_value_norms = get_fn!("value_norms");
@@ -119,6 +126,8 @@ impl GpuKernels {
             fn_copy_kv_cache,
             fn_f32_to_bf16,
             fn_dequant_gemv_q4,
+            fn_dequant_gemv_q4_naive,
+            use_naive_gemv,
             fn_gravity_score,
             fn_cfc_gate_update,
             fn_value_norms,
@@ -576,8 +585,14 @@ impl GpuKernels {
         let grid = (n as u32, m.max(1) as u32, 1);  // (N rows, M tokens)
         let block = (bsz, 1, 1);
 
-        // Optimized kernel: only 8 floats for cross-warp reduction (256/32 = 8 warps)
-        let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
+        // Select kernel and shared memory based on mode
+        let (kernel_fn, shared_mem) = if self.use_naive_gemv {
+            // Naive kernel: 256 floats for tree reduction
+            (self.fn_dequant_gemv_q4_naive, (256 * std::mem::size_of::<f32>()) as u32)
+        } else {
+            // Optimized kernel: only 8 floats for cross-warp reduction (256/32 = 8 warps)
+            (self.fn_dequant_gemv_q4, (8 * std::mem::size_of::<f32>()) as u32)
+        };
 
         let mut p_packed = packed;
         let mut p_scales = scales;
@@ -591,7 +606,7 @@ impl GpuKernels {
         let mut p_beta = beta;
 
         hip_launch_kernel(
-            self.fn_dequant_gemv_q4,
+            kernel_fn,
             grid,
             block,
             shared_mem,

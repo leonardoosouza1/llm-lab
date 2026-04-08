@@ -377,6 +377,105 @@ impl ModelArchitecture {
         })
     }
 
+    /// Detecta a arquitetura a partir dos metadados GGUF.
+    /// O GGUF contém "general.architecture" (e.g., "qwen2") e pode ter EOS tokens no metadata.
+    pub fn from_gguf(gguf: &crate::storage::gguf::GgufFile, tokenizer_dir: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let arch_name = gguf.get_str("general.architecture")
+            .unwrap_or("qwen2");
+
+        let (family, norm_type, activation, mlp_type, has_qk_norm, has_qkv_bias, tensor_map) =
+            match arch_name {
+                "qwen3" => (
+                    "qwen3".into(),
+                    NormType::RMSNorm,
+                    Activation::SiLU,
+                    MlpType::GatedProjection,
+                    true,
+                    false,
+                    {
+                        let mut m = TensorNameMap::standard();
+                        m.q_norm = Some("self_attn.q_norm.weight".into());
+                        m.k_norm = Some("self_attn.k_norm.weight".into());
+                        m
+                    },
+                ),
+                "qwen2" => (
+                    "qwen2".into(),
+                    NormType::RMSNorm,
+                    Activation::SiLU,
+                    MlpType::GatedProjection,
+                    false,
+                    true, // Qwen2/2.5 always has QKV bias
+                    {
+                        let mut m = TensorNameMap::standard();
+                        m.attn_q_bias = Some("self_attn.q_proj.bias".into());
+                        m.attn_k_bias = Some("self_attn.k_proj.bias".into());
+                        m.attn_v_bias = Some("self_attn.v_proj.bias".into());
+                        m
+                    },
+                ),
+                "llama" => (
+                    "llama".into(),
+                    NormType::RMSNorm,
+                    Activation::SiLU,
+                    MlpType::GatedProjection,
+                    false, false,
+                    TensorNameMap::standard(),
+                ),
+                other => {
+                    log::warn!("GGUF arch '{}' não reconhecida — usando defaults genéricos", other);
+                    (
+                        other.to_string(),
+                        NormType::RMSNorm,
+                        Activation::SiLU,
+                        MlpType::GatedProjection,
+                        false, false,
+                        TensorNameMap::standard(),
+                    )
+                }
+            };
+
+        // EOS tokens: try generation_config.json from tokenizer dir, then GGUF metadata, then fallback
+        let eos_token_ids = if let Some(dir) = tokenizer_dir {
+            let eos = Self::load_eos_tokens(dir);
+            if eos != vec![2u32] { eos } else {
+                Self::load_eos_from_gguf(gguf)
+            }
+        } else {
+            Self::load_eos_from_gguf(gguf)
+        };
+
+        let tie_embeddings = !gguf.tensors.contains_key("output.weight");
+
+        log::info!(
+            "🏗️  Arquitetura GGUF: family={}, norm={:?}, activation={:?}, qk_norm={}, tied_embed={}, eos={:?}",
+            family, norm_type, activation, has_qk_norm, tie_embeddings, eos_token_ids
+        );
+
+        Ok(Self {
+            family,
+            norm_type,
+            activation,
+            mlp_type,
+            has_qk_norm,
+            has_qkv_bias,
+            tie_word_embeddings: tie_embeddings,
+            eos_token_ids,
+            tensor_map,
+        })
+    }
+
+    /// Extract EOS tokens from GGUF metadata
+    fn load_eos_from_gguf(gguf: &crate::storage::gguf::GgufFile) -> Vec<u32> {
+        // Try common GGUF EOS metadata keys
+        if let Some(eos_id) = gguf.get_u32("tokenizer.ggml.eos_token_id") {
+            return vec![eos_id];
+        }
+        // Qwen2.5 commonly uses 151645 and 151643
+        log::warn!("EOS não encontrado em GGUF metadata, usando fallback [151645, 151643]");
+        vec![151645, 151643]
+    }
+
     /// Carrega tokens EOS de generation_config.json.
     /// Suporta tanto valor único quanto array de IDs.
     /// Fallback: [2] (padrão de muitos modelos HuggingFace).
