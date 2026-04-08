@@ -8,12 +8,12 @@
 set -e
 
 # 1. Caminhos ROCm (idêntico ao run_iara.sh)
-export ROCM_PATH=/opt/rocm-6.4.4
+export ROCM_PATH=/opt/rocm-7.2.1
 export ROCM_LLVM_PATH=$ROCM_PATH/llvm
 export LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_LLVM_PATH/lib:$LD_LIBRARY_PATH
 export LIBCLANG_PATH=$ROCM_LLVM_PATH/lib
 export CLANG_PATH=$ROCM_LLVM_PATH/bin/clang
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem $ROCM_LLVM_PATH/lib/clang/19/include -I$ROCM_PATH/include"
+export BINDGEN_EXTRA_CLANG_ARGS="-isystem $ROCM_LLVM_PATH/lib/clang/22/include -I$ROCM_PATH/include"
 export HSA_OVERRIDE_GFX_VERSION=10.3.0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -25,7 +25,7 @@ use compute_core::{
     ComputeBackend, AnyTensor,
     GemmBf16Params, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
-    AddBiasParams, GemvQ4Params,
+    AddBiasParams, GemvQ4Params, FusedAttentionDecodeParams,
 };
 use half::bf16;
 use std::collections::HashMap;
@@ -1840,82 +1840,43 @@ impl CausalLM {
             };
 
             // ── Attention: Q × K^T → softmax → × V ───────────────────────────
-            // T7: Batched attention with GQA fallback
+            // T7: Fused decode attention (n=1) or batched attention (n>1)
             //
-            // For MHA (nk == nh): All heads can be processed via sgemm_strided_batched
-            // For GQA (nk < nh):  Multiple Q heads share K/V heads → non-uniform strides
-            //   Fall back to per-head loop since strided batched requires uniform strides
+            // For decode (n=1): Use fused kernel that does QK^T+softmax+AV in one pass.
+            //   This eliminates the scores tensor and 3 kernel launches per layer.
+            //   Supports GQA natively via kv_head mapping inside the kernel.
             //
-            // Scratchpad layout:
-            //   Q:      [n, qd] = [n, nh*hd]    stride=qd between tokens, hd between heads
-            //   K cache: [seq, kd]               stride=kd between tokens, hd between heads
-            //   V cache: [seq, kd]               stride=kd between tokens, hd between heads
-            //   scores: [nh*n, seq]             stride=n*seq between heads, seq between tokens
+            // For prefill (n>1): Use separate GEMM+softmax+GEMM (batched or GQA grouped).
 
-            let use_batched = nk == nh;  // MHA only; GQA needs per-head loop
+            let use_fused_decode = n == 1 && seq > 0;
+            let mut fused_ok = false;
 
-            if use_batched {
-                log::trace!("layer {layer_idx}: attn QK BATCHED (MHA) m={n} n={seq} k={hd} batch={nh}");
-
-                // T7a: Batched Q×K^T for all heads
-                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
-                    trans_a: false,
-                    trans_b: true,
-                    m: n,
-                    n: seq,
-                    k: hd,
-                    alpha: scale,
-                    beta: 0.0,
-                    a: &self.scratch.q,
-                    lda: hd,      // leading dim of Q sub-block [n, hd]
-                    stride_a: hd,  // stride between Q heads: next head starts at +hd
-                    a_offset: 0,
-                    b: kv_k_use,
-                    ldb: hd,      // leading dim of K sub-block [seq, hd]
-                    stride_b: hd,  // stride between K heads (MHA: uniform)
-                    b_offset: 0,
-                    c: &self.scratch.scores,
-                    ldc: seq,     // leading dim of scores sub-block [n, seq]
-                    stride_c: n * seq,  // stride between score heads
-                    c_offset: 0,
-                    batch_count: nh,
-                })?;
-
-                // T7b: Softmax per head (still sequential, it's fast)
-                for hi in 0..nh {
-                    self.backend.softmax_rows(&SoftmaxParams {
-                        scores: &self.scratch.scores,
-                        offset_elems: hi * n * seq,
-                        n_rows: n,
-                        row_len: seq,
-                    })?;
+            if use_fused_decode {
+                // ── FUSED DECODE ATTENTION (n=1) ─────────────────────────────
+                log::trace!("layer {layer_idx}: attn FUSED DECODE seq={seq} nh={nh} nk={nk} hd={hd}");
+                match self.backend.fused_attention_decode(&FusedAttentionDecodeParams {
+                    q: &self.scratch.q,
+                    k_cache: kv_k_use,
+                    v_cache: kv_v_use,
+                    out: &self.scratch.attn_out,
+                    seq_len: seq,
+                    head_dim: hd,
+                    n_heads: nh,
+                    n_kv_heads: nk,
+                    scale,
+                }) {
+                    Ok(()) => {
+                        fused_ok = true;
+                    }
+                    Err(_) => {
+                        // Fused not available on this backend — use GQA path
+                        fused_ok = false;
+                    }
                 }
+            }
 
-                // T7c: Batched Attn×V for all heads
-                log::trace!("layer {layer_idx}: attn AV BATCHED (MHA) m={n} n={hd} k={seq} batch={nh}");
-                self.backend.sgemm_strided_batched(&SgemmStridedBatchedParams {
-                    trans_a: false,
-                    trans_b: false,
-                    m: n,
-                    n: hd,
-                    k: seq,
-                    alpha: 1.0,
-                    beta: 0.0,
-                    a: &self.scratch.scores,
-                    lda: seq,     // leading dim of scores sub-block [n, seq]
-                    stride_a: n * seq,  // stride between score heads
-                    a_offset: 0,
-                    b: kv_v_use,
-                    ldb: hd,      // leading dim of V sub-block [seq, hd]
-                    stride_b: hd,  // stride between V heads (MHA: uniform)
-                    b_offset: 0,
-                    c: &self.scratch.attn_out,
-                    ldc: hd,      // leading dim of attn_out sub-block [n, hd]
-                    stride_c: hd,  // stride between output heads
-                    c_offset: 0,
-                    batch_count: nh,
-                })?;
-            } else {
+            // GQA grouped batched attention (for prefill n>1, or fused fallback)
+            if !fused_ok && seq > 0 {
                 // GQA grouped batched: group Q heads that share the same KV head
                 // For Qwen2.5-1.5b: 12 Q heads / 2 KV heads = 6 Q heads per group
                 // Instead of 12×3 = 36 sgemm calls, do 2×2 = 4 sgemm_strided_batched + 12 softmax
@@ -1952,16 +1913,13 @@ impl CausalLM {
                         batch_count: heads_per_group,
                     })?;
 
-                    // T7b-GQA: Softmax per Q head (still individual, fast on GPU)
-                    for gi in 0..heads_per_group {
-                        let hi = q_start + gi;
-                        self.backend.softmax_rows(&SoftmaxParams {
-                            scores: &self.scratch.scores,
-                            offset_elems: hi * n * seq,
-                            n_rows: n,
-                            row_len: seq,
-                        })?;
-                    }
+                    // T7b-GQA: Softmax all Q heads in this KV group in one launch
+                    self.backend.softmax_rows(&SoftmaxParams {
+                        scores: &self.scratch.scores,
+                        offset_elems: q_start * n * seq,
+                        n_rows: heads_per_group * n,
+                        row_len: seq,
+                    })?;
 
                     // T7c-GQA: Batched Attn×V for all Q heads in this KV group
                     log::trace!("layer {layer_idx}: attn AV GQA kv_h={kv_h} q_start={q_start} batch={heads_per_group}");
@@ -2163,9 +2121,12 @@ impl CausalLM {
             // ── Phase coherence check for early exit (decode-only) ────────────────
             // Only check at the 2 boundary layers (fast and medium) to avoid
             // GPU→CPU sync on every layer. This reduces from 28 downloads to at most 2.
+            // Gated on telemetry_enabled: each download_f32 is a GPU→CPU sync that
+            // stalls the pipeline ~1-2ms. In default mode (telemetry off) we do ZERO
+            // mid-forward syncs, keeping maximum throughput for benchmarks.
             let mut early_exit_flag = false;
             let is_boundary = layer_idx + 1 == fast_layer_count || layer_idx + 1 == medium_layer_count;
-            if n == 1 && layer_budget.is_none() && is_boundary {
+            if n == 1 && layer_budget.is_none() && is_boundary && self.telemetry_enabled {
                 let x_data = self.backend.download_f32(&self.scratch.x);
                 let start_idx = (n - 1) * h;
                 let end_idx = start_idx + h;

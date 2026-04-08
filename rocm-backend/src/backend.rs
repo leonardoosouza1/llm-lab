@@ -7,7 +7,7 @@ use compute_core::{
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
-        KuramotoCoherenceParams, TopkSelectParams,
+        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -715,6 +715,25 @@ impl ComputeBackend for RocmBackend {
                 p.kv_dim as i32,
                 p.head_dim as i32,
                 p.n_kv_heads as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_attention_decode(&self, p: &FusedAttentionDecodeParams) -> Result<(), BackendError> {
+        let kv_dim = (p.n_kv_heads * p.head_dim) as i32;
+        unsafe {
+            self.kernels.fused_attention_decode(
+                f32_ptr(p.q),
+                f32_ptr(p.k_cache),
+                f32_ptr(p.v_cache),
+                f32_mut_ptr(p.out),
+                p.seq_len as i32,
+                p.head_dim as i32,
+                p.n_heads as i32,
+                p.n_kv_heads as i32,
+                kv_dim,
+                p.scale,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))

@@ -63,6 +63,7 @@ pub struct GpuKernels {
     fn_gather_cols_bf16: hipFunction_t,
     fn_kuramoto_coherence: hipFunction_t,
     fn_topk_select: hipFunction_t,
+    fn_fused_attention_decode: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -105,6 +106,7 @@ impl GpuKernels {
         let fn_gather_cols_bf16 = get_fn!("gather_cols_bf16");
         let fn_kuramoto_coherence = get_fn!("kuramoto_coherence");
         let fn_topk_select = get_fn!("topk_select");
+        let fn_fused_attention_decode = get_fn!("fused_attention_decode");
 
         Ok(Self {
             module,
@@ -129,6 +131,7 @@ impl GpuKernels {
             fn_gather_cols_bf16,
             fn_kuramoto_coherence,
             fn_topk_select,
+            fn_fused_attention_decode,
         })
     }
 }
@@ -573,12 +576,8 @@ impl GpuKernels {
         let grid = (n as u32, m.max(1) as u32, 1);  // (N rows, M tokens)
         let block = (bsz, 1, 1);
 
-        // Shared memory layout for optimized kernel:
-        // [0..n_groups) : scales
-        // [n_groups..2*n_groups) : zeros
-        // [2*n_groups..2*n_groups + 256) : reduction buffer (one per warp)
-        let n_groups = ((k as u32 + group_size as u32 - 1) / group_size as u32) as usize;
-        let shared_mem = ((n_groups * 2 + 256) * std::mem::size_of::<f32>()) as u32;
+        // Optimized kernel: only 8 floats for cross-warp reduction (256/32 = 8 warps)
+        let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
 
         let mut p_packed = packed;
         let mut p_scales = scales;
@@ -1188,6 +1187,67 @@ impl GpuKernels {
                 &mut p_idx as *mut *mut i32 as *mut std::ffi::c_void,
                 &mut p_nn as *mut i32 as *mut std::ffi::c_void,
                 &mut p_tk as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ── Fused Attention Decode ─────────────────────────────────────────────
+    // Fuses Q×K^T → softmax → ×V into a single kernel for n=1 decode.
+    // Eliminates the scores tensor and 3 separate kernel launches per layer.
+    // Grid : (n_heads, 1, 1)
+    // Block: (256, 1, 1)
+    // Shared: (256 + head_dim) * sizeof(float)
+    // -----------------------------------------------------------------------
+
+    /// Fused single-token attention (decode only, n=1).
+    ///
+    /// # Safety
+    /// All pointers must point to valid GPU allocations.
+    pub unsafe fn fused_attention_decode(
+        &self,
+        q: *const f32,          // [1, n_heads * head_dim]
+        k_cache: *const f32,    // [max_seq, n_kv_heads * head_dim]
+        v_cache: *const f32,    // [max_seq, n_kv_heads * head_dim]
+        out: *mut f32,          // [1, n_heads * head_dim]
+        seq_len: i32,
+        head_dim: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        kv_dim: i32,
+        scale: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n_heads as u32, 1, 1);
+        let block = (256u32, 1, 1);
+        let shared_bytes = (256 + head_dim as u32) * 4; // floats
+
+        let mut p_q = q;
+        let mut p_k = k_cache;
+        let mut p_v = v_cache;
+        let mut p_out = out;
+        let mut p_seq = seq_len;
+        let mut p_hd = head_dim;
+        let mut p_nh = n_heads;
+        let mut p_nk = n_kv_heads;
+        let mut p_kd = kv_dim;
+        let mut p_sc = scale;
+
+        hip_launch_kernel(
+            self.fn_fused_attention_decode,
+            grid,
+            block,
+            shared_bytes,
+            ptr::null_mut(),
+            &mut [
+                &mut p_q as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_k as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_v as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hd as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nh as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nk as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kd as *mut i32 as *mut std::ffi::c_void,
+                &mut p_sc as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }

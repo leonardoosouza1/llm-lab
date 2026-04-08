@@ -301,3 +301,19 @@ pub struct TopkSelectParams<'a> {
     pub n_neurons: usize,
     pub top_k: usize,
 }
+
+/// Fused single-token attention (decode only, n=1).
+/// Combines Q×K^T → softmax → ×V into a single kernel, eliminating
+/// the scores tensor and 3 separate kernel launches per layer.
+/// Supports GQA via kv_head mapping.
+pub struct FusedAttentionDecodeParams<'a> {
+    pub q: &'a AnyTensor,           // [1, n_heads * head_dim] F32
+    pub k_cache: &'a AnyTensor,     // [max_seq, n_kv_heads * head_dim] F32
+    pub v_cache: &'a AnyTensor,     // [max_seq, n_kv_heads * head_dim] F32
+    pub out: &'a AnyTensor,         // [1, n_heads * head_dim] F32 (output)
+    pub seq_len: usize,             // current filled positions in KV cache
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub scale: f32,                 // 1/sqrt(head_dim)
+}

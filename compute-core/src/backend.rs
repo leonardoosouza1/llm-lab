@@ -70,6 +70,12 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError>;
     fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError>;
 
+    /// Fused single-token attention: Q×K^T → softmax → ×V in one kernel (decode n=1).
+    /// Default: returns NotImplemented (fallback to separate GEMM+softmax+GEMM).
+    fn fused_attention_decode(&self, _p: &FusedAttentionDecodeParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_attention_decode".into()))
+    }
+
     /// Soma dois tensores F32 in-place: a[i] += alpha * b[i]
     /// Usado para aplicar CfC correction ao hidden state.
     fn add_tensors_inplace(&self, a: &AnyTensor, b: &AnyTensor, n_elems: usize, alpha: f32) -> Result<(), BackendError>;

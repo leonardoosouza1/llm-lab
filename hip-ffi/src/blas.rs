@@ -65,7 +65,7 @@ pub fn gemm_bf16_f32(
     // We want C_col[n, m] = B_col[n, k] × A_col^T[k, m]
     // Which gives row-major: C[m, n] = A[m, k] × B^T[n, k]
     unsafe {
-        blas_check(hipblasGemmEx_v2(
+        blas_check(hipblasGemmEx(
             handle.handle,
             hipblasOperation_t_HIPBLAS_OP_T,  // weights: transposed in col-major
             hipblasOperation_t_HIPBLAS_OP_N,  // activations: non-transposed
@@ -119,7 +119,7 @@ pub fn sgemm_strided(
     let ta = if trans_b { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
     let tb = if trans_a { hipblasOperation_t_HIPBLAS_OP_T } else { hipblasOperation_t_HIPBLAS_OP_N };
     unsafe {
-        blas_check(hipblasGemmEx_v2(
+        blas_check(hipblasGemmEx(
             handle.handle,
             ta, tb,
             n, m, k,
@@ -203,7 +203,7 @@ pub fn sgemm(
     c: *mut f32,
 ) -> Result<(), HipError> {
     unsafe {
-        blas_check(hipblasGemmEx_v2(
+        blas_check(hipblasGemmEx(
             handle.handle,
             hipblasOperation_t_HIPBLAS_OP_T,
             hipblasOperation_t_HIPBLAS_OP_N,

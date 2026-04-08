@@ -10,5 +10,6 @@ pub use params::{
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
     AddBiasParams, GemvQ4Params, GravityScoreParams, CfcForwardParams,
     KvCacheQuantizedParams, FusedNormBiasRopeParams, KvCacheInt8AppendParams, KvCacheInt8ReadParams,
+    FusedAttentionDecodeParams,
 };
 pub use backend::ComputeBackend;

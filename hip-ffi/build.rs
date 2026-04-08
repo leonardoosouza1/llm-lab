@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let rocm = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm-6.4.4".to_string());
+    let rocm = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm-7.2.1".to_string());
 
     // Link libamdhip64
     println!("cargo:rustc-link-search=native={}/lib", rocm);
@@ -15,7 +15,17 @@ fn main() {
     // Usa o Clang do ROCm (não o do sistema) — ele sabe encontrar seus próprios headers
     // LIBCLANG_PATH deve apontar para o lib do ROCm LLVM (setado em run_iara.sh)
     let rocm_llvm_lib = format!("{}/lib/llvm/lib", rocm);
-    let _rocm_llvm_include = format!("{}/lib/llvm/lib/clang/19/include", rocm);
+    // Auto-detect clang version: scan {rocm}/lib/llvm/lib/clang/*/include
+    let clang_version = std::fs::read_dir(format!("{}/lib/llvm/lib/clang", rocm))
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| name.chars().next().map_or(false, |c| c.is_ascii_digit()))
+                .max()
+        })
+        .unwrap_or_else(|| "22".to_string());
+    let _rocm_llvm_include = format!("{}/lib/llvm/lib/clang/{}/include", rocm, clang_version);
 
     // Exporta LIBCLANG_PATH para que bindgen use o clang certo
     println!("cargo:rustc-env=LIBCLANG_PATH={}", rocm_llvm_lib);
@@ -25,7 +35,7 @@ fn main() {
         .clang_arg("-D__HIP_PLATFORM_AMD__=1")
         .clang_arg(format!("-I{}/include", rocm))
         // Resource dir do Clang do ROCm — encontra cstdint, array, etc.
-        .clang_arg(format!("-resource-dir={}/lib/llvm/lib/clang/19", rocm))
+        .clang_arg(format!("-resource-dir={}/lib/llvm/lib/clang/{}", rocm, clang_version))
         .clang_arg("-x")
         .clang_arg("c++")
         .clang_arg("-std=c++17")
@@ -101,19 +111,20 @@ fn main() {
         .clang_arg(format!("-I{}/include", rocm))
         .clang_arg("-D__HIP_PLATFORM_AMD__")
         .clang_arg("-DHIPBLAS_V2")
-        .clang_arg(format!("-resource-dir={}/lib/llvm/lib/clang/19", rocm))
+        .clang_arg(format!("-resource-dir={}/lib/llvm/lib/clang/{}", rocm, clang_version))
         .clang_arg("-x")
         .clang_arg("c++")
         .clang_arg("-std=c++17")
         // Functions
         .allowlist_function("hipblasCreate")
         .allowlist_function("hipblasDestroy")
-        .allowlist_function("hipblasGemmEx_v2")
+        .allowlist_function("hipblasGemmEx")
         .allowlist_function("hipblasSgemmStridedBatched")
         // Types
         .allowlist_type("hipblasStatus_t")
         .allowlist_type("hipblasOperation_t")
         .allowlist_type("hipblasGemmAlgo_t")
+        .allowlist_type("hipDataType")
         .allowlist_type("hipblasComputeType_t")
         // Vars / constants
         .allowlist_var("HIPBLAS_STATUS.*")
