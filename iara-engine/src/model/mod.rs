@@ -457,7 +457,7 @@ pub struct CausalLM {
     pub layers:  Vec<TransformerLayer>,
     pub norm_w:  AnyTensor,     // F32 [hidden]
     pub norm_b:  Option<AnyTensor>, // F32 [hidden] — bias (LayerNorm only)
-    pub lm_head: AnyTensor,     // BF16 [vocab, hidden] — sempre (sensível a quantização)
+    pub lm_head: LayerWeight,   // BF16 ou Q4 [vocab, hidden]
     pub cfg:     ModelCfg,
     /// Descritor da arquitetura (família, norm, ativação, tensor map, EOS tokens)
     pub arch: ModelArchitecture,
@@ -525,6 +525,7 @@ impl CausalLM {
                     zeros: &qt.zeros,
                     group_size: qt.group_size,
                     x: input,
+                    x_offset: a_offset,
                     out: output,
                     beta,
                 })?;
@@ -757,12 +758,12 @@ impl CausalLM {
             _ => None,
         };
 
-        let lm_head = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+        let lm_head = LayerWeight::Bf16(if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
             gpu(&tmap.lm_head)?
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
             gpu(&tmap.embed)?
-        };
+        });
 
         // ── Contabilidade de VRAM/memória ────────────────────────────────────
         // Estimativa: BF16 = 2 bytes/elem, F32 = 4 bytes/elem
@@ -783,7 +784,7 @@ impl CausalLM {
             }
         };
 
-        let mut vram_bytes = bf16_bytes(&embed) + bf16_bytes(&lm_head);
+        let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
         for l in &layers {
             vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk) + layer_weight_bytes(&l.wv)
                         + layer_weight_bytes(&l.wo) + layer_weight_bytes(&l.wgate)
@@ -1079,19 +1080,28 @@ impl CausalLM {
             _ => None,
         };
 
-        // lm_head em BF16 (não quantizar)
-        let lm_head = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
-            gpu_bf16(&tmap.lm_head)?
+        // lm_head: Q4 quantizado (mesma otimização que pesos de camada)
+        let lm_head_name = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+            tmap.lm_head.clone()
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            gpu_bf16(&tmap.embed)?
+            tmap.embed.clone()
         };
+        log::info!("  → lm_head (Q4)");
+        let lm_head = quantize_weight(&lm_head_name)?;
 
         // ── Contabilidade de VRAM (com quantização) ──────────────────────────
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
         let f32_bytes = |t: &AnyTensor| t.numel() * 4;
 
-        let mut vram_bytes = bf16_bytes(&embed) + bf16_bytes(&lm_head);
+        let lm_head_bytes = match &lm_head {
+            LayerWeight::Bf16(t) => bf16_bytes(t),
+            LayerWeight::Q4(qt) => {
+                let [rows, cols] = qt.shape;
+                rows * cols / 2 + rows * (cols / qt.group_size) * 8
+            }
+        };
+        let mut vram_bytes = bf16_bytes(&embed) + lm_head_bytes;
         for l in &layers {
             // Pesos quantizados (Q4): ~1 byte por 2 valores + scales/zeros
             let q4_weight_bytes = |qt: &QuantizedTensor| {
@@ -1463,7 +1473,7 @@ impl CausalLM {
         };
 
         // ── LM head ──────────────────────────────────────────────────────────
-        let lm_head = if !arch.tie_word_embeddings && reader.tensor_meta(&tmap.lm_head).is_ok() {
+        let lm_head = LayerWeight::Bf16(if !arch.tie_word_embeddings && reader.tensor_meta(&tmap.lm_head).is_ok() {
             let meta = reader.tensor_meta(&tmap.lm_head)
                 .map_err(|e| ModelError::Model(format!("LM head não encontrado: {}", e)))?;
             let data = reader.tensor_data(&tmap.lm_head)
@@ -1481,7 +1491,6 @@ impl CausalLM {
                 }
                 _ => {
                     log::warn!("⚠️  LM head com dtype não-BF16, usando embed_tokens (tied)");
-                    // Reload embedding as fallback
                     let embed_data = reader.tensor_data(&tmap.embed)
                         .map_err(|e| ModelError::Model(format!("Embedding fallback: {}", e)))?;
                     bf16_from_bytes(embed_data)?
@@ -1489,11 +1498,10 @@ impl CausalLM {
             }
         } else {
             log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            // Reload embedding as fallback
             let embed_data = reader.tensor_data(&tmap.embed)
                 .map_err(|e| ModelError::Model(format!("Embedding fallback: {}", e)))?;
             bf16_from_bytes(embed_data)?
-        };
+        });
 
         // ── Contabilidade de VRAM ────────────────────────────────────────────
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
@@ -1510,7 +1518,7 @@ impl CausalLM {
             }
         };
 
-        let mut vram_bytes = bf16_bytes(&embed) + bf16_bytes(&lm_head);
+        let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
         for l in &layers {
             vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk) + layer_weight_bytes(&l.wv)
                         + layer_weight_bytes(&l.wo) + layer_weight_bytes(&l.wgate)
@@ -2287,19 +2295,13 @@ impl CausalLM {
         )?;
 
         // ── lm_head (apenas o último token) ──────────────────────────────────
-        // lm_head SEMPRE em BF16 (não quantizável — muito sensível)
+        // Suporta BF16 (load normal) ou Q4 (load_quantized): dispatch via project()
         // a_offset aponta para o último token: (n-1) * hidden_size
-        self.backend.gemm_bf16_f32(&GemmBf16Params {
-            m: 1,
-            n: vocab,
-            k: h,
-            alpha: 1.0,
-            beta: 0.0,
-            a: &self.scratch.normed,
-            a_offset: (n - 1) * h,
-            b: &self.lm_head,
-            c: &self.scratch.logits,
-        })?;
+        Self::project(
+            &self.backend, &self.lm_head,
+            &self.scratch.normed, &self.scratch.logits,
+            1, vocab, h, (n - 1) * h, 0.0,
+        )?;
 
         // ── Download logits: único to_host() de todo o forward ───────────────
         let logits = self.backend.download_f32(&self.scratch.logits);
@@ -2793,17 +2795,11 @@ impl CausalLM {
         )?;
 
         // ── lm_head ──
-        self.backend.gemm_bf16_f32(&GemmBf16Params {
-            m: 1,
-            n: vocab,
-            k: h,
-            alpha: 1.0,
-            beta: 0.0,
-            a: &self.scratch.normed,
-            a_offset: (n - 1) * h,
-            b: &self.lm_head,
-            c: &self.scratch.logits,
-        })?;
+        Self::project(
+            &self.backend, &self.lm_head,
+            &self.scratch.normed, &self.scratch.logits,
+            1, vocab, h, (n - 1) * h, 0.0,
+        )?;
 
         // ── Download logits ──
         let logits = self.backend.download_f32(&self.scratch.logits);

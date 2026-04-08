@@ -165,6 +165,7 @@ pub struct GemvQ4Params<'a> {
     pub zeros: &'a AnyTensor,      // [n, k/group_size] F32 zero-points por grupo
     pub group_size: usize,         // tipicamente 128
     pub x: &'a AnyTensor,          // [m, k] F32 ativações
+    pub x_offset: usize,           // offset em floats para x (para selecionar token específico)
     pub out: &'a AnyTensor,        // [m, n] F32 saída
     pub beta: f32,                 // 0.0 sobrescreve, 1.0 acumula (residual)
 }

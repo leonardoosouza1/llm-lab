@@ -401,12 +401,14 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4(&self, p: &GemvQ4Params) -> Result<(), BackendError> {
         // GEMV dequantizado: pesos INT4 comprimido × ativações F32 → F32
+        // x_offset permite selecionar token específico (ex: lm_head usa último token)
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
         unsafe {
             self.kernels.dequant_gemv_q4(
                 u8_ptr(p.packed),
                 f32_ptr(p.scales),
                 f32_ptr(p.zeros),
-                f32_ptr(p.x),
+                x_ptr,
                 f32_mut_ptr(p.out),
                 p.m as i32,
                 p.n as i32,
