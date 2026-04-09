@@ -272,6 +272,9 @@ pub struct FusedQkvParams<'a> {
     pub out_q: &'a AnyTensor,    // [Nq] Q output
     pub out_k: &'a AnyTensor,    // [Nk] K output
     pub out_v: &'a AnyTensor,    // [Nv] V output
+    pub bias_q: Option<&'a AnyTensor>,  // [Nq] Q bias or None
+    pub bias_k: Option<&'a AnyTensor>,  // [Nk] K bias or None
+    pub bias_v: Option<&'a AnyTensor>,  // [Nv] V bias or None
     pub nq: usize,               // Q output dim
     pub nk: usize,               // K output dim
     pub nv: usize,               // V output dim

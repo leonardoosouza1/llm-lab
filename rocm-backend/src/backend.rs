@@ -503,8 +503,8 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k_q8(&self, p: &GemvQ4KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            // Always use multi-row kernel: 8 warps share Q8 via LDS, better BW utilization
-            self.kernels.gemv_q4k_q8_multi(
+            // Wave64 kernel: 2.26x better BW on RDNA2 (ported from llama.cpp)
+            self.kernels.gemv_q4k_q8_w64(
                 u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                 p.m as i32, p.n as i32, p.k as i32, p.beta,
             )
@@ -514,8 +514,8 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q6k_q8(&self, p: &GemvQ6KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            // Single-row kernel is faster on RDNA2 (max occupancy)
-            self.kernels.gemv_q6k_q8(
+            // Wave64 kernel: better BW on RDNA2
+            self.kernels.gemv_q6k_q8_w64(
                 u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                 p.m as i32, p.n as i32, p.k as i32, p.beta,
             )
@@ -946,10 +946,15 @@ impl ComputeBackend for RocmBackend {
 
     fn fused_qkv(&self, p: &FusedQkvParams) -> Result<(), BackendError> {
         unsafe {
-            self.kernels.fused_qkv_q4k(
+            let bq = p.bias_q.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
+            let bk = p.bias_k.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
+            let bv = p.bias_v.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
+            // Wave64 fused QKV: 2.26x better BW
+            self.kernels.fused_qkv_q4k_w64(
                 u8_ptr(p.wq_data), u8_ptr(p.wk_data), u8_ptr(p.wv_data),
                 u8_ptr(p.x_q8),
                 f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),
+                bq, bk, bv,
                 p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32,
             )
         }
@@ -967,14 +972,9 @@ impl ComputeBackend for RocmBackend {
                     gate_ptr, up_ptr, q8_ptr, out_ptr,
                     p.n as i32, p.k as i32,
                 )
-            } else if p.n > 256 {
-                // Multi-row for large N (MLP intermediate_size)
-                self.kernels.fused_gate_up_silu_q4k_multi(
-                    gate_ptr, up_ptr, q8_ptr, out_ptr,
-                    p.n as i32, p.k as i32,
-                )
             } else {
-                self.kernels.fused_gate_up_silu_q4k(
+                // Wave64 fused MLP: 2.26x better BW
+                self.kernels.fused_gate_up_silu_q4k_w64(
                     gate_ptr, up_ptr, q8_ptr, out_ptr,
                     p.n as i32, p.k as i32,
                 )

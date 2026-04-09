@@ -2119,7 +2119,7 @@ impl CausalLM {
         static PROF_FINAL: AtomicU64 = AtomicU64::new(0);  // final norm + lm_head
         static PROF_DONE: AtomicBool = AtomicBool::new(false);
         let tok_num = PROF_TOKEN.fetch_add(1, AO::Relaxed);
-        let do_section_prof = tok_num >= 3 && tok_num < 13; // Profile decode tokens 3-12 (skip prompt eval)
+        let do_section_prof = false; // DISABLED — use GREEDY timing for benchmarks
         // Also keep old profile for backwards compat
         let do_profile = false;
         let forward_t0: Option<std::time::Instant> = None;
@@ -2197,6 +2197,9 @@ impl CausalLM {
                             wq_data: dq, wk_data: dk, wv_data: dv,
                             x_q8: self.scratch.q8_scratch.as_ref().unwrap(),
                             out_q: &self.scratch.q, out_k: &self.scratch.k, out_v: &self.scratch.v,
+                            bias_q: layer.q_bias.as_ref(),
+                            bias_k: layer.k_bias.as_ref(),
+                            bias_v: layer.v_bias.as_ref(),
                             nq: qd, nk: kd, nv: kd, k: h,
                         }).is_ok()
                     }
@@ -2255,30 +2258,32 @@ impl CausalLM {
 
             prof_sync!("qkv_done");
             section_time!(PROF_QKV, _sec_t0);
-            // Biases opcionais (Qwen2/2.5)
-            if let Some(ref bias) = layer.q_bias {
-                self.backend.add_bias_inplace(&AddBiasParams {
-                    tensor: &self.scratch.q,
-                    bias,
-                    n_tokens: n,
-                    dim: qd,
-                })?;
-            }
-            if let Some(ref bias) = layer.k_bias {
-                self.backend.add_bias_inplace(&AddBiasParams {
-                    tensor: &self.scratch.k,
-                    bias,
-                    n_tokens: n,
-                    dim: kd,
-                })?;
-            }
-            if let Some(ref bias) = layer.v_bias {
-                self.backend.add_bias_inplace(&AddBiasParams {
-                    tensor: &self.scratch.v,
-                    bias,
-                    n_tokens: n,
-                    dim: kd,
-                })?;
+            // Biases: fused into fused_qkv kernel when active, otherwise separate launches
+            if !fused_qkv_ok {
+                if let Some(ref bias) = layer.q_bias {
+                    self.backend.add_bias_inplace(&AddBiasParams {
+                        tensor: &self.scratch.q,
+                        bias,
+                        n_tokens: n,
+                        dim: qd,
+                    })?;
+                }
+                if let Some(ref bias) = layer.k_bias {
+                    self.backend.add_bias_inplace(&AddBiasParams {
+                        tensor: &self.scratch.k,
+                        bias,
+                        n_tokens: n,
+                        dim: kd,
+                    })?;
+                }
+                if let Some(ref bias) = layer.v_bias {
+                    self.backend.add_bias_inplace(&AddBiasParams {
+                        tensor: &self.scratch.v,
+                        bias,
+                        n_tokens: n,
+                        dim: kd,
+                    })?;
+                }
             }
 
             // ── QK Normalization (Qwen3) ─────────────────────────────────────

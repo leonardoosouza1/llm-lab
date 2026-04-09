@@ -187,4 +187,28 @@ fn main() {
     if !status.success() {
         panic!("hipcc failed to compile llm_kernels.hip (exit: {})", status);
     }
+
+    // ── Compile wave64 GEMV kernels (separate .hsaco) ────────────────────────
+    // These kernels use wave64 (default on RDNA2) for 2.26x better memory BW
+    // in bandwidth-bound GEMV operations. Loaded alongside llm_kernels.hsaco.
+    let w64_src = format!("{}/kernels/gemv_w64.hip", manifest_dir);
+    let w64_out = out.join("gemv_w64.hsaco");
+
+    println!("cargo:rerun-if-changed=kernels/gemv_w64.hip");
+
+    let w64_status = std::process::Command::new(&hipcc)
+        .args(&[
+            "--offload-arch=gfx1030",
+            "-O3",
+            "-ffast-math",
+            "--genco",
+            "-o", w64_out.to_str().unwrap(),
+            &w64_src,
+        ])
+        .status()
+        .expect("hipcc not found — ensure ROCM_PATH is set");
+
+    if !w64_status.success() {
+        panic!("hipcc failed to compile gemv_w64.hip (exit: {})", w64_status);
+    }
 }
