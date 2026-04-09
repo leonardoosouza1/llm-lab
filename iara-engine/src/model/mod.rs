@@ -2104,26 +2104,38 @@ impl CausalLM {
             }
 
             // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
-            Self::apply_norm(
-                &self.backend, norm_type,
-                &self.scratch.x, &layer.input_norm_w, None,
-                &self.scratch.normed, n, h, eps,
-            )?;
-            prof_sync!("norm");
-
-            // ── Q, K, V projections (BF16/Q4 pesos × F32 ativações → F32) ──────
-            // Q/K/V escrevem em buffers independentes → sem sync entre eles.
-            // Todos os kernels seguintes (bias, QK-norm, RoPE, KV-cache, SGEMM)
-            // rodam no mesmo HIP stream default → ordem garantida pelo hardware.
-            log::trace!("layer {layer_idx}: wq+wk+wv n={n} qd={qd} kd={kd} h={h}");
-            // Pre-quantize normed activations once for all 3 QKV projections
-            let qkv_q8_pre = if n == 1 {
+            // Try fused RMSNorm+Quantize (1 launch vs 2) for decode
+            let qkv_q8_pre = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
-                    Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
-                    true
+                    if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
+                        input: &self.scratch.x, weight: &layer.input_norm_w,
+                        out_f32: &self.scratch.normed, out_q8: q8,
+                        hidden_size: h, eps,
+                    }).is_ok() {
+                        static FUSED_NQ_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !FUSED_NQ_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("FUSED NORM+Q8: active (h={})", h);
+                        }
+                        true
+                    } else {
+                        Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.input_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                        Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                        true
+                    }
+                } else {
+                    Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.input_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                    false
+                }
+            } else {
+                Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.input_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                if n == 1 {
+                    if let Some(q8) = self.scratch.q8_scratch.as_ref() {
+                        Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                        true
+                    } else { false }
                 } else { false }
-            } else { false };
-            prof_sync!("q8_qkv");
+            };
+            prof_sync!("norm+q8");
 
             // Try fused QKV kernel (1 launch vs 3) for decode with Q4K weights
             static FUSED_QKV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2519,12 +2531,28 @@ impl CausalLM {
             Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             prof_sync!("wo_done");
-            // ── Post-attention Normalization ───────────────────────────────────
-            Self::apply_norm(
-                &self.backend, norm_type,
-                &self.scratch.x, &layer.post_attn_norm_w, None,
-                &self.scratch.normed, n, h, eps,
-            )?;
+            // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
+            let mlp_q8_pre = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
+                if let Some(q8) = self.scratch.q8_scratch.as_ref() {
+                    if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
+                        input: &self.scratch.x, weight: &layer.post_attn_norm_w,
+                        out_f32: &self.scratch.normed, out_q8: q8,
+                        hidden_size: h, eps,
+                    }).is_ok() {
+                        true
+                    } else {
+                        Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.post_attn_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                        Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                        true
+                    }
+                } else {
+                    Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.post_attn_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                    false
+                }
+            } else {
+                Self::apply_norm(&self.backend, norm_type, &self.scratch.x, &layer.post_attn_norm_w, None, &self.scratch.normed, n, h, eps)?;
+                false
+            };
 
             // ── MLP: Dense, Calibration, or Sparse path ─────────────────────────
             //
@@ -2661,8 +2689,10 @@ impl CausalLM {
                 // ── DENSE MLP PATH (also used for calibration) ─────────────────
                 log::trace!("layer {layer_idx}: wgate+wup n={n} it={it} h={h}");
 
-                // Pre-quantize normed for gate+up (same input)
-                let gu_q8_pre = if n == 1 {
+                // Pre-quantize normed for gate+up (reuse from fused norm+q8 if available)
+                let gu_q8_pre = if mlp_q8_pre {
+                    true  // already quantized by fused_rms_norm_quantize
+                } else if n == 1 {
                     if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                         Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
                         true

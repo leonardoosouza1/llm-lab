@@ -8,7 +8,7 @@ use compute_core::{
         QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
-        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams,
+        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };

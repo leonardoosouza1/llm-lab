@@ -1173,7 +1173,7 @@ impl GpuKernels {
         hidden: i32,
         eps: f32,
     ) -> Result<(), HipError> {
-        let block_size = 1024i32.min(hidden.next_power_of_two());
+        let block_size = 1024i32.min((hidden as u32).next_power_of_two() as i32);
         let grid = (1u32, 1, 1);
         let block = (block_size as u32, 1, 1);
         let shared_bytes = ((block_size + hidden) as u32) * 4; // reduction + normed buf

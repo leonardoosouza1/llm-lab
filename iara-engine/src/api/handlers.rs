@@ -864,26 +864,25 @@ async fn generate_internal(
     }
 
     let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
-    let mut sampling_buf = SamplingBuffer::with_vocab_size(
-        state.qwen_model.lock().await.as_ref().map(|m| m.cfg.vocab_size).unwrap_or(152_000)
-    );
 
-    for step in 0..req.max_tokens {
-        let (tok_id, tok_str) = {
-            let mut model_guard = state.qwen_model.lock().await;
-            let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
-                .map_err(|e| format!("Forward pass error: {}", e))?
-        };
+    // Hold mutex for entire decode loop — avoids per-token lock/unlock overhead
+    {
+        let mut model_guard = state.qwen_model.lock().await;
+        let model = model_guard.as_mut().ok_or("Model not loaded")?;
+        let mut sampling_buf = SamplingBuffer::with_vocab_size(model.cfg.vocab_size);
 
-        decode_token = tok_id;
-        last_token   = decode_token;
-        if !eos_ids.contains(&last_token) {
-            generated_text.push_str(&tok_str);
+        for _step in 0..req.max_tokens {
+            let (tok_id, tok_str) = forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
+                .map_err(|e| format!("Forward pass error: {}", e))?;
+
+            decode_token = tok_id;
+            last_token   = decode_token;
+            if !eos_ids.contains(&last_token) {
+                generated_text.push_str(&tok_str);
+            }
+            eval_count += 1;
+            if eos_ids.contains(&last_token) { break; }
         }
-        eval_count += 1;
-        if eos_ids.contains(&last_token) { break; }
-        let _ = step;
     }
 
     brain_trace.finalize();
