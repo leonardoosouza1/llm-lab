@@ -104,12 +104,20 @@ pub fn forward_traced_buffered(
 
 /// Fast decode step — skips top_logits and layer_traces for maximum throughput.
 /// Returns only (token_id, token_str). Avoids 152K Vec allocation per token.
+/// When temperature < 0.001 (greedy), uses GPU argmax to skip CPU sampling entirely.
 pub fn forward_decode_fast(
     model: &mut CausalLM,
     token_ids: &[u32],
     sampling: &SamplingParams,
     sampling_buf: &mut SamplingBuffer,
 ) -> ModelResult<(u32, String)> {
+    // Greedy mode: use GPU argmax (skip expensive logits download + CPU sampling)
+    if sampling.temperature < 0.001 {
+        let token_id = model.forward_greedy(token_ids)?;
+        let token_str = tokenizer::token_id_to_text(token_id);
+        return Ok((token_id, token_str));
+    }
+
     let (logits, _layer_traces) = model.forward(token_ids, None)?;
     let token_id  = sample_token_buffered(&logits, sampling, sampling_buf);
     let token_str = tokenizer::token_id_to_text(token_id);

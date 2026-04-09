@@ -162,6 +162,11 @@ pub fn hip_module_get_function(m: hipModule_t, name: &str) -> Result<hipFunction
 /// # Safety
 /// - `func` deve ser uma função válida de um módulo carregado
 /// - `args` deve conter ponteiros para os argumentos do kernel na ordem correta
+/// Global kernel launch counter for profiling
+static LAUNCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn get_launch_count() -> u64 { LAUNCH_COUNT.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn reset_launch_count() { LAUNCH_COUNT.store(0, std::sync::atomic::Ordering::Relaxed); }
+
 pub unsafe fn hip_launch_kernel(
     func: hipFunction_t,
     grid: (u32, u32, u32),
@@ -170,6 +175,7 @@ pub unsafe fn hip_launch_kernel(
     stream: hipStream_t,
     args: &mut [*mut std::ffi::c_void],
 ) -> Result<(), HipError> {
+    LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     hip_check(hipModuleLaunchKernel(
         func,
         grid.0,
@@ -187,6 +193,60 @@ pub unsafe fn hip_launch_kernel(
 
 pub unsafe fn hip_module_unload(m: hipModule_t) -> Result<(), HipError> {
     hip_check(hipModuleUnload(m))
+}
+
+// ── Graph capture ────────────────────────────────────────────────────────────
+
+/// Relaxed capture mode — no cross-stream serialization
+pub const CAPTURE_MODE_RELAXED: hipStreamCaptureMode =
+    hipStreamCaptureMode_hipStreamCaptureModeRelaxed;
+
+pub unsafe fn hip_stream_begin_capture(
+    stream: hipStream_t,
+    mode: hipStreamCaptureMode,
+) -> Result<(), HipError> {
+    hip_check(hipStreamBeginCapture(stream, mode))
+}
+
+pub unsafe fn hip_stream_end_capture(stream: hipStream_t) -> Result<hipGraph_t, HipError> {
+    let mut graph: hipGraph_t = ptr::null_mut();
+    hip_check(hipStreamEndCapture(stream, &mut graph))?;
+    Ok(graph)
+}
+
+pub unsafe fn hip_graph_instantiate(graph: hipGraph_t) -> Result<hipGraphExec_t, HipError> {
+    let mut exec: hipGraphExec_t = ptr::null_mut();
+    hip_check(hipGraphInstantiate(
+        &mut exec,
+        graph,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        0,
+    ))?;
+    Ok(exec)
+}
+
+pub unsafe fn hip_graph_launch(exec: hipGraphExec_t, stream: hipStream_t) -> Result<(), HipError> {
+    hip_check(hipGraphLaunch(exec, stream))
+}
+
+pub unsafe fn hip_graph_exec_update(
+    exec: hipGraphExec_t,
+    graph: hipGraph_t,
+) -> Result<bool, HipError> {
+    let mut error_node: hipGraphNode_t = ptr::null_mut();
+    let mut result: hipGraphExecUpdateResult = 0;
+    let err = hipGraphExecUpdate(exec, graph, &mut error_node, &mut result);
+    hip_check(err)?;
+    Ok(result == 0) // 0 = hipGraphExecUpdateSuccess
+}
+
+pub unsafe fn hip_graph_destroy(graph: hipGraph_t) -> Result<(), HipError> {
+    hip_check(hipGraphDestroy(graph))
+}
+
+pub unsafe fn hip_graph_exec_destroy(exec: hipGraphExec_t) -> Result<(), HipError> {
+    hip_check(hipGraphExecDestroy(exec))
 }
 
 // ── RAII DeviceBuffer ─────────────────────────────────────────────────────────

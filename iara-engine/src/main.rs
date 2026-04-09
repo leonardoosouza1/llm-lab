@@ -333,7 +333,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .with_state(app_state);
 
-    let http_addr: std::net::SocketAddr = "0.0.0.0:3000".parse()?;
+    let http_addr: std::net::SocketAddr = std::env::var("IARA_HTTP_PORT")
+        .ok()
+        .and_then(|p| format!("0.0.0.0:{}", p).parse().ok())
+        .unwrap_or_else(|| "0.0.0.0:3000".parse().unwrap());
     log::info!("🌐 HTTP em http://localhost:3000");
     log::info!("📦 Nenhum modelo carregado. Selecione um no painel do frontend.");
 

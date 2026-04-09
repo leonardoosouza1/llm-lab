@@ -1,7 +1,7 @@
 //! Safe wrappers for HIP LLM inference kernels.
 //!
 //! Kernels are compiled from `kernels/llm_kernels.hip` by `build.rs` using
-//!   hipcc --offload-arch=gfx1032 -O3 -o $OUT_DIR/llm_kernels.hsaco kernels/llm_kernels.hip
+//!   hipcc --offload-arch=gfx1031 -O3 -mwavefrontsize32 -ffast-math --genco -o $OUT_DIR/llm_kernels.hsaco kernels/llm_kernels.hip
 //!
 //! The resulting `.hsaco` (HIP Shader Archive Code Object) is embedded at
 //! compile-time via `include_bytes!`.  The embedding will only succeed after
@@ -15,7 +15,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::raw::{hipFunction_t, hipModule_t};
+use crate::raw::{hipFunction_t, hipModule_t, hipStream_t};
 use crate::safe::{
     hip_launch_kernel, hip_module_get_function, hip_module_load_data, hip_module_unload, HipError,
 };
@@ -42,6 +42,7 @@ static KERNEL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/llm_kerne
 /// concurrent launches (e.g. via a Mutex or by using separate streams).
 pub struct GpuKernels {
     module: hipModule_t,
+    stream: hipStream_t, // dedicated stream for all kernel launches
     fn_embed_lookup: hipFunction_t,
     fn_rms_norm: hipFunction_t,
     fn_add_bias: hipFunction_t,
@@ -147,6 +148,7 @@ impl GpuKernels {
 
         Ok(Self {
             module,
+            stream: ptr::null_mut(), // default stream; call set_stream() to change
             fn_embed_lookup,
             fn_rms_norm,
             fn_add_bias,
@@ -187,6 +189,16 @@ impl GpuKernels {
             fn_fused_gate_up_silu_q4k_multi,
             fn_argmax_f32,
         })
+    }
+
+    /// Set the HIP stream for all subsequent kernel launches.
+    pub fn set_stream(&mut self, stream: hipStream_t) {
+        self.stream = stream;
+    }
+
+    /// Get the current stream.
+    pub fn get_stream(&self) -> hipStream_t {
+        self.stream
     }
 }
 
@@ -271,7 +283,7 @@ impl GpuKernels {
             grid,
             block,
             0,               // no dynamic shared memory
-            ptr::null_mut(), // default stream
+            self.stream,
             &mut [
                 &mut p_embed as *mut *const u16 as *mut std::ffi::c_void,
                 &mut p_token_ids as *mut *const u32 as *mut std::ffi::c_void,
@@ -321,7 +333,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
@@ -365,7 +377,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_x as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_bias as *mut *const f32 as *mut std::ffi::c_void,
@@ -412,7 +424,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_x as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_n_heads as *mut i32 as *mut std::ffi::c_void,
@@ -458,7 +470,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_gate as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_up as *mut *const f32 as *mut std::ffi::c_void,
@@ -510,7 +522,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_scores as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
@@ -552,7 +564,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_scores as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
@@ -604,7 +616,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_cache as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_new_kv as *mut *const f32 as *mut std::ffi::c_void,
@@ -634,7 +646,7 @@ impl GpuKernels {
             (grid_x, 1, 1),
             (block_x, 1, 1),
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
@@ -699,7 +711,7 @@ impl GpuKernels {
             grid,
             block,
             shared_mem,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_scales as *mut *const f32 as *mut std::ffi::c_void,
@@ -753,7 +765,7 @@ impl GpuKernels {
             grid,
             block,
             shared_mem,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
@@ -801,7 +813,7 @@ impl GpuKernels {
             grid,
             block,
             shared_mem,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
@@ -842,7 +854,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_out as *mut *mut u8 as *mut std::ffi::c_void,
@@ -885,7 +897,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
@@ -919,6 +931,8 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = (((n + 7) / 8) as u32, m.max(1) as u32, 1);
         let block = (32u32, 8, 1);  // 8 warps per block
+        let nq8 = k / 32;
+        let shared_bytes = (nq8 * 36) as u32;  // Q8_1 blocks in LDS
 
         let mut p_data = data;
         let mut p_x_q8 = x_q8;
@@ -932,8 +946,8 @@ impl GpuKernels {
             self.fn_gemv_q4k_q8_multi,
             grid,
             block,
-            0,  // shared mem dynamically allocated in kernel via __shared__
-            ptr::null_mut(),
+            shared_bytes,
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
@@ -980,7 +994,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
@@ -1023,7 +1037,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
@@ -1064,7 +1078,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
@@ -1100,7 +1114,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
@@ -1123,6 +1137,8 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = (((n + 7) / 8) as u32, 1, 1);
         let block = (32u32, 8, 1);
+        let nq8 = k / 32;
+        let shared_bytes = (nq8 * 36) as u32;
 
         let mut p_gate = gate_data;
         let mut p_up = up_data;
@@ -1135,8 +1151,8 @@ impl GpuKernels {
             self.fn_fused_gate_up_silu_q4k_multi,
             grid,
             block,
-            0,
-            ptr::null_mut(),
+            shared_bytes,
+            self.stream,
             &mut [
                 &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
                 &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
@@ -1163,11 +1179,16 @@ impl GpuKernels {
         out_q: *mut f32,
         out_k: *mut f32,
         out_v: *mut f32,
+        bias_q: *const f32,  // nullptr = no bias
+        bias_k: *const f32,
+        bias_v: *const f32,
         nq: i32, nk: i32, nv: i32, k: i32,
     ) -> Result<(), HipError> {
         let total = nq + nk + nv;
         let grid = (((total + 7) / 8) as u32, 1, 1);
         let block = (32u32, 8, 1);
+        let nq8 = k / 32;
+        let shared_bytes = (nq8 * 36) as u32;
 
         let mut p_wq = wq_data;
         let mut p_wk = wk_data;
@@ -1176,6 +1197,9 @@ impl GpuKernels {
         let mut p_oq = out_q;
         let mut p_ok = out_k;
         let mut p_ov = out_v;
+        let mut p_bq = bias_q;
+        let mut p_bk = bias_k;
+        let mut p_bv = bias_v;
         let mut p_nq = nq;
         let mut p_nk = nk;
         let mut p_nv = nv;
@@ -1185,20 +1209,23 @@ impl GpuKernels {
             self.fn_fused_qkv_q4k,
             grid,
             block,
-            0,
-            ptr::null_mut(),
+            shared_bytes,
+            self.stream,
             &mut [
-                &mut p_wq as *mut *const u8 as *mut std::ffi::c_void,
-                &mut p_wk as *mut *const u8 as *mut std::ffi::c_void,
-                &mut p_wv as *mut *const u8 as *mut std::ffi::c_void,
-                &mut p_x  as *mut *const u8 as *mut std::ffi::c_void,
-                &mut p_oq as *mut *mut f32  as *mut std::ffi::c_void,
-                &mut p_ok as *mut *mut f32  as *mut std::ffi::c_void,
-                &mut p_ov as *mut *mut f32  as *mut std::ffi::c_void,
-                &mut p_nq as *mut i32       as *mut std::ffi::c_void,
-                &mut p_nk as *mut i32       as *mut std::ffi::c_void,
-                &mut p_nv as *mut i32       as *mut std::ffi::c_void,
-                &mut p_k  as *mut i32       as *mut std::ffi::c_void,
+                &mut p_wq as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wk as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wv as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_x  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_oq as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ok as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ov as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_bq as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bk as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bv as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nq as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nk as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nv as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k  as *mut i32        as *mut std::ffi::c_void,
             ],
         )
     }
@@ -1235,7 +1262,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_x  as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_w  as *mut *const f32 as *mut std::ffi::c_void,
@@ -1282,7 +1309,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_q  as *mut *mut f32   as *mut std::ffi::c_void,
                 &mut p_k  as *mut *mut f32   as *mut std::ffi::c_void,
@@ -1337,7 +1364,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_attn_weights as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_value_norms as *mut *const f32 as *mut std::ffi::c_void,
@@ -1384,7 +1411,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_values as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_norms_out as *mut *mut f32 as *mut std::ffi::c_void,
@@ -1429,7 +1456,7 @@ impl GpuKernels {
             (grid_x, 1, 1),
             (block_x, 1, 1),
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_f_proj as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_g_proj as *mut *const f32 as *mut std::ffi::c_void,
@@ -1483,7 +1510,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_cache as *mut *mut u8 as *mut std::ffi::c_void,
                 &mut p_scales as *mut *mut f32 as *mut std::ffi::c_void,
@@ -1524,7 +1551,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_a as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_b as *mut *const f32 as *mut std::ffi::c_void,
@@ -1584,7 +1611,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_output as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_input as *mut *const f32 as *mut std::ffi::c_void,
@@ -1648,7 +1675,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_cache_q as *mut *mut i8 as *mut std::ffi::c_void,
                 &mut p_cache_scales as *mut *mut f32 as *mut std::ffi::c_void,
@@ -1702,7 +1729,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_cache_q as *mut *const i8 as *mut std::ffi::c_void,
                 &mut p_cache_scales as *mut *const f32 as *mut std::ffi::c_void,
@@ -1746,7 +1773,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_src as *mut *const u16 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
@@ -1790,7 +1817,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_src as *mut *const u16 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
@@ -1832,7 +1859,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_hidden as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_forks as *mut *const f32 as *mut std::ffi::c_void,
@@ -1870,7 +1897,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_coh as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_idx as *mut *mut i32 as *mut std::ffi::c_void,
@@ -1924,7 +1951,7 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_q as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_k as *mut *const f32 as *mut std::ffi::c_void,
@@ -1972,7 +1999,7 @@ impl GpuKernels {
             grid,
             block,
             0,
-            ptr::null_mut(),
+            self.stream,
             &mut [
                 &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut i32 as *mut std::ffi::c_void,

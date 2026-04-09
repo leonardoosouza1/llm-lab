@@ -1,15 +1,18 @@
-// llm_kernels.hip — HIP GPU kernels for LLM inference on AMD RDNA2 (GFX1032).
-// Compiled with: hipcc --offload-arch=gfx1032 -O3 -o llm_kernels.hsaco llm_kernels.hip
+// llm_kernels.hip — HIP GPU kernels for LLM inference on AMD RDNA2 (GFX1031).
+// Compiled with: hipcc --offload-arch=gfx1031 -O3 -mwavefrontsize32 -ffast-math --genco
 //
 // All kernels are extern "C" __global__ so Rust can resolve them by name via
 // hipModuleGetFunction after loading the .hsaco with hipModuleLoadData.
 //
-// RDNA2 notes:
-//   - Wavefront (warp) size: 64 threads
+// RDNA2 notes (RX 6750 XT / Navi22 / gfx1031):
+//   - Wavefront (warp) size: 32 threads (native wave32)
+//   - 40 CUs, 2 SIMDs per CU, max 32 waves per CU
 //   - Max shared memory per block: 64 KB
-//   - Block sizes must be powers of 2 (64, 128, 256, 512, 1024)
+//   - Infinity Cache: 96 MB (effective BW ~900 GB/s for data < 96MB)
+//   - GDDR6 BW: 432 GB/s (192-bit @ 18 Gbps)
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <math.h>
 
 // ---------------------------------------------------------------------------
@@ -494,40 +497,10 @@ extern "C" __global__ void f32_to_bf16(
 
 // ---------------------------------------------------------------------------
 // Helper: FP16 (stored as uint16_t) → float
-// IEEE 754 half-precision: 1 sign + 5 exponent + 10 mantissa.
-// Conversão portável via manipulação de bits — sem inline asm.
+// Uses hardware v_cvt_f32_f16 instruction on RDNA2 (1 cycle, no branches).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float fp16_to_f32(unsigned short bits) {
-    unsigned int sign = (unsigned int)(bits >> 15) << 31;
-    unsigned int exp  = (bits >> 10) & 0x1F;
-    unsigned int mant = bits & 0x3FF;
-
-    unsigned int f32_bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            // ±0
-            f32_bits = sign;
-        } else {
-            // Subnormal FP16 → normal F32
-            exp = 1;
-            while ((mant & 0x400) == 0) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x3FF;
-            f32_bits = sign | ((127 - 15 + exp) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1F) {
-        // Inf / NaN
-        f32_bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        // Normal
-        f32_bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-
-    float f;
-    __builtin_memcpy(&f, &f32_bits, sizeof(f));
-    return f;
+    return __half2float(*reinterpret_cast<const __half*>(&bits));
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1110,7 @@ extern "C" __global__ void fused_rms_norm_quantize(
 }
 
 // ---------------------------------------------------------------------------
-// Scale/min unpacking for Q4_K (6-bit packed scales)
+// Scale/min unpacking for Q4_K (6-bit packed scales) — branching version
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void unpack_scale_min_k4(
     int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
@@ -1152,15 +1125,40 @@ __device__ __forceinline__ void unpack_scale_min_k4(
 }
 
 // ---------------------------------------------------------------------------
-// Kernel: gemv_q4k_q8 — Q4_K × Q8_1 GEMV with dp4a
+// llama.cpp-style scale/min unpacking via uint16 — branchless for j < 4
+// Returns 2 scales and 2 mins for consecutive sub-block pairs.
+// j = bq8_offset / 2, where bq8_offset = 2 * group
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void unpack_scales_mins_k4_u16(
+    int j, const unsigned char* __restrict__ scales,
+    unsigned char* __restrict__ sc0, unsigned char* __restrict__ m0,
+    unsigned char* __restrict__ sc1, unsigned char* __restrict__ m1
+) {
+    const unsigned short* sc16 = (const unsigned short*)scales;
+    unsigned short aux[2];
+    if (j < 2) {
+        aux[0] = sc16[j + 0] & 0x3f3fu;
+        aux[1] = sc16[j + 2] & 0x3f3fu;
+    } else {
+        aux[0] = ((sc16[j + 2] >> 0) & 0x0f0fu) | ((sc16[j - 2] & 0xc0c0u) >> 2);
+        aux[1] = ((sc16[j + 2] >> 4) & 0x0f0fu) | ((sc16[j + 0] & 0xc0c0u) >> 2);
+    }
+    const unsigned char* a = (const unsigned char*)aux;
+    *sc0 = a[0]; *sc1 = a[1];
+    *m0  = a[2]; *m1  = a[3];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_q4k_q8 — Q4_K × Q8_1 GEMV with dp4a + VDR2
 //
 // Each warp (32 threads) handles one output row's dot product.
-// Thread layout: 4 groups of 8 threads per Q4_K block.
+// VDR=2: processes 2 Q4_K blocks per iteration for better memory pipelining.
+// No inner-loop shuffles: each lane accumulates independently.
 //
 // Grid : (N, M, 1)
-// Block: (32, 1, 1) — single warp on RDNA2
+// Block: (32, 1, 1) — single warp on RDNA2, max occupancy
 // ---------------------------------------------------------------------------
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 1)
 extern "C" __global__ void gemv_q4k_q8(
     const unsigned char* __restrict__ w_data,  // [N * nblk * 144] raw Q4_K
     const unsigned char* __restrict__ x_q8,    // [M * (K/32) * 36] Q8_1 blocks
@@ -1172,71 +1170,66 @@ extern "C" __global__ void gemv_q4k_q8(
     const int mi  = blockIdx.y;
     if (row >= N || mi >= M) return;
 
-    const int lane = threadIdx.x;  // 0..31
-
-    const int nblk = K / 256;  // Q4_K blocks per row
+    const int lane = threadIdx.x;
+    const int nblk = K / 256;
     const unsigned char* __restrict__ row_w = w_data + (size_t)row * nblk * 144;
     const unsigned char* __restrict__ x_base = x_q8 + (size_t)mi * (K / 32) * 36;
 
     float acc = 0.0f;
+    const int group = lane >> 3;
+    const int lane_g = lane & 7;
 
-    // Thread mapping: lane → group (0..3), position within group (0..7)
-    const int group = lane >> 3;       // 0..3
-    const int lane_g = lane & 7;       // 0..7 (each handles 4 bytes)
+    // VDR=2: process two Q4K blocks per iteration for better MLP
+    for (int blk = 0; blk < nblk; blk += 2) {
+        // ── Block A ──
+        const unsigned char* bp_a = row_w + blk * 144;
+        const float d_a    = fp16_load(bp_a + 0);
+        const float dmin_a = fp16_load(bp_a + 2);
+        unsigned char sc_lo_a, m_lo_a, sc_hi_a, m_hi_a;
+        unpack_scale_min_k4(2 * group,     bp_a + 4, &sc_lo_a, &m_lo_a);
+        unpack_scale_min_k4(2 * group + 1, bp_a + 4, &sc_hi_a, &m_hi_a);
+        const int q4a = *(const int*)(bp_a + 16 + group * 32 + lane_g * 4);
+        const int q8l_a = blk * 8 + 2 * group, q8h_a = q8l_a + 1;
+        const unsigned char* q8lp_a = x_base + (size_t)q8l_a * 36;
+        const unsigned char* q8hp_a = x_base + (size_t)q8h_a * 36;
+        const float d8l_a = fp16_to_f32(*(const unsigned short*)q8lp_a);
+        const float d8h_a = fp16_to_f32(*(const unsigned short*)q8hp_a);
+        const int ul_a = *(const int*)(q8lp_a + 4 + lane_g * 4);
+        const int uh_a = *(const int*)(q8hp_a + 4 + lane_g * 4);
 
-    for (int blk = 0; blk < nblk; blk++) {
-        const unsigned char* bp = row_w + blk * 144;
-        const float d    = fp16_load(bp + 0);
-        const float dmin = fp16_load(bp + 2);
-
-        // Unpack 6-bit scales for low and high nibble sub-groups
-        unsigned char sc_lo, m_lo, sc_hi, m_hi;
-        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
-        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
-
-        // Load 4 qs bytes → extract low and high nibbles as packed int32
-        const int q4_packed = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
-        const int q4_lo = q4_packed & 0x0F0F0F0F;
-        const int q4_hi = (q4_packed >> 4) & 0x0F0F0F0F;
-
-        // Corresponding Q8_1 blocks for low/high nibbles
-        const int q8_lo_idx = blk * 8 + 2 * group;
-        const int q8_hi_idx = blk * 8 + 2 * group + 1;
-
-        const unsigned char* q8_lo_bp = x_base + (size_t)q8_lo_idx * 36;
-        const unsigned char* q8_hi_bp = x_base + (size_t)q8_hi_idx * 36;
-
-        const float d8_lo = fp16_to_f32(*(const unsigned short*)(q8_lo_bp + 0));
-        const float d8_hi = fp16_to_f32(*(const unsigned short*)(q8_hi_bp + 0));
-
-        // Load 4 Q8_1 int8 values as packed int32
-        const int u_lo = *(const int*)(q8_lo_bp + 4 + lane_g * 4);
-        const int u_hi = *(const int*)(q8_hi_bp + 4 + lane_g * 4);
-
-        // dp4a: dot product of 4 packed int8 pairs
-        const int dot_lo = dp4a(q4_lo, u_lo, 0);
-        const int dot_hi = dp4a(q4_hi, u_hi, 0);
-
-        // Sum of Q8 values for min correction
-        const int sum_lo = dp4a(0x01010101, u_lo, 0);
-        const int sum_hi = dp4a(0x01010101, u_hi, 0);
-
-        // Warp reduce within each group: 8 lanes → lane_g=0
-        int rd_lo = dot_lo, rd_hi = dot_hi, rs_lo = sum_lo, rs_hi = sum_hi;
-        for (int off = 4; off >= 1; off >>= 1) {
-            rd_lo += __shfl_down(rd_lo, off);
-            rd_hi += __shfl_down(rd_hi, off);
-            rs_lo += __shfl_down(rs_lo, off);
-            rs_hi += __shfl_down(rs_hi, off);
+        // ── Block B (if exists) ──
+        if (blk + 1 < nblk) {
+            const unsigned char* bp_b = row_w + (blk + 1) * 144;
+            const float d_b    = fp16_load(bp_b + 0);
+            const float dmin_b = fp16_load(bp_b + 2);
+            unsigned char sc_lo_b, m_lo_b, sc_hi_b, m_hi_b;
+            unpack_scale_min_k4(2 * group,     bp_b + 4, &sc_lo_b, &m_lo_b);
+            unpack_scale_min_k4(2 * group + 1, bp_b + 4, &sc_hi_b, &m_hi_b);
+            const int q4b = *(const int*)(bp_b + 16 + group * 32 + lane_g * 4);
+            const int q8l_b = (blk + 1) * 8 + 2 * group, q8h_b = q8l_b + 1;
+            const unsigned char* q8lp_b = x_base + (size_t)q8l_b * 36;
+            const unsigned char* q8hp_b = x_base + (size_t)q8h_b * 36;
+            const float d8l_b = fp16_to_f32(*(const unsigned short*)q8lp_b);
+            const float d8h_b = fp16_to_f32(*(const unsigned short*)q8hp_b);
+            const int ul_b = *(const int*)(q8lp_b + 4 + lane_g * 4);
+            const int uh_b = *(const int*)(q8hp_b + 4 + lane_g * 4);
+            int dot_lo_b = dp4a(q4b & 0x0F0F0F0F, ul_b, 0);
+            int dot_hi_b = dp4a((q4b >> 4) & 0x0F0F0F0F, uh_b, 0);
+            int sum_lo_b = dp4a(0x01010101, ul_b, 0);
+            int sum_hi_b = dp4a(0x01010101, uh_b, 0);
+            acc += d8l_b * (d_b * (float)sc_lo_b * (float)dot_lo_b - dmin_b * (float)m_lo_b * (float)sum_lo_b);
+            acc += d8h_b * (d_b * (float)sc_hi_b * (float)dot_hi_b - dmin_b * (float)m_hi_b * (float)sum_hi_b);
         }
 
-        if (lane_g == 0) {
-            acc += d8_lo * (d * (float)sc_lo * (float)rd_lo - dmin * (float)m_lo * (float)rs_lo);
-            acc += d8_hi * (d * (float)sc_hi * (float)rd_hi - dmin * (float)m_hi * (float)rs_hi);
-        }
+        // ── Block A compute (after B loads issued for pipelining) ──
+        int dot_lo_a = dp4a(q4a & 0x0F0F0F0F, ul_a, 0);
+        int dot_hi_a = dp4a((q4a >> 4) & 0x0F0F0F0F, uh_a, 0);
+        int sum_lo_a = dp4a(0x01010101, ul_a, 0);
+        int sum_hi_a = dp4a(0x01010101, uh_a, 0);
+        acc += d8l_a * (d_a * (float)sc_lo_a * (float)dot_lo_a - dmin_a * (float)m_lo_a * (float)sum_lo_a);
+        acc += d8h_a * (d_a * (float)sc_hi_a * (float)dot_hi_a - dmin_a * (float)m_hi_a * (float)sum_hi_a);
     }
 
-    // Full warp reduce
     for (int off = 16; off >= 1; off >>= 1)
         acc += __shfl_down(acc, off);
 
@@ -1249,15 +1242,18 @@ extern "C" __global__ void gemv_q4k_q8(
 // ---------------------------------------------------------------------------
 // Kernel: gemv_q4k_q8_multi — Multi-row Q4_K × Q8_1 GEMV (8 rows/block)
 //
-// Processes 8 output rows per block. All 8 warps share the Q8_1 input
-// loaded into LDS, eliminating 7/8 of Q8 global memory reads.
-// Critical for large N matrices (lm_head: N=151936, K=1536).
+// Optimized for RDNA2 (wave32, gfx1031):
+//   - Separated d/dmin accumulators (deferred subtraction → fewer float ops)
+//   - Combined d/dmin load as uint32 (1 load instead of 2)
+//   - Integer dot*scale multiply before float conversion (like llama.cpp)
+//   - 8 warps share Q8 input via LDS
+//   - VDR=2 for memory pipelining
 //
 // Grid : (ceil(N/8), M, 1)
 // Block: (32, 8, 1) — 8 warps, each handles one row
 // ---------------------------------------------------------------------------
 #define MULTI_ROWS 8
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 2)
 extern "C" __global__ void gemv_q4k_q8_multi(
     const unsigned char* __restrict__ w_data,  // [N * nblk * 144] raw Q4_K
     const unsigned char* __restrict__ x_q8,    // [M * (K/32) * 36] Q8_1 blocks
@@ -1269,17 +1265,14 @@ extern "C" __global__ void gemv_q4k_q8_multi(
     const int mi  = blockIdx.y;
     if (mi >= M) return;
 
-    const int lane   = threadIdx.x;  // 0..31
+    const int lane   = threadIdx.x;
     const int nblk   = K / 256;
-    const int nq8    = K / 32;       // number of Q8_1 blocks
+    const int nq8    = K / 32;
 
-    // ── Shared memory for Q8_1 input (all warps share) ──
-    // Max K=8960 → nq8=280 → 280*36 = 10080 bytes. Fits in LDS.
-    __shared__ unsigned char x_shared[280 * 36];  // 10080 bytes
+    extern __shared__ unsigned char x_shared[];  // dynamic: nq8 * 36 bytes
 
     const unsigned char* __restrict__ x_base = x_q8 + (size_t)mi * nq8 * 36;
 
-    // Cooperative load of Q8 input into shared memory
     for (int i = threadIdx.y * 32 + threadIdx.x; i < nq8 * 36; i += 256) {
         x_shared[i] = x_base[i];
     }
@@ -1288,55 +1281,70 @@ extern "C" __global__ void gemv_q4k_q8_multi(
     if (row >= N) return;
 
     const unsigned char* __restrict__ row_w = w_data + (size_t)row * nblk * 144;
-    float acc = 0.0f;
 
-    const int group  = lane >> 3;
+    // Separated accumulators: combine at the very end (1 subtraction instead of per-block)
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    const int group  = lane >> 3;   // 0..3
     const int lane_g = lane & 7;
 
-    for (int blk = 0; blk < nblk; blk++) {
-        const unsigned char* bp = row_w + blk * 144;
-        const float d    = fp16_load(bp + 0);
-        const float dmin = fp16_load(bp + 2);
+    // VDR=2: process two Q4K blocks per iteration
+    for (int blk = 0; blk < nblk; blk += 2) {
+        // ── Block A ──
+        const unsigned char* bp_a = row_w + blk * 144;
+        // Combined d/dmin as uint32: 1 load instead of 2 fp16 loads
+        const unsigned int dm_a = *(const unsigned int*)bp_a;
+        const float d_a    = fp16_to_f32((unsigned short)(dm_a & 0xFFFF));
+        const float dmin_a = fp16_to_f32((unsigned short)(dm_a >> 16));
+        unsigned char sc_lo_a, m_lo_a, sc_hi_a, m_hi_a;
+        unpack_scale_min_k4(2 * group,     bp_a + 4, &sc_lo_a, &m_lo_a);
+        unpack_scale_min_k4(2 * group + 1, bp_a + 4, &sc_hi_a, &m_hi_a);
+        const int q4a = *(const int*)(bp_a + 16 + group * 32 + lane_g * 4);
+        const int q8l_a = blk * 8 + 2 * group;
+        const unsigned char* q8lp_a = x_shared + (size_t)q8l_a * 36;
+        const unsigned char* q8hp_a = x_shared + (size_t)(q8l_a + 1) * 36;
+        const float d8l_a = fp16_to_f32(*(const unsigned short*)q8lp_a);
+        const float d8h_a = fp16_to_f32(*(const unsigned short*)q8hp_a);
+        const int ul_a = *(const int*)(q8lp_a + 4 + lane_g * 4);
+        const int uh_a = *(const int*)(q8hp_a + 4 + lane_g * 4);
 
-        unsigned char sc_lo, m_lo, sc_hi, m_hi;
-        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
-        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
-
-        const int q4_packed = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
-        const int q4_lo = q4_packed & 0x0F0F0F0F;
-        const int q4_hi = (q4_packed >> 4) & 0x0F0F0F0F;
-
-        const int q8_lo_idx = blk * 8 + 2 * group;
-        const int q8_hi_idx = blk * 8 + 2 * group + 1;
-
-        // Read Q8 from shared memory instead of global
-        const unsigned char* q8_lo_bp = x_shared + (size_t)q8_lo_idx * 36;
-        const unsigned char* q8_hi_bp = x_shared + (size_t)q8_hi_idx * 36;
-
-        const float d8_lo = fp16_to_f32(*(const unsigned short*)(q8_lo_bp + 0));
-        const float d8_hi = fp16_to_f32(*(const unsigned short*)(q8_hi_bp + 0));
-
-        const int u_lo = *(const int*)(q8_lo_bp + 4 + lane_g * 4);
-        const int u_hi = *(const int*)(q8_hi_bp + 4 + lane_g * 4);
-
-        const int dot_lo = dp4a(q4_lo, u_lo, 0);
-        const int dot_hi = dp4a(q4_hi, u_hi, 0);
-        const int sum_lo = dp4a(0x01010101, u_lo, 0);
-        const int sum_hi = dp4a(0x01010101, u_hi, 0);
-
-        int rd_lo = dot_lo, rd_hi = dot_hi, rs_lo = sum_lo, rs_hi = sum_hi;
-        for (int off = 4; off >= 1; off >>= 1) {
-            rd_lo += __shfl_down(rd_lo, off);
-            rd_hi += __shfl_down(rd_hi, off);
-            rs_lo += __shfl_down(rs_lo, off);
-            rs_hi += __shfl_down(rs_hi, off);
+        // ── Block B (if exists) — load while A data in flight ──
+        if (blk + 1 < nblk) {
+            const unsigned char* bp_b = row_w + (blk + 1) * 144;
+            const unsigned int dm_b = *(const unsigned int*)bp_b;
+            const float d_b    = fp16_to_f32((unsigned short)(dm_b & 0xFFFF));
+            const float dmin_b = fp16_to_f32((unsigned short)(dm_b >> 16));
+            unsigned char sc_lo_b, m_lo_b, sc_hi_b, m_hi_b;
+            unpack_scale_min_k4(2 * group,     bp_b + 4, &sc_lo_b, &m_lo_b);
+            unpack_scale_min_k4(2 * group + 1, bp_b + 4, &sc_hi_b, &m_hi_b);
+            const int q4b = *(const int*)(bp_b + 16 + group * 32 + lane_g * 4);
+            const int q8l_b = (blk + 1) * 8 + 2 * group;
+            const unsigned char* q8lp_b = x_shared + (size_t)q8l_b * 36;
+            const unsigned char* q8hp_b = x_shared + (size_t)(q8l_b + 1) * 36;
+            const float d8l_b = fp16_to_f32(*(const unsigned short*)q8lp_b);
+            const float d8h_b = fp16_to_f32(*(const unsigned short*)q8hp_b);
+            const int ul_b = *(const int*)(q8lp_b + 4 + lane_g * 4);
+            const int uh_b = *(const int*)(q8hp_b + 4 + lane_g * 4);
+            // Integer dot*scale, then float (like llama.cpp: fewer float ops)
+            int dot_lo_b = dp4a(q4b & 0x0F0F0F0F, ul_b, 0);
+            int dot_hi_b = dp4a((q4b >> 4) & 0x0F0F0F0F, uh_b, 0);
+            int sum_lo_b = dp4a(0x01010101, ul_b, 0);
+            int sum_hi_b = dp4a(0x01010101, uh_b, 0);
+            sumf_d += d_b * (d8l_b * (float)(dot_lo_b * (int)sc_lo_b) + d8h_b * (float)(dot_hi_b * (int)sc_hi_b));
+            sumf_m += dmin_b * (d8l_b * (float)(sum_lo_b * (int)m_lo_b) + d8h_b * (float)(sum_hi_b * (int)m_hi_b));
         }
 
-        if (lane_g == 0) {
-            acc += d8_lo * (d * (float)sc_lo * (float)rd_lo - dmin * (float)m_lo * (float)rs_lo);
-            acc += d8_hi * (d * (float)sc_hi * (float)rd_hi - dmin * (float)m_hi * (float)rs_hi);
-        }
+        // ── Block A compute ──
+        int dot_lo_a = dp4a(q4a & 0x0F0F0F0F, ul_a, 0);
+        int dot_hi_a = dp4a((q4a >> 4) & 0x0F0F0F0F, uh_a, 0);
+        int sum_lo_a = dp4a(0x01010101, ul_a, 0);
+        int sum_hi_a = dp4a(0x01010101, uh_a, 0);
+        sumf_d += d_a * (d8l_a * (float)(dot_lo_a * (int)sc_lo_a) + d8h_a * (float)(dot_hi_a * (int)sc_hi_a));
+        sumf_m += dmin_a * (d8l_a * (float)(sum_lo_a * (int)m_lo_a) + d8h_a * (float)(sum_hi_a * (int)m_hi_a));
     }
+
+    float acc = sumf_d - sumf_m;
 
     for (int off = 16; off >= 1; off >>= 1)
         acc += __shfl_down(acc, off);
@@ -1358,7 +1366,7 @@ extern "C" __global__ void gemv_q4k_q8_multi(
 // Grid : (N, M, 1)
 // Block: (32, 1, 1) — single warp per row
 // ---------------------------------------------------------------------------
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 1)
 extern "C" __global__ void gemv_q6k_q8(
     const unsigned char* __restrict__ w_data,  // [N * nblk * 210] raw Q6_K
     const unsigned char* __restrict__ x_q8,    // [M * (K/32) * 36] Q8_1 blocks
@@ -1522,14 +1530,15 @@ extern "C" __global__ void gemv_q6k_q8_multi(
 #undef MULTI_ROWS_Q6
 
 // ---------------------------------------------------------------------------
-// Kernel: fused_qkv_q4k — Fused Q+K+V projection in a single kernel
+// Kernel: fused_qkv_q4k — Fused Q+K+V projection + optional bias in a single kernel
 //
 // Computes Q, K, V projections from the same Q8_1 input in one launch.
 // Virtual row space: [0..Nq) → Q, [Nq..Nq+Nk) → K, [Nq+Nk..Nq+Nk+Nv) → V
 // 8 warps per block share Q8 input via LDS.
+// Bias pointers can be nullptr (no bias applied).
 //
 // For qwen2.5-1.5b: Nq=1536, Nk=256, Nv=256, K=1536 → 2048 total rows, 256 blocks
-// Saves 2 kernel launches per layer (28 layers × 2 = 56 launches/token saved).
+// Saves 5 kernel launches per layer (28 layers × 5 = 140 launches/token saved).
 //
 // Grid : (ceil((Nq+Nk+Nv)/8), 1, 1)
 // Block: (32, 8, 1) — 8 warps
@@ -1544,6 +1553,9 @@ extern "C" __global__ void fused_qkv_q4k(
     float*               __restrict__ out_q,    // [Nq] Q output
     float*               __restrict__ out_k,    // [Nk] K output
     float*               __restrict__ out_v,    // [Nv] V output
+    const float*         __restrict__ bias_q,   // [Nq] or nullptr
+    const float*         __restrict__ bias_k,   // [Nk] or nullptr
+    const float*         __restrict__ bias_v,   // [Nv] or nullptr
     int Nq, int Nk, int Nv, int K
 ) {
     const int total_N = Nq + Nk + Nv;
@@ -1553,7 +1565,7 @@ extern "C" __global__ void fused_qkv_q4k(
     const int nq8  = K / 32;
 
     // ── Cooperative load of Q8 input into shared memory ──
-    __shared__ unsigned char x_shared[280 * 36];  // max K=8960
+    extern __shared__ unsigned char x_shared[];  // dynamic: nq8 * 36 bytes
     for (int i = threadIdx.y * 32 + threadIdx.x; i < nq8 * 36; i += 256) {
         x_shared[i] = x_q8[i];
     }
@@ -1564,19 +1576,23 @@ extern "C" __global__ void fused_qkv_q4k(
     // Determine which matrix this virtual row belongs to
     const unsigned char* __restrict__ row_w;
     float* out_ptr;
+    const float* bias_ptr;
     int local_row;
     if (vrow < Nq) {
         local_row = vrow;
         row_w = wq_data + (size_t)local_row * nblk * 144;
         out_ptr = out_q;
+        bias_ptr = bias_q;
     } else if (vrow < Nq + Nk) {
         local_row = vrow - Nq;
         row_w = wk_data + (size_t)local_row * nblk * 144;
         out_ptr = out_k;
+        bias_ptr = bias_k;
     } else {
         local_row = vrow - Nq - Nk;
         row_w = wv_data + (size_t)local_row * nblk * 144;
         out_ptr = out_v;
+        bias_ptr = bias_v;
     }
 
     float acc = 0.0f;
@@ -1613,25 +1629,18 @@ extern "C" __global__ void fused_qkv_q4k(
         const int sum_lo = dp4a(0x01010101, u_lo, 0);
         const int sum_hi = dp4a(0x01010101, u_hi, 0);
 
-        int rd_lo = dot_lo, rd_hi = dot_hi, rs_lo = sum_lo, rs_hi = sum_hi;
-        for (int off = 4; off >= 1; off >>= 1) {
-            rd_lo += __shfl_down(rd_lo, off);
-            rd_hi += __shfl_down(rd_hi, off);
-            rs_lo += __shfl_down(rs_lo, off);
-            rs_hi += __shfl_down(rs_hi, off);
-        }
-
-        if (lane_g == 0) {
-            acc += d8_lo * (d * (float)sc_lo * (float)rd_lo - dmin * (float)m_lo * (float)rs_lo);
-            acc += d8_hi * (d * (float)sc_hi * (float)rd_hi - dmin * (float)m_hi * (float)rs_hi);
-        }
+        // No inner-loop shuffle
+        acc += d8_lo * (d * (float)sc_lo * (float)dot_lo - dmin * (float)m_lo * (float)sum_lo);
+        acc += d8_hi * (d * (float)sc_hi * (float)dot_hi - dmin * (float)m_hi * (float)sum_hi);
     }
 
     for (int off = 16; off >= 1; off >>= 1)
         acc += __shfl_down(acc, off);
 
     if (lane == 0) {
-        out_ptr[local_row] = acc;
+        float result = acc;
+        if (bias_ptr) result += bias_ptr[local_row];
+        out_ptr[local_row] = result;
     }
 }
 #undef FUSED_QKV_ROWS
@@ -1717,24 +1726,11 @@ extern "C" __global__ void fused_gate_up_silu_q4k(
         int usum_lo = gsum_lo;  // same Q8 input → same sums
         int usum_hi = gsum_hi;
 
-        // ── Intra-group reduction ──
-        for (int off = 4; off >= 1; off >>= 1) {
-            gdot_lo += __shfl_down(gdot_lo, off);
-            gdot_hi += __shfl_down(gdot_hi, off);
-            gsum_lo += __shfl_down(gsum_lo, off);
-            gsum_hi += __shfl_down(gsum_hi, off);
-            udot_lo += __shfl_down(udot_lo, off);
-            udot_hi += __shfl_down(udot_hi, off);
-            usum_lo += __shfl_down(usum_lo, off);
-            usum_hi += __shfl_down(usum_hi, off);
-        }
-
-        if (lane_g == 0) {
-            acc_gate += d8_lo * (gd * (float)gsc_lo * (float)gdot_lo - gdmin * (float)gm_lo * (float)gsum_lo);
-            acc_gate += d8_hi * (gd * (float)gsc_hi * (float)gdot_hi - gdmin * (float)gm_hi * (float)gsum_hi);
-            acc_up   += d8_lo * (ud * (float)usc_lo * (float)udot_lo - udmin * (float)um_lo * (float)usum_lo);
-            acc_up   += d8_hi * (ud * (float)usc_hi * (float)udot_hi - udmin * (float)um_hi * (float)usum_hi);
-        }
+        // No inner-loop shuffle: each lane accumulates independently
+        acc_gate += d8_lo * (gd * (float)gsc_lo * (float)gdot_lo - gdmin * (float)gm_lo * (float)gsum_lo);
+        acc_gate += d8_hi * (gd * (float)gsc_hi * (float)gdot_hi - gdmin * (float)gm_hi * (float)gsum_hi);
+        acc_up   += d8_lo * (ud * (float)usc_lo * (float)udot_lo - udmin * (float)um_lo * (float)usum_lo);
+        acc_up   += d8_hi * (ud * (float)usc_hi * (float)udot_hi - udmin * (float)um_hi * (float)usum_hi);
     }
 
     // Full warp reduce
@@ -1835,15 +1831,13 @@ extern "C" __global__ void fused_gate_up_silu_q6k(
 // ---------------------------------------------------------------------------
 // Kernel: fused_gate_up_silu_q4k_multi — Multi-row fused MLP (8 rows/block)
 //
-// Same as fused_gate_up_silu_q4k but 8 warps per block share Q8 via LDS.
-// Reduces global Q8 reads by 8× and block count from N to ceil(N/8).
-// For N=8960, K=1536: 1120 blocks instead of 8960.
+// Optimized: combined d/dmin load, separated accumulators, int dot*scale.
 //
 // Grid : (ceil(N/8), 1, 1)
-// Block: (32, 8, 1) — 8 warps
+// Block: (32, 8, 1) — 8 warps share Q8 via LDS
 // ---------------------------------------------------------------------------
 #define FUSED_MLP_ROWS 8
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 2)
 extern "C" __global__ void fused_gate_up_silu_q4k_multi(
     const unsigned char* __restrict__ gate_data,
     const unsigned char* __restrict__ up_data,
@@ -1856,8 +1850,7 @@ extern "C" __global__ void fused_gate_up_silu_q4k_multi(
     const int nblk = K / 256;
     const int nq8  = K / 32;
 
-    // Cooperative load Q8 into shared memory
-    __shared__ unsigned char x_shared[280 * 36];  // max K=8960 → 280 Q8 blocks
+    extern __shared__ unsigned char x_shared[];  // dynamic: nq8 * 36 bytes
     for (int i = threadIdx.y * 32 + threadIdx.x; i < nq8 * 36; i += 256) {
         x_shared[i] = x_q8[i];
     }
@@ -1868,76 +1861,100 @@ extern "C" __global__ void fused_gate_up_silu_q4k_multi(
     const unsigned char* __restrict__ gate_row = gate_data + (size_t)row * nblk * 144;
     const unsigned char* __restrict__ up_row   = up_data   + (size_t)row * nblk * 144;
 
-    float acc_gate = 0.0f;
-    float acc_up   = 0.0f;
+    // 4 separated accumulators: gate_d, gate_m, up_d, up_m
+    float gd_acc = 0.0f, gm_acc = 0.0f;
+    float ud_acc = 0.0f, um_acc = 0.0f;
 
     const int group  = lane >> 3;
     const int lane_g = lane & 7;
 
-    for (int blk = 0; blk < nblk; blk++) {
-        // Gate weights
-        const unsigned char* gbp = gate_row + blk * 144;
-        const float gd    = fp16_load(gbp + 0);
-        const float gdmin = fp16_load(gbp + 2);
-        unsigned char gsc_lo, gm_lo, gsc_hi, gm_hi;
-        unpack_scale_min_k4(2 * group,     gbp + 4, &gsc_lo, &gm_lo);
-        unpack_scale_min_k4(2 * group + 1, gbp + 4, &gsc_hi, &gm_hi);
-        const int gq4 = *(const int*)(gbp + 16 + group * 32 + lane_g * 4);
-        const int gq4_lo = gq4 & 0x0F0F0F0F;
-        const int gq4_hi = (gq4 >> 4) & 0x0F0F0F0F;
+    for (int blk = 0; blk < nblk; blk += 2) {
+        // ── Block A ──
+        const unsigned char* gbp_a = gate_row + blk * 144;
+        const unsigned int gdm_a = *(const unsigned int*)gbp_a;
+        const float g_d_a    = fp16_to_f32((unsigned short)(gdm_a & 0xFFFF));
+        const float g_dmin_a = fp16_to_f32((unsigned short)(gdm_a >> 16));
+        unsigned char gsc_lo_a, gm_lo_a, gsc_hi_a, gm_hi_a;
+        unpack_scale_min_k4(2 * group,     gbp_a + 4, &gsc_lo_a, &gm_lo_a);
+        unpack_scale_min_k4(2 * group + 1, gbp_a + 4, &gsc_hi_a, &gm_hi_a);
+        const int gq4_a = *(const int*)(gbp_a + 16 + group * 32 + lane_g * 4);
 
-        // Up weights
-        const unsigned char* ubp = up_row + blk * 144;
-        const float ud    = fp16_load(ubp + 0);
-        const float udmin = fp16_load(ubp + 2);
-        unsigned char usc_lo, um_lo, usc_hi, um_hi;
-        unpack_scale_min_k4(2 * group,     ubp + 4, &usc_lo, &um_lo);
-        unpack_scale_min_k4(2 * group + 1, ubp + 4, &usc_hi, &um_hi);
-        const int uq4 = *(const int*)(ubp + 16 + group * 32 + lane_g * 4);
-        const int uq4_lo = uq4 & 0x0F0F0F0F;
-        const int uq4_hi = (uq4 >> 4) & 0x0F0F0F0F;
+        const unsigned char* ubp_a = up_row + blk * 144;
+        const unsigned int udm_a = *(const unsigned int*)ubp_a;
+        const float u_d_a    = fp16_to_f32((unsigned short)(udm_a & 0xFFFF));
+        const float u_dmin_a = fp16_to_f32((unsigned short)(udm_a >> 16));
+        unsigned char usc_lo_a, um_lo_a, usc_hi_a, um_hi_a;
+        unpack_scale_min_k4(2 * group,     ubp_a + 4, &usc_lo_a, &um_lo_a);
+        unpack_scale_min_k4(2 * group + 1, ubp_a + 4, &usc_hi_a, &um_hi_a);
+        const int uq4_a = *(const int*)(ubp_a + 16 + group * 32 + lane_g * 4);
 
-        // Q8 from shared memory
-        const int q8_lo_idx = blk * 8 + 2 * group;
-        const int q8_hi_idx = blk * 8 + 2 * group + 1;
-        const unsigned char* q8_lo_bp = x_shared + (size_t)q8_lo_idx * 36;
-        const unsigned char* q8_hi_bp = x_shared + (size_t)q8_hi_idx * 36;
-        const float d8_lo = fp16_to_f32(*(const unsigned short*)(q8_lo_bp + 0));
-        const float d8_hi = fp16_to_f32(*(const unsigned short*)(q8_hi_bp + 0));
-        const int u_lo = *(const int*)(q8_lo_bp + 4 + lane_g * 4);
-        const int u_hi = *(const int*)(q8_hi_bp + 4 + lane_g * 4);
+        const int q8l_a = blk * 8 + 2 * group;
+        const unsigned char* q8lp_a = x_shared + (size_t)q8l_a * 36;
+        const unsigned char* q8hp_a = x_shared + (size_t)(q8l_a + 1) * 36;
+        const float d8l_a = fp16_to_f32(*(const unsigned short*)q8lp_a);
+        const float d8h_a = fp16_to_f32(*(const unsigned short*)q8hp_a);
+        const int ul_a = *(const int*)(q8lp_a + 4 + lane_g * 4);
+        const int uh_a = *(const int*)(q8hp_a + 4 + lane_g * 4);
 
-        // dp4a for gate
-        int gdot_lo = dp4a(gq4_lo, u_lo, 0);
-        int gdot_hi = dp4a(gq4_hi, u_hi, 0);
-        int gsum_lo = dp4a(0x01010101, u_lo, 0);
-        int gsum_hi = dp4a(0x01010101, u_hi, 0);
+        // ── Block B (if exists) ──
+        if (blk + 1 < nblk) {
+            const unsigned char* gbp_b = gate_row + (blk + 1) * 144;
+            const unsigned int gdm_b = *(const unsigned int*)gbp_b;
+            const float g_d_b    = fp16_to_f32((unsigned short)(gdm_b & 0xFFFF));
+            const float g_dmin_b = fp16_to_f32((unsigned short)(gdm_b >> 16));
+            unsigned char gsc_lo_b, gm_lo_b, gsc_hi_b, gm_hi_b;
+            unpack_scale_min_k4(2 * group,     gbp_b + 4, &gsc_lo_b, &gm_lo_b);
+            unpack_scale_min_k4(2 * group + 1, gbp_b + 4, &gsc_hi_b, &gm_hi_b);
+            const int gq4_b = *(const int*)(gbp_b + 16 + group * 32 + lane_g * 4);
 
-        // dp4a for up
-        int udot_lo = dp4a(uq4_lo, u_lo, 0);
-        int udot_hi = dp4a(uq4_hi, u_hi, 0);
-        int usum_lo = gsum_lo;
-        int usum_hi = gsum_hi;
+            const unsigned char* ubp_b = up_row + (blk + 1) * 144;
+            const unsigned int udm_b = *(const unsigned int*)ubp_b;
+            const float u_d_b    = fp16_to_f32((unsigned short)(udm_b & 0xFFFF));
+            const float u_dmin_b = fp16_to_f32((unsigned short)(udm_b >> 16));
+            unsigned char usc_lo_b, um_lo_b, usc_hi_b, um_hi_b;
+            unpack_scale_min_k4(2 * group,     ubp_b + 4, &usc_lo_b, &um_lo_b);
+            unpack_scale_min_k4(2 * group + 1, ubp_b + 4, &usc_hi_b, &um_hi_b);
+            const int uq4_b = *(const int*)(ubp_b + 16 + group * 32 + lane_g * 4);
 
-        // Intra-group reduction
-        for (int off = 4; off >= 1; off >>= 1) {
-            gdot_lo += __shfl_down(gdot_lo, off);
-            gdot_hi += __shfl_down(gdot_hi, off);
-            gsum_lo += __shfl_down(gsum_lo, off);
-            gsum_hi += __shfl_down(gsum_hi, off);
-            udot_lo += __shfl_down(udot_lo, off);
-            udot_hi += __shfl_down(udot_hi, off);
-            usum_lo += __shfl_down(usum_lo, off);
-            usum_hi += __shfl_down(usum_hi, off);
+            const int q8l_b = (blk + 1) * 8 + 2 * group;
+            const unsigned char* q8lp_b = x_shared + (size_t)q8l_b * 36;
+            const unsigned char* q8hp_b = x_shared + (size_t)(q8l_b + 1) * 36;
+            const float d8l_b = fp16_to_f32(*(const unsigned short*)q8lp_b);
+            const float d8h_b = fp16_to_f32(*(const unsigned short*)q8hp_b);
+            const int ul_b = *(const int*)(q8lp_b + 4 + lane_g * 4);
+            const int uh_b = *(const int*)(q8hp_b + 4 + lane_g * 4);
+
+            int gdot_lo_b = dp4a(gq4_b & 0x0F0F0F0F, ul_b, 0);
+            int gdot_hi_b = dp4a((gq4_b >> 4) & 0x0F0F0F0F, uh_b, 0);
+            int gsum_lo_b = dp4a(0x01010101, ul_b, 0);
+            int gsum_hi_b = dp4a(0x01010101, uh_b, 0);
+            int udot_lo_b = dp4a(uq4_b & 0x0F0F0F0F, ul_b, 0);
+            int udot_hi_b = dp4a((uq4_b >> 4) & 0x0F0F0F0F, uh_b, 0);
+
+            // Separated accumulators + integer dot*scale
+            gd_acc += g_d_b * (d8l_b * (float)(gdot_lo_b * (int)gsc_lo_b) + d8h_b * (float)(gdot_hi_b * (int)gsc_hi_b));
+            gm_acc += g_dmin_b * (d8l_b * (float)(gsum_lo_b * (int)gm_lo_b) + d8h_b * (float)(gsum_hi_b * (int)gm_hi_b));
+            ud_acc += u_d_b * (d8l_b * (float)(udot_lo_b * (int)usc_lo_b) + d8h_b * (float)(udot_hi_b * (int)usc_hi_b));
+            um_acc += u_dmin_b * (d8l_b * (float)(gsum_lo_b * (int)um_lo_b) + d8h_b * (float)(gsum_hi_b * (int)um_hi_b));
         }
 
-        if (lane_g == 0) {
-            acc_gate += d8_lo * (gd * (float)gsc_lo * (float)gdot_lo - gdmin * (float)gm_lo * (float)gsum_lo);
-            acc_gate += d8_hi * (gd * (float)gsc_hi * (float)gdot_hi - gdmin * (float)gm_hi * (float)gsum_hi);
-            acc_up   += d8_lo * (ud * (float)usc_lo * (float)udot_lo - udmin * (float)um_lo * (float)usum_lo);
-            acc_up   += d8_hi * (ud * (float)usc_hi * (float)udot_hi - udmin * (float)um_hi * (float)usum_hi);
-        }
+        // ── Block A compute ──
+        int gdot_lo_a = dp4a(gq4_a & 0x0F0F0F0F, ul_a, 0);
+        int gdot_hi_a = dp4a((gq4_a >> 4) & 0x0F0F0F0F, uh_a, 0);
+        int gsum_lo_a = dp4a(0x01010101, ul_a, 0);
+        int gsum_hi_a = dp4a(0x01010101, uh_a, 0);
+        int udot_lo_a = dp4a(uq4_a & 0x0F0F0F0F, ul_a, 0);
+        int udot_hi_a = dp4a((uq4_a >> 4) & 0x0F0F0F0F, uh_a, 0);
+
+        gd_acc += g_d_a * (d8l_a * (float)(gdot_lo_a * (int)gsc_lo_a) + d8h_a * (float)(gdot_hi_a * (int)gsc_hi_a));
+        gm_acc += g_dmin_a * (d8l_a * (float)(gsum_lo_a * (int)gm_lo_a) + d8h_a * (float)(gsum_hi_a * (int)gm_hi_a));
+        ud_acc += u_d_a * (d8l_a * (float)(udot_lo_a * (int)usc_lo_a) + d8h_a * (float)(udot_hi_a * (int)usc_hi_a));
+        um_acc += u_dmin_a * (d8l_a * (float)(gsum_lo_a * (int)um_lo_a) + d8h_a * (float)(gsum_hi_a * (int)um_hi_a));
     }
+
+    // Combine: gate = gd - gm, up = ud - um
+    float acc_gate = gd_acc - gm_acc;
+    float acc_up   = ud_acc - um_acc;
 
     for (int off = 16; off >= 1; off >>= 1) {
         acc_gate += __shfl_down(acc_gate, off);

@@ -866,10 +866,11 @@ async fn generate_internal(
     let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
 
     // Hold mutex for entire decode loop — avoids per-token lock/unlock overhead
-    {
+    let decode_ms = {
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
         let mut sampling_buf = SamplingBuffer::with_vocab_size(model.cfg.vocab_size);
+        let decode_start = std::time::Instant::now();
 
         for _step in 0..req.max_tokens {
             let (tok_id, tok_str) = forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
@@ -883,7 +884,13 @@ async fn generate_internal(
             eval_count += 1;
             if eos_ids.contains(&last_token) { break; }
         }
-    }
+        let decode_duration = decode_start.elapsed();
+        let ms = decode_duration.as_millis() as u128;
+        log::warn!("DECODE: {} tokens in {}ms = {:.1} tok/s",
+            eval_count, ms,
+            eval_count as f64 / decode_duration.as_secs_f64());
+        ms
+    };
 
     brain_trace.finalize();
     *state.last_trace.lock().await = Some(brain_trace);
@@ -898,7 +905,7 @@ async fn generate_internal(
         total_duration: total_duration.as_millis(),
         prompt_eval_count,
         eval_count,
-        eval_duration: total_duration.as_millis(),
+        eval_duration: decode_ms,
     })
 }
 

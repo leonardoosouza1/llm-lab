@@ -272,7 +272,9 @@ impl ForwardScratchpad {
         // max_k = max(hidden, intermediate) — covers all projection sizes
         let max_k = h.max(it);
         let q8_bytes = (max_k / 32) * 36;
-        let q8_scratch = if std::env::var("IARA_GGUF_NATIVE").is_ok() {
+        // Always allocate Q8 scratch when native GGUF is active (default)
+        let native_mode = std::env::var("IARA_GGUF_NATIVE").unwrap_or_else(|_| "1".to_string());
+        let q8_scratch = if native_mode != "0" {
             Some(backend.alloc_q4(&[q8_bytes]))
         } else {
             None
@@ -605,6 +607,19 @@ impl CausalLM {
         q8_scratch: Option<&AnyTensor>,
         q8_precomputed: bool,
     ) -> ModelResult<()> {
+        {
+            static PROJ_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !PROJ_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let wtype = match weight {
+                    LayerWeight::Bf16(_) => "BF16",
+                    LayerWeight::Q4(_) => "Q4",
+                    LayerWeight::Q4K { .. } => "Q4K",
+                    LayerWeight::Q6K { .. } => "Q6K",
+                };
+                log::warn!("project() first call: weight={}, m={}, n={}, k={}, q8_scratch={}, precomputed={}",
+                    wtype, m, n, k, q8_scratch.is_some(), q8_precomputed);
+            }
+        }
         match weight {
             LayerWeight::Bf16(w) => {
                 backend.gemm_bf16_f32(&GemmBf16Params {
@@ -636,6 +651,10 @@ impl CausalLM {
             }
             LayerWeight::Q4K { data, n: _, k: _ } => {
                 if let (Some(q8), true) = (q8_scratch, m == 1) {
+                    static Q4K_Q8_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !Q4K_Q8_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!("Q4K path: using Q8 dp4a (m={}, n={}, k={}, precomputed={})", m, n, k, q8_precomputed);
+                    }
                     if !q8_precomputed {
                         backend.quantize_q8(&compute_core::QuantizeQ8Params {
                             x: input, x_offset: a_offset, out: q8, k,
@@ -645,6 +664,10 @@ impl CausalLM {
                         m, n, k, data, x_q8: q8, out: output, beta,
                     })?;
                 } else {
+                    static Q4K_SLOW_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !Q4K_SLOW_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!("Q4K path: SLOW dequant_gemv (m={}, n={}, k={}, q8_scratch={}, m==1={})", m, n, k, q8_scratch.is_some(), m == 1);
+                    }
                     backend.gemv_q4k(&GemvQ4KParams {
                         m,
                         n,
@@ -2022,6 +2045,12 @@ impl CausalLM {
     /// - `token_ids`: token sequence to process
     /// - `layer_budget`: how many layers to use (Fast/Medium/Slow), None = use all
     pub fn forward(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
+        self.forward_inner(token_ids, layer_budget, false)
+    }
+
+    fn forward_inner(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>, skip_logits_download: bool) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
+        let _fwd_t0 = std::time::Instant::now();
+        hip_ffi::safe::reset_launch_count();
         let n    = token_ids.len();
         let h    = self.cfg.hidden_size;
         let nh   = self.cfg.num_heads;
@@ -2076,11 +2105,24 @@ impl CausalLM {
             _ => n_layers - 1,  // Slow or None: use all layers
         };
 
-        // ── Per-operation GPU profiling (IARA_PROFILE=1) ──
-        let do_profile = std::env::var("IARA_PROFILE").map(|v| v == "1").unwrap_or(false) && n == 1;
-        static PROFILE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let do_profile = do_profile && !PROFILE_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
-        let forward_t0 = if do_profile { Some(std::time::Instant::now()) } else { None };
+        // ── Per-section GPU profiling (tokens 3-5, with device_sync per section) ──
+        use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AO};
+        static PROF_TOKEN: AtomicU64 = AtomicU64::new(0);
+        static PROF_NORM: AtomicU64 = AtomicU64::new(0);
+        static PROF_QKV: AtomicU64 = AtomicU64::new(0);
+        static PROF_ROPE_KV: AtomicU64 = AtomicU64::new(0);
+        static PROF_ATTN: AtomicU64 = AtomicU64::new(0);
+        static PROF_WO: AtomicU64 = AtomicU64::new(0);
+        static PROF_POST_NORM: AtomicU64 = AtomicU64::new(0);
+        static PROF_MLP: AtomicU64 = AtomicU64::new(0);
+        static PROF_RESIDUAL: AtomicU64 = AtomicU64::new(0);
+        static PROF_FINAL: AtomicU64 = AtomicU64::new(0);  // final norm + lm_head
+        static PROF_DONE: AtomicBool = AtomicBool::new(false);
+        let tok_num = PROF_TOKEN.fetch_add(1, AO::Relaxed);
+        let do_section_prof = tok_num >= 3 && tok_num < 13; // Profile decode tokens 3-12 (skip prompt eval)
+        // Also keep old profile for backwards compat
+        let do_profile = false;
+        let forward_t0: Option<std::time::Instant> = None;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Check if we should early exit based on budget
@@ -2091,17 +2133,25 @@ impl CausalLM {
                 );
                 break;
             }
-            let _prof_l0 = false;  // disabled: per-op profiling stalls pipeline
-            let _layer_t0: Option<std::time::Instant> = None;  // disabled: per-layer sync inflates 2×
+            let _prof_l0 = false;
+            let _layer_t0: Option<std::time::Instant> = None;
 
             macro_rules! prof_sync {
-                ($label:expr) => {
-                    if _prof_l0 {
+                ($label:expr) => {};
+            }
+
+            // Section profiling: sync GPU and accumulate per-section time
+            macro_rules! section_time {
+                ($accum:ident, $t0:ident) => {
+                    if do_section_prof {
                         self.backend.device_sync();
-                        log::warn!("PROF-L0 {} @ {:?}", $label, _layer_t0.unwrap().elapsed());
+                        let _elapsed = $t0.elapsed().as_micros() as u64;
+                        $accum.fetch_add(_elapsed, AO::Relaxed);
+                        $t0 = std::time::Instant::now();
                     }
                 };
             }
+            let mut _sec_t0 = std::time::Instant::now();
 
             // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
             // Try fused RMSNorm+Quantize (1 launch vs 2) for decode
@@ -2136,6 +2186,7 @@ impl CausalLM {
                 } else { false }
             };
             prof_sync!("norm+q8");
+            section_time!(PROF_NORM, _sec_t0);
 
             // Try fused QKV kernel (1 launch vs 3) for decode with Q4K weights
             static FUSED_QKV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2203,6 +2254,7 @@ impl CausalLM {
             }
 
             prof_sync!("qkv_done");
+            section_time!(PROF_QKV, _sec_t0);
             // Biases opcionais (Qwen2/2.5)
             if let Some(ref bias) = layer.q_bias {
                 self.backend.add_bias_inplace(&AddBiasParams {
@@ -2271,12 +2323,27 @@ impl CausalLM {
 
             // Try fused RoPE + KV copy (1 launch vs 4) for F32 KV decode
             let fused_rope_ok = if n == 1 && matches!(layer.kv_k.mode, kv_cache::KvCacheMode::F32) {
-                self.backend.fused_rope_kv_copy(&compute_core::FusedRopeKvCopyParams {
+                match self.backend.fused_rope_kv_copy(&compute_core::FusedRopeKvCopyParams {
                     q: &self.scratch.q, k: &self.scratch.k, v: &self.scratch.v,
                     kv_k_cache: &layer.kv_k.data, kv_v_cache: &layer.kv_v.data,
                     n_heads: nh, n_kv_heads: nk, head_dim: hd,
                     pos_start, theta, kv_dim: kd, max_seq: self.cfg.max_seq_len,
-                }).is_ok()
+                }) {
+                    Ok(()) => {
+                        static FUSED_ROPE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !FUSED_ROPE_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("FUSED ROPE+KV: active (nh={}, nk={}, hd={})", nh, nk, hd);
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        static FUSED_ROPE_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !FUSED_ROPE_FAIL.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("FUSED ROPE+KV FAILED: {}", e);
+                        }
+                        false
+                    }
+                }
             } else { false };
 
             if !fused_rope_ok {
@@ -2422,6 +2489,7 @@ impl CausalLM {
             // For prefill (n>1): Use separate GEMM+softmax+GEMM (batched or GQA grouped).
 
             prof_sync!("kv_done");
+            section_time!(PROF_ROPE_KV, _sec_t0);
             let use_fused_decode = n == 1 && seq > 0;
             let mut fused_ok = false;
 
@@ -2440,10 +2508,17 @@ impl CausalLM {
                     scale,
                 }) {
                     Ok(()) => {
+                        static FUSED_ATTN_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !FUSED_ATTN_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("FUSED ATTN DECODE: active (nh={}, nk={}, hd={}, seq={})", nh, nk, hd, seq);
+                        }
                         fused_ok = true;
                     }
-                    Err(_) => {
-                        // Fused not available on this backend — use GQA path
+                    Err(e) => {
+                        static FUSED_ATTN_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !FUSED_ATTN_FAIL.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("FUSED ATTN DECODE FAILED: {}", e);
+                        }
                         fused_ok = false;
                     }
                 }
@@ -2543,12 +2618,14 @@ impl CausalLM {
             }
 
             prof_sync!("attn_done");
+            section_time!(PROF_ATTN, _sec_t0);
             // ── Output projection: attn_out × wo^T → x (residual) ─────────────
             // x = x + attn_out × wo^T  (beta=1.0 para acumular em x)
             log::trace!("layer {layer_idx}: wo");
             Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             prof_sync!("wo_done");
+            section_time!(PROF_WO, _sec_t0);
             // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
             let mlp_q8_pre = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
@@ -2572,6 +2649,7 @@ impl CausalLM {
                 false
             };
 
+            section_time!(PROF_POST_NORM, _sec_t0);
             // ── MLP: Dense, Calibration, or Sparse path ─────────────────────────
             //
             // Calibration: during first prefill (n > 1), run dense MLP but intercept
@@ -2780,6 +2858,7 @@ impl CausalLM {
             }
 
             prof_sync!("mlp_done");
+            section_time!(PROF_MLP, _sec_t0);
             // ── DEBUG: dump x after full layer ──
             if std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
                 let x_after = self.backend.download_f32(&self.scratch.x);
@@ -2960,6 +3039,9 @@ impl CausalLM {
         }
 
         // ── Final Normalization ──────────────────────────────────────────────
+        let mut _sec_t0 = std::time::Instant::now();  // re-init for final section
+        let _cpu_layers_done = _fwd_t0.elapsed();
+        // GPU-SYNC measurement DISABLED — 50 device_sync calls destroy pipeline
         if let Some(t0) = forward_t0 {
             self.backend.device_sync();
             log::warn!("PROF layers_done @ {:?}", t0.elapsed());
@@ -2980,39 +3062,109 @@ impl CausalLM {
             self.scratch.q8_scratch.as_ref(), false,
         )?;
 
-        // ── Download logits OR GPU argmax ────────────────────────────────────
+        // Section prof: final norm + lm_head
+        if do_section_prof {
+            self.backend.device_sync();
+            let _elapsed = _sec_t0.elapsed().as_micros() as u64;
+            PROF_FINAL.fetch_add(_elapsed, AO::Relaxed);
+        }
+        // Report section profiling after 3 profiled tokens
+        if tok_num == 13 && !PROF_DONE.swap(true, AO::Relaxed) {
+            let div = 10.0;  // 10 profiled decode tokens
+            let n_layers = self.layers.len() as f64;
+            log::warn!("=== SECTION PROFILE (avg of 3 tokens, {}µs per section per token) ===", "all layers summed");
+            log::warn!("  NORM+Q8:   {:>7.0}µs  ({:.0}µs/layer)", PROF_NORM.load(AO::Relaxed) as f64 / div, PROF_NORM.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  QKV proj:  {:>7.0}µs  ({:.0}µs/layer)", PROF_QKV.load(AO::Relaxed) as f64 / div, PROF_QKV.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  ROPE+KV:   {:>7.0}µs  ({:.0}µs/layer)", PROF_ROPE_KV.load(AO::Relaxed) as f64 / div, PROF_ROPE_KV.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  ATTN:      {:>7.0}µs  ({:.0}µs/layer)", PROF_ATTN.load(AO::Relaxed) as f64 / div, PROF_ATTN.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  WO proj:   {:>7.0}µs  ({:.0}µs/layer)", PROF_WO.load(AO::Relaxed) as f64 / div, PROF_WO.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  POST NORM: {:>7.0}µs  ({:.0}µs/layer)", PROF_POST_NORM.load(AO::Relaxed) as f64 / div, PROF_POST_NORM.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  MLP:       {:>7.0}µs  ({:.0}µs/layer)", PROF_MLP.load(AO::Relaxed) as f64 / div, PROF_MLP.load(AO::Relaxed) as f64 / div / n_layers);
+            log::warn!("  FINAL:     {:>7.0}µs", PROF_FINAL.load(AO::Relaxed) as f64 / div);
+            let total = (PROF_NORM.load(AO::Relaxed) + PROF_QKV.load(AO::Relaxed) + PROF_ROPE_KV.load(AO::Relaxed) + PROF_ATTN.load(AO::Relaxed) + PROF_WO.load(AO::Relaxed) + PROF_POST_NORM.load(AO::Relaxed) + PROF_MLP.load(AO::Relaxed) + PROF_FINAL.load(AO::Relaxed)) as f64 / div;
+            log::warn!("  TOTAL:     {:>7.0}µs/token", total);
+        }
+
+        // ── Download logits (or skip for GPU argmax path) ───────────────────
         if let Some(t0) = forward_t0 {
             self.backend.device_sync();
             log::warn!("PROF lm_head_done @ {:?}", t0.elapsed());
         }
-        let logits = self.backend.download_f32(&self.scratch.logits);
+        let logits = if skip_logits_download {
+            Vec::new()  // logits stay on device for GPU argmax
+        } else {
+            self.backend.download_f32(&self.scratch.logits)
+        };
         if let Some(t0) = forward_t0 {
             log::warn!("PROF logits_download_done @ {:?}", t0.elapsed());
+        }
+
+        // Per-token timing (log every 50 tokens)
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+            static ACCUM_US: AtomicU64 = AtomicU64::new(0);
+            static CPU_DISPATCH_US: AtomicU64 = AtomicU64::new(0);
+            let total_us = _fwd_t0.elapsed().as_micros() as u64;
+            let dispatch_us = _cpu_layers_done.as_micros() as u64;
+            let count = TOKEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            ACCUM_US.fetch_add(total_us, Ordering::Relaxed);
+            CPU_DISPATCH_US.fetch_add(dispatch_us, Ordering::Relaxed);
+            let launches = hip_ffi::safe::get_launch_count();
+            if count % 50 == 0 {
+                let avg_total = ACCUM_US.load(Ordering::Relaxed) as f64 / count as f64;
+                let avg_dispatch = CPU_DISPATCH_US.load(Ordering::Relaxed) as f64 / count as f64;
+                log::warn!("PERF [{} tokens] avg: {:.0}µs total, {:.0}µs cpu-dispatch, {:.0}µs gpu-wait, {} launches/token",
+                    count, avg_total, avg_dispatch, avg_total - avg_dispatch, launches);
+            }
         }
 
         Ok((logits, layer_traces))
     }
 
-    /// Fast greedy forward: runs entire forward pass and returns token_id via GPU argmax.
+    /// Fast greedy forward: full forward pass + GPU argmax = returns token_id.
     /// Skips downloading 608KB of logits — only downloads 4 bytes (the argmax index).
     pub fn forward_greedy(&mut self, token_ids: &[u32]) -> ModelResult<u32> {
+        use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+        static GREEDY_COUNT: AtomicU64 = AtomicU64::new(0);
+        static GRAPH_LOGGED: AtomicBool = AtomicBool::new(false);
+
         let vocab = self.cfg.vocab_size;
+        let count = GREEDY_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // Run full forward which computes logits on device AND downloads them
-        let (logits, _) = self.forward(token_ids, None)?;
+        // Graph capture DISABLED: KV-cache position changes per-token, making graphs
+        // non-replayable without hipGraphExecKernelNodeSetParams for every node.
+        // Focus on other optimizations (async H2D, kernel fusion, etc.)
+        let _ = count;
 
-        // GPU argmax on device tensor (logits still in scratch.logits)
+        // Forward pass — all kernels dispatched to dedicated stream
+        let greedy_t0 = std::time::Instant::now();
+        let launches_before = hip_ffi::safe::get_launch_count();
+        let _ = self.forward_inner(token_ids, None, true)?;
+        let dispatch_us = greedy_t0.elapsed().as_micros();
+        let launches_this_token = hip_ffi::safe::get_launch_count() - launches_before;
+
+        // GPU argmax runs on same stream, so properly ordered.
+        // The argmax D2H copy implicitly syncs and gives us total time.
         match self.backend.gpu_argmax(&self.scratch.logits, vocab) {
             Ok(token_id) => {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    log::warn!("GPU ARGMAX: active (vocab={})", vocab);
+                let total_us = greedy_t0.elapsed().as_micros();
+                static GREEDY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+                static GREEDY_ACCUM_US: AtomicU64 = AtomicU64::new(0);
+                static GREEDY_DISPATCH_US: AtomicU64 = AtomicU64::new(0);
+                let gc = GREEDY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                GREEDY_ACCUM_US.fetch_add(total_us as u64, Ordering::Relaxed);
+                GREEDY_DISPATCH_US.fetch_add(dispatch_us as u64, Ordering::Relaxed);
+                if gc % 50 == 0 {
+                    let avg = GREEDY_ACCUM_US.load(Ordering::Relaxed) as f64 / gc as f64;
+                    let avg_d = GREEDY_DISPATCH_US.load(Ordering::Relaxed) as f64 / gc as f64;
+                    log::warn!("GREEDY [{gc}tok] avg: {avg:.0}µs total ({avg_d:.0}µs dispatch, {:.0}µs GPU+argmax), {:.1} tok/s, {} launches/token",
+                        avg - avg_d, 1_000_000.0 / avg, launches_this_token);
                 }
                 Ok(token_id as u32)
-            }
+            },
             Err(_) => {
-                // Fallback: CPU argmax on downloaded logits
+                let logits = self.backend.download_f32(&self.scratch.logits);
                 Ok(logits.iter()
                     .enumerate()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))

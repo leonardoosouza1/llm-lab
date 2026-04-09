@@ -199,6 +199,16 @@ pub trait ComputeBackend: Send + Sync + 'static {
         Err(BackendError::NotImplemented("gpu_argmax".into()))
     }
 
+    // ── Graph capture (HIP graphs / CUDA graphs) ──────────────────────────────
+
+    /// Begin capturing kernel launches into a graph (instead of executing them).
+    /// Returns false if graph capture is not supported by this backend.
+    fn begin_graph_capture(&self) -> bool { false }
+
+    /// End graph capture, instantiate/update executable, and launch the graph.
+    /// Returns false if graph capture was not active.
+    fn end_graph_capture_and_launch(&self) -> bool { false }
+
     // ── Sync e informações ───────────────────────────────────────────────────
 
     /// Sincroniza o device (equivale a hipDeviceSynchronize / clFinish).

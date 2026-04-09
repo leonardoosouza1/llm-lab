@@ -74,6 +74,18 @@ fn main() {
         // Errors
         .allowlist_function("hipGetErrorString")
         .allowlist_function("hipGetLastError")
+        // Graph capture & replay
+        .allowlist_function("hipStreamBeginCapture")
+        .allowlist_function("hipStreamEndCapture")
+        .allowlist_function("hipStreamIsCapturing")
+        .allowlist_function("hipGraphCreate")
+        .allowlist_function("hipGraphDestroy")
+        .allowlist_function("hipGraphInstantiate")
+        .allowlist_function("hipGraphInstantiateWithFlags")
+        .allowlist_function("hipGraphLaunch")
+        .allowlist_function("hipGraphExecDestroy")
+        .allowlist_function("hipGraphExecUpdate")
+        .allowlist_function("hipblasSetStream")
         // Types
         .allowlist_type("hipError_t")
         .allowlist_type("hipMemcpyKind")
@@ -82,6 +94,13 @@ fn main() {
         .allowlist_type("hipModule_t")
         .allowlist_type("hipFunction_t")
         .allowlist_type("hipDeviceProp_t")
+        .allowlist_type("hipGraph_t")
+        .allowlist_type("hipGraphNode_t")
+        .allowlist_type("hipGraphExec_t")
+        .allowlist_type("hipStreamCaptureMode")
+        .allowlist_type("hipStreamCaptureStatus")
+        .allowlist_type("hipGraphExecUpdateResult")
+        .allowlist_type("hipGraphInstantiateFlags")
         .allowlist_var("hipSuccess")
         .allowlist_var("hipErrorOutOfMemory")
         .allowlist_var("hipErrorInvalidValue")
@@ -118,6 +137,7 @@ fn main() {
         // Functions
         .allowlist_function("hipblasCreate")
         .allowlist_function("hipblasDestroy")
+        .allowlist_function("hipblasSetStream")
         .allowlist_function("hipblasGemmEx")
         .allowlist_function("hipblasSgemmStridedBatched")
         // Types
@@ -155,6 +175,8 @@ fn main() {
         .args(&[
             "--offload-arch=gfx1030",
             "-O3",
+            "-mno-wavefrontsize64",
+            "-ffast-math",
             "--genco",
             "-o", kernel_out.to_str().unwrap(),
             &kernel_src,

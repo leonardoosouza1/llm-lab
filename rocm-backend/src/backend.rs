@@ -87,6 +87,10 @@ pub struct RocmBackend {
     tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
     act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
     argmax_buf: hip_ffi::safe::DeviceBuffer<i32>,
+    // HIP stream + graph capture state
+    stream: hip_ffi::raw::hipStream_t,
+    graph_exec: std::sync::Mutex<Option<hip_ffi::raw::hipGraphExec_t>>,
+    capturing: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: `BlasHandle` and `GpuKernels` both declare `unsafe impl Send + Sync`
@@ -102,24 +106,33 @@ impl RocmBackend {
     pub fn probe() -> Result<Self, BackendError> {
         hip_ffi::hip_set_device(0).map_err(|e| BackendError::NotAvailable(format!("HIP: {e}")))?;
 
+        // Create a dedicated stream for all operations (required for graph capture)
+        let stream = hip_ffi::hip_stream_create()
+            .map_err(|e| BackendError::NotAvailable(format!("HIP stream: {e}")))?;
+
         let blas = hip_ffi::BlasHandle::new()
             .map_err(|e| BackendError::NotAvailable(format!("hipBLAS: {e}")))?;
 
-        let kernels = hip_ffi::GpuKernels::new()
+        // Route hipBLAS through our stream
+        blas.set_stream(stream)
+            .map_err(|e| BackendError::NotAvailable(format!("hipBLAS set_stream: {e}")))?;
+
+        let mut kernels = hip_ffi::GpuKernels::new()
             .map_err(|e| BackendError::NotAvailable(format!("GpuKernels: {e}")))?;
 
-        // Pre-allocate a buffer for up to 4096 tokens (max_seq_len) to avoid
-        // VRAM fragmentation (memory leak footprint) during the generation loop.
+        // Route kernel launches through our stream
+        kernels.set_stream(stream);
+
         let tok_buf = hip_ffi::safe::DeviceBuffer::<u32>::alloc(4096)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc: {e}")))?;
 
-        // Pre-allocate BF16 activations buffer for GEMM (max: 4096 seq x 8192 hidden) = 33.5M elems (~67 MB)
         let act_bf16 = hip_ffi::safe::DeviceBuffer::<u16>::alloc(4096 * 8192)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc act_bf16: {e}")))?;
 
-        // Pre-allocate argmax result buffer (1 i32 on device)
         let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
+
+        eprintln!("ROCm backend: using dedicated HIP stream + graph capture support");
 
         Ok(Self {
             blas,
@@ -127,6 +140,9 @@ impl RocmBackend {
             tok_buf: std::sync::Mutex::new(tok_buf),
             act_bf16: std::sync::Mutex::new(act_bf16),
             argmax_buf,
+            stream,
+            graph_exec: std::sync::Mutex::new(None),
+            capturing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -192,7 +208,7 @@ impl ComputeBackend for RocmBackend {
     }
 
     fn device_sync(&self) {
-        hip_ffi::safe::hip_device_sync().ok();
+        unsafe { hip_ffi::hip_stream_sync(self.stream).ok(); }
     }
 
     fn download_bf16_as_f32(&self, t: &AnyTensor) -> Vec<f32> {
@@ -306,9 +322,9 @@ impl ComputeBackend for RocmBackend {
             ));
         }
 
-        // Upload token IDs (host slice) to the pre-allocated GPU buffer.
+        // Upload token IDs (host slice) to the pre-allocated GPU buffer via our stream.
         unsafe {
-            hip_ffi::safe::hip_h2d(buf_guard.as_mut_ptr(), p.token_ids)
+            hip_ffi::safe::hip_h2d_async(buf_guard.as_mut_ptr(), p.token_ids, self.stream)
                 .map_err(|e| BackendError::Transfer(e.to_string()))?;
         }
 
@@ -487,36 +503,22 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k_q8(&self, p: &GemvQ4KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            // Use multi-row kernel for N > 256 (MLP intermediate, lm_head)
-            // 8 warps share Q8 input via LDS, reducing global reads
-            if p.n > 256 && p.m == 1 {
-                self.kernels.gemv_q4k_q8_multi(
-                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
-                    p.m as i32, p.n as i32, p.k as i32, p.beta,
-                )
-            } else {
-                self.kernels.gemv_q4k_q8(
-                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
-                    p.m as i32, p.n as i32, p.k as i32, p.beta,
-                )
-            }
+            // Always use multi-row kernel: 8 warps share Q8 via LDS, better BW utilization
+            self.kernels.gemv_q4k_q8_multi(
+                u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                p.m as i32, p.n as i32, p.k as i32, p.beta,
+            )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn gemv_q6k_q8(&self, p: &GemvQ6KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            if p.n > 256 && p.m == 1 {
-                self.kernels.gemv_q6k_q8_multi(
-                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
-                    p.m as i32, p.n as i32, p.k as i32, p.beta,
-                )
-            } else {
-                self.kernels.gemv_q6k_q8(
-                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
-                    p.m as i32, p.n as i32, p.k as i32, p.beta,
-                )
-            }
+            // Single-row kernel is faster on RDNA2 (max occupancy)
+            self.kernels.gemv_q6k_q8(
+                u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                p.m as i32, p.n as i32, p.k as i32, p.beta,
+            )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
@@ -798,6 +800,80 @@ impl ComputeBackend for RocmBackend {
         let result = self.argmax_buf.to_host()
             .map_err(|e| BackendError::Kernel(e.to_string()))?;
         Ok(result[0])
+    }
+
+    // ── Graph capture ──────────────────────────────────────────────────────────
+
+    fn begin_graph_capture(&self) -> bool {
+        unsafe {
+            match hip_ffi::hip_stream_begin_capture(self.stream, hip_ffi::CAPTURE_MODE_RELAXED) {
+                Ok(()) => {
+                    self.capturing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("graph capture begin failed: {}", e);
+                    false
+                }
+            }
+        }
+    }
+
+    fn end_graph_capture_and_launch(&self) -> bool {
+        if !self.capturing.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        unsafe {
+            // End capture → get graph
+            let graph = match hip_ffi::hip_stream_end_capture(self.stream) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("graph capture end failed: {}", e);
+                    return false;
+                }
+            };
+
+            let mut exec_guard = self.graph_exec.lock().unwrap();
+
+            // Try to update existing exec, or instantiate new one
+            let exec = if let Some(existing) = exec_guard.as_ref() {
+                match hip_ffi::hip_graph_exec_update(*existing, graph) {
+                    Ok(true) => *existing, // update succeeded
+                    _ => {
+                        // Topology changed → re-instantiate
+                        let _ = hip_ffi::hip_graph_exec_destroy(*existing);
+                        match hip_ffi::hip_graph_instantiate(graph) {
+                            Ok(e) => e,
+                            Err(err) => {
+                                eprintln!("graph instantiate failed: {}", err);
+                                let _ = hip_ffi::hip_graph_destroy(graph);
+                                *exec_guard = None;
+                                return false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match hip_ffi::hip_graph_instantiate(graph) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        eprintln!("graph instantiate failed: {}", err);
+                        let _ = hip_ffi::hip_graph_destroy(graph);
+                        return false;
+                    }
+                }
+            };
+
+            *exec_guard = Some(exec);
+
+            // Launch the graph
+            let launch_ok = hip_ffi::hip_graph_launch(exec, self.stream).is_ok();
+
+            // Clean up captured graph (exec retains what it needs)
+            let _ = hip_ffi::hip_graph_destroy(graph);
+
+            launch_ok
+        }
     }
 
     // ── Sync and info ─────────────────────────────────────────────────────────

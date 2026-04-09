@@ -32,6 +32,11 @@ impl BlasHandle {
         unsafe { blas_check(hipblasCreate(&mut handle))? };
         Ok(Self { handle })
     }
+
+    /// Set the stream for all subsequent hipBLAS operations.
+    pub fn set_stream(&self, stream: crate::raw::hipStream_t) -> Result<(), HipError> {
+        unsafe { blas_check(hipblasSetStream(self.handle, stream as _)) }
+    }
 }
 
 impl Drop for BlasHandle {
