@@ -8,7 +8,7 @@ use compute_core::{
         QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
-        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams,
+        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -817,6 +817,19 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn fused_rope_kv_copy(&self, p: &FusedRopeKvCopyParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.fused_rope_kv_copy(
+                f32_mut_ptr(p.q), f32_mut_ptr(p.k), f32_ptr(p.v),
+                f32_mut_ptr(p.kv_k_cache), f32_mut_ptr(p.kv_v_cache),
+                p.n_heads as i32, p.n_kv_heads as i32, p.head_dim as i32,
+                p.pos_start as i32, p.theta,
+                p.kv_dim as i32, p.max_seq as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     fn fused_rms_norm_quantize(&self, p: &FusedRmsNormQuantizeParams) -> Result<(), BackendError> {
         unsafe {
             self.kernels.fused_rms_norm_quantize(
@@ -848,6 +861,12 @@ impl ComputeBackend for RocmBackend {
             let out_ptr = f32_mut_ptr(p.out);
             if is_q6k {
                 self.kernels.fused_gate_up_silu_q6k(
+                    gate_ptr, up_ptr, q8_ptr, out_ptr,
+                    p.n as i32, p.k as i32,
+                )
+            } else if p.n > 256 {
+                // Multi-row for large N (MLP intermediate_size)
+                self.kernels.fused_gate_up_silu_q4k_multi(
                     gate_ptr, up_ptr, q8_ptr, out_ptr,
                     p.n as i32, p.k as i32,
                 )

@@ -2266,24 +2266,37 @@ impl CausalLM {
             }
 
             prof_sync!("bias_done");
-            // ── RoPE (in-place) ───────────────────────────────────────────────
+            // ── RoPE + KV cache append ────────────────────────────────────────
             let pos_start = layer.kv_k.current_len;
-            self.backend.rope_inplace(&RopeParams {
-                tensor: &self.scratch.q,
-                pos_offset: pos_start,
-                n_tokens: n,
-                n_heads: nh,
-                head_dim: hd,
-                theta,
-            })?;
-            self.backend.rope_inplace(&RopeParams {
-                tensor: &self.scratch.k,
-                pos_offset: pos_start,
-                n_tokens: n,
-                n_heads: nk,
-                head_dim: hd,
-                theta,
-            })?;
+
+            // Try fused RoPE + KV copy (1 launch vs 4) for F32 KV decode
+            let fused_rope_ok = if n == 1 && matches!(layer.kv_k.mode, kv_cache::KvCacheMode::F32) {
+                self.backend.fused_rope_kv_copy(&compute_core::FusedRopeKvCopyParams {
+                    q: &self.scratch.q, k: &self.scratch.k, v: &self.scratch.v,
+                    kv_k_cache: &layer.kv_k.data, kv_v_cache: &layer.kv_v.data,
+                    n_heads: nh, n_kv_heads: nk, head_dim: hd,
+                    pos_start, theta, kv_dim: kd, max_seq: self.cfg.max_seq_len,
+                }).is_ok()
+            } else { false };
+
+            if !fused_rope_ok {
+                self.backend.rope_inplace(&RopeParams {
+                    tensor: &self.scratch.q,
+                    pos_offset: pos_start,
+                    n_tokens: n,
+                    n_heads: nh,
+                    head_dim: hd,
+                    theta,
+                })?;
+                self.backend.rope_inplace(&RopeParams {
+                    tensor: &self.scratch.k,
+                    pos_offset: pos_start,
+                    n_tokens: n,
+                    n_heads: nk,
+                    head_dim: hd,
+                    theta,
+                })?;
+            }
 
             // ── DEBUG: dump Q/K after RoPE ──
             if layer_idx == 0 && std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
@@ -2294,7 +2307,10 @@ impl CausalLM {
             }
 
             prof_sync!("rope_done");
-            // ── Append K, V ao KV-cache ───────────────────────────────────────
+            // ── Append K, V ao KV-cache (skip if already done by fused kernel) ──
+            if fused_rope_ok {
+                // Fused kernel already copied K and V to cache
+            } else {
             match layer.kv_k.mode {
                 kv_cache::KvCacheMode::F32 => {
                     self.backend.copy_to_kv_cache(&KvCacheParams {
@@ -2322,7 +2338,6 @@ impl CausalLM {
                     })?;
                 },
             }
-            layer.kv_k.current_len += n;
 
             match layer.kv_v.mode {
                 kv_cache::KvCacheMode::F32 => {
@@ -2351,6 +2366,9 @@ impl CausalLM {
                     })?;
                 },
             }
+            } // end else !fused_rope_ok (KV cache append)
+
+            layer.kv_k.current_len += n;
             layer.kv_v.current_len += n;
 
             let seq = layer.kv_k.current_len;

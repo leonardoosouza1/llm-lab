@@ -237,6 +237,22 @@ pub struct GemvQ6KQ8Params<'a> {
     pub beta: f32,
 }
 
+/// Fused RoPE + KV cache copy: apply RoPE to Q and K, copy K+V to KV cache.
+pub struct FusedRopeKvCopyParams<'a> {
+    pub q: &'a AnyTensor,            // [n_heads * head_dim] — RoPE applied in-place
+    pub k: &'a AnyTensor,            // [n_kv_heads * head_dim] — RoPE applied in-place
+    pub v: &'a AnyTensor,            // [n_kv_heads * head_dim] — copied to cache
+    pub kv_k_cache: &'a AnyTensor,   // [max_seq, kv_dim] — K cache
+    pub kv_v_cache: &'a AnyTensor,   // [max_seq, kv_dim] — V cache
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub pos_start: usize,
+    pub theta: f32,
+    pub kv_dim: usize,
+    pub max_seq: usize,
+}
+
 /// Fused RMSNorm + Quantize Q8_1: normalize and quantize in one kernel launch.
 pub struct FusedRmsNormQuantizeParams<'a> {
     pub input: &'a AnyTensor,     // [hidden] F32 input

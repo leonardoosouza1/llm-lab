@@ -106,6 +106,11 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError>;
     fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError>;
 
+    /// Fused RoPE + KV cache copy: apply RoPE to Q/K, copy K+V to cache (saves 3 launches).
+    fn fused_rope_kv_copy(&self, _p: &FusedRopeKvCopyParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rope_kv_copy".into()))
+    }
+
     /// Fused RMSNorm + Q8 quantize in one kernel (saves 1 launch per norm+quantize pair).
     fn fused_rms_norm_quantize(&self, _p: &FusedRmsNormQuantizeParams) -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("fused_rms_norm_quantize".into()))

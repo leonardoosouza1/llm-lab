@@ -396,6 +396,85 @@ extern "C" __global__ void copy_to_kv_cache(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel: fused_rope_kv_copy — RoPE(Q), RoPE(K), copy K→KV, copy V→KV
+//
+// For decode (n=1): applies RoPE to Q and K in-place, then copies K and V
+// to their respective KV cache positions. Replaces 4 separate kernel launches.
+//
+// Virtual block mapping:
+//   blockIdx.x < n_heads     → RoPE on Q[head]
+//   blockIdx.x >= n_heads    → RoPE on K[kv_head], copy K[kv_head] + V[kv_head]
+//
+// Grid : (n_heads + n_kv_heads, 1, 1)
+// Block: (head_dim, 1, 1)  — threads 0..head_dim/2-1 do RoPE, all do copy
+// ---------------------------------------------------------------------------
+extern "C" __global__ void fused_rope_kv_copy(
+    float*       __restrict__ q,         // [n_heads * head_dim]
+    float*       __restrict__ k,         // [n_kv_heads * head_dim]
+    const float* __restrict__ v,         // [n_kv_heads * head_dim]
+    float*       __restrict__ kv_k_cache,// [max_seq, n_kv_heads * head_dim]
+    float*       __restrict__ kv_v_cache,// [max_seq, n_kv_heads * head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int pos_start,
+    float theta,
+    int kv_dim,      // n_kv_heads * head_dim
+    int max_seq
+) {
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int half_dim = head_dim / 2;
+
+    if (bid < n_heads) {
+        // ── RoPE on Q head ──
+        if (tid < half_dim) {
+            const int head = bid;
+            size_t base = (size_t)head * head_dim;
+            float freq = 1.0f / powf(theta, (2.0f * (float)tid) / (float)head_dim);
+            float angle = (float)pos_start * freq;
+            float c = cosf(angle);
+            float s = sinf(angle);
+            float x0 = q[base + tid];
+            float x1 = q[base + half_dim + tid];
+            q[base + tid]            = x0 * c - x1 * s;
+            q[base + half_dim + tid] = x0 * s + x1 * c;
+        }
+    } else {
+        // ── RoPE on K head + copy K + copy V ──
+        const int kv_head = bid - n_heads;
+        if (kv_head >= n_kv_heads) return;
+
+        size_t k_base = (size_t)kv_head * head_dim;
+
+        // Apply RoPE to K (only threads 0..half_dim-1)
+        if (tid < half_dim) {
+            float freq = 1.0f / powf(theta, (2.0f * (float)tid) / (float)head_dim);
+            float angle = (float)pos_start * freq;
+            float c = cosf(angle);
+            float s = sinf(angle);
+            float x0 = k[k_base + tid];
+            float x1 = k[k_base + half_dim + tid];
+            k[k_base + tid]            = x0 * c - x1 * s;
+            k[k_base + half_dim + tid] = x0 * s + x1 * c;
+        }
+        __syncthreads();  // ensure RoPE completes before copy
+
+        // Copy K[kv_head] to kv_k_cache at position pos_start
+        if (tid < head_dim) {
+            size_t cache_idx = (size_t)pos_start * kv_dim + kv_head * head_dim + tid;
+            kv_k_cache[cache_idx] = k[k_base + tid];
+        }
+
+        // Copy V[kv_head] to kv_v_cache at position pos_start (no RoPE)
+        if (tid < head_dim) {
+            size_t cache_idx = (size_t)pos_start * kv_dim + kv_head * head_dim + tid;
+            kv_v_cache[cache_idx] = v[k_base + tid];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel 8: f32_to_bf16
 // Converter F32 -> BF16
 // ---------------------------------------------------------------------------
@@ -1752,6 +1831,125 @@ extern "C" __global__ void fused_gate_up_silu_q6k(
         out[row] = silu_gate * acc_up;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_gate_up_silu_q4k_multi — Multi-row fused MLP (8 rows/block)
+//
+// Same as fused_gate_up_silu_q4k but 8 warps per block share Q8 via LDS.
+// Reduces global Q8 reads by 8× and block count from N to ceil(N/8).
+// For N=8960, K=1536: 1120 blocks instead of 8960.
+//
+// Grid : (ceil(N/8), 1, 1)
+// Block: (32, 8, 1) — 8 warps
+// ---------------------------------------------------------------------------
+#define FUSED_MLP_ROWS 8
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_gate_up_silu_q4k_multi(
+    const unsigned char* __restrict__ gate_data,
+    const unsigned char* __restrict__ up_data,
+    const unsigned char* __restrict__ x_q8,
+    float*               __restrict__ out,
+    int N, int K
+) {
+    const int row = blockIdx.x * FUSED_MLP_ROWS + threadIdx.y;
+    const int lane = threadIdx.x;
+    const int nblk = K / 256;
+    const int nq8  = K / 32;
+
+    // Cooperative load Q8 into shared memory
+    __shared__ unsigned char x_shared[280 * 36];  // max K=8960 → 280 Q8 blocks
+    for (int i = threadIdx.y * 32 + threadIdx.x; i < nq8 * 36; i += 256) {
+        x_shared[i] = x_q8[i];
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const unsigned char* __restrict__ gate_row = gate_data + (size_t)row * nblk * 144;
+    const unsigned char* __restrict__ up_row   = up_data   + (size_t)row * nblk * 144;
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    const int group  = lane >> 3;
+    const int lane_g = lane & 7;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        // Gate weights
+        const unsigned char* gbp = gate_row + blk * 144;
+        const float gd    = fp16_load(gbp + 0);
+        const float gdmin = fp16_load(gbp + 2);
+        unsigned char gsc_lo, gm_lo, gsc_hi, gm_hi;
+        unpack_scale_min_k4(2 * group,     gbp + 4, &gsc_lo, &gm_lo);
+        unpack_scale_min_k4(2 * group + 1, gbp + 4, &gsc_hi, &gm_hi);
+        const int gq4 = *(const int*)(gbp + 16 + group * 32 + lane_g * 4);
+        const int gq4_lo = gq4 & 0x0F0F0F0F;
+        const int gq4_hi = (gq4 >> 4) & 0x0F0F0F0F;
+
+        // Up weights
+        const unsigned char* ubp = up_row + blk * 144;
+        const float ud    = fp16_load(ubp + 0);
+        const float udmin = fp16_load(ubp + 2);
+        unsigned char usc_lo, um_lo, usc_hi, um_hi;
+        unpack_scale_min_k4(2 * group,     ubp + 4, &usc_lo, &um_lo);
+        unpack_scale_min_k4(2 * group + 1, ubp + 4, &usc_hi, &um_hi);
+        const int uq4 = *(const int*)(ubp + 16 + group * 32 + lane_g * 4);
+        const int uq4_lo = uq4 & 0x0F0F0F0F;
+        const int uq4_hi = (uq4 >> 4) & 0x0F0F0F0F;
+
+        // Q8 from shared memory
+        const int q8_lo_idx = blk * 8 + 2 * group;
+        const int q8_hi_idx = blk * 8 + 2 * group + 1;
+        const unsigned char* q8_lo_bp = x_shared + (size_t)q8_lo_idx * 36;
+        const unsigned char* q8_hi_bp = x_shared + (size_t)q8_hi_idx * 36;
+        const float d8_lo = fp16_to_f32(*(const unsigned short*)(q8_lo_bp + 0));
+        const float d8_hi = fp16_to_f32(*(const unsigned short*)(q8_hi_bp + 0));
+        const int u_lo = *(const int*)(q8_lo_bp + 4 + lane_g * 4);
+        const int u_hi = *(const int*)(q8_hi_bp + 4 + lane_g * 4);
+
+        // dp4a for gate
+        int gdot_lo = dp4a(gq4_lo, u_lo, 0);
+        int gdot_hi = dp4a(gq4_hi, u_hi, 0);
+        int gsum_lo = dp4a(0x01010101, u_lo, 0);
+        int gsum_hi = dp4a(0x01010101, u_hi, 0);
+
+        // dp4a for up
+        int udot_lo = dp4a(uq4_lo, u_lo, 0);
+        int udot_hi = dp4a(uq4_hi, u_hi, 0);
+        int usum_lo = gsum_lo;
+        int usum_hi = gsum_hi;
+
+        // Intra-group reduction
+        for (int off = 4; off >= 1; off >>= 1) {
+            gdot_lo += __shfl_down(gdot_lo, off);
+            gdot_hi += __shfl_down(gdot_hi, off);
+            gsum_lo += __shfl_down(gsum_lo, off);
+            gsum_hi += __shfl_down(gsum_hi, off);
+            udot_lo += __shfl_down(udot_lo, off);
+            udot_hi += __shfl_down(udot_hi, off);
+            usum_lo += __shfl_down(usum_lo, off);
+            usum_hi += __shfl_down(usum_hi, off);
+        }
+
+        if (lane_g == 0) {
+            acc_gate += d8_lo * (gd * (float)gsc_lo * (float)gdot_lo - gdmin * (float)gm_lo * (float)gsum_lo);
+            acc_gate += d8_hi * (gd * (float)gsc_hi * (float)gdot_hi - gdmin * (float)gm_hi * (float)gsum_hi);
+            acc_up   += d8_lo * (ud * (float)usc_lo * (float)udot_lo - udmin * (float)um_lo * (float)usum_lo);
+            acc_up   += d8_hi * (ud * (float)usc_hi * (float)udot_hi - udmin * (float)um_hi * (float)usum_hi);
+        }
+    }
+
+    for (int off = 16; off >= 1; off >>= 1) {
+        acc_gate += __shfl_down(acc_gate, off);
+        acc_up   += __shfl_down(acc_up, off);
+    }
+
+    if (lane == 0) {
+        float silu_gate = acc_gate / (1.0f + expf(-acc_gate));
+        out[row] = silu_gate * acc_up;
+    }
+}
+#undef FUSED_MLP_ROWS
 
 // ---------------------------------------------------------------------------
 // Kernel: fused_attention_decode — Single-token attention in one kernel
