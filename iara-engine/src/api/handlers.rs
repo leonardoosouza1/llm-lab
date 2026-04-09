@@ -21,7 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::debug::brain::BrainTrace;
 use crate::model::{CausalLM, ModelCfg, ModelArchitecture};
-use crate::inference::{forward_traced, forward_traced_buffered, SamplingBuffer};
+use crate::inference::{forward_traced_buffered, forward_decode_fast, SamplingBuffer};
+#[allow(unused_imports)]
+use crate::inference::forward_traced;
 use crate::inference::SamplingParams;
 use crate::storage::iara_format::IaraV2Reader;
 use compute_core::ComputeBackend;
@@ -835,7 +837,7 @@ async fn generate_internal(
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
-    let mut last_token: u32;
+    let mut last_token: u32 = 0;
 
     // Extract EOS token IDs from model architecture
     let eos_ids = {
@@ -846,17 +848,14 @@ async fn generate_internal(
         }
     };
 
-    // Reset KV cache before generation — prevents stale state from previous calls.
+    // Reset KV cache before generation
     {
         let mut guard = state.qwen_model.lock().await;
         let model = guard.as_mut().ok_or("Model not loaded")?;
         model.reset_cache();
     }
 
-    // Prefill em batch: processa tokens 0..n-2 em um único forward pass para popular o KV cache.
-    // forward() já suporta n > 1, processando todos os tokens e atualizando o KV cache por posição.
-    // O último token do prompt é processado pela primeira iteração do decode loop,
-    // que retorna os logits para amostrar o primeiro token gerado.
+    // Prefill em batch
     if prompt_ids.len() > 1 {
         let mut model_guard = state.qwen_model.lock().await;
         let model = model_guard.as_mut().ok_or("Model not loaded")?;
@@ -864,35 +863,27 @@ async fn generate_internal(
             .map_err(|e| format!("Prefill error: {}", e))?;
     }
 
-    // Decode: a primeira iteração processa o último token do prompt → logits para 1º token gerado.
-    // Iterações seguintes processam cada token gerado → logits para o próximo.
     let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
-
-    // Pre-allocate sampling buffer — reused across all decode tokens (zero-alloc hot path)
     let mut sampling_buf = SamplingBuffer::with_vocab_size(
         state.qwen_model.lock().await.as_ref().map(|m| m.cfg.vocab_size).unwrap_or(152_000)
     );
 
     for step in 0..req.max_tokens {
-        let gen_step = {
+        let (tok_id, tok_str) = {
             let mut model_guard = state.qwen_model.lock().await;
             let model = model_guard.as_mut().ok_or("Model not loaded")?;
-            forward_traced_buffered(model, &[decode_token], &sampling, None, &mut sampling_buf)
+            forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
                 .map_err(|e| format!("Forward pass error: {}", e))?
         };
 
-        decode_token = gen_step.token_id;
+        decode_token = tok_id;
         last_token   = decode_token;
-        // Não inclui tokens especiais/EOS no texto visível
         if !eos_ids.contains(&last_token) {
-            generated_text.push_str(&gen_step.token_str);
+            generated_text.push_str(&tok_str);
         }
-        brain_trace.add_step(gen_step);
         eval_count += 1;
-
         if eos_ids.contains(&last_token) { break; }
-
-        let _ = step; // evita warning de variável não usada
+        let _ = step;
     }
 
     brain_trace.finalize();

@@ -25,7 +25,7 @@ use compute_core::{
     ComputeBackend, AnyTensor,
     GemmBf16Params, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
-    AddBiasParams, GemvQ4Params, FusedAttentionDecodeParams,
+    AddBiasParams, GemvQ4Params, GemvQ4KParams, GemvQ6KParams, FusedAttentionDecodeParams,
 };
 use half::bf16;
 use std::collections::HashMap;
@@ -241,6 +241,9 @@ pub struct ForwardScratchpad {
     /// Buffers para dequantização INT8 (se modo INT8 está ativo)
     pub kv_k_deq: Option<AnyTensor>,  // [max_seq, kv_dim] F32 — dequant temp
     pub kv_v_deq: Option<AnyTensor>,  // [max_seq, kv_dim] F32 — dequant temp
+    /// Q8_1 scratch buffer for dp4a GEMV (quantized activations)
+    /// Size: (max_k / 32) * 36 bytes, where max_k = max(hidden, intermediate)
+    pub q8_scratch: Option<AnyTensor>,
 }
 
 impl ForwardScratchpad {
@@ -265,6 +268,16 @@ impl ForwardScratchpad {
             }
         };
 
+        // Q8_1 scratch for dp4a GEMV: needs (max_k / 32) * 36 bytes
+        // max_k = max(hidden, intermediate) — covers all projection sizes
+        let max_k = h.max(it);
+        let q8_bytes = (max_k / 32) * 36;
+        let q8_scratch = if std::env::var("IARA_GGUF_NATIVE").is_ok() {
+            Some(backend.alloc_q4(&[q8_bytes]))
+        } else {
+            None
+        };
+
         Self {
             x:        backend.alloc_f32(&[ms, h]),
             normed:   backend.alloc_f32(&[ms, h]),
@@ -278,6 +291,7 @@ impl ForwardScratchpad {
             logits:   backend.alloc_f32(&[v]),
             kv_k_deq,
             kv_v_deq,
+            q8_scratch,
         }
     }
 }
@@ -472,6 +486,27 @@ pub enum LayerWeight {
     Bf16(AnyTensor),
     /// Tensor INT4 quantizado (packed + scales + zeros no device)
     Q4(QuantizedTensor),
+    /// GGML Q4_K: raw quantized blocks on GPU (144 bytes per 256 values).
+    /// Stores (raw_data_tensor, n_rows, k_dim).
+    Q4K { data: AnyTensor, n: usize, k: usize },
+    /// GGML Q6_K: raw quantized blocks on GPU (210 bytes per 256 values).
+    /// Stores (raw_data_tensor, n_rows, k_dim).
+    Q6K { data: AnyTensor, n: usize, k: usize },
+}
+
+impl LayerWeight {
+    /// Estimated VRAM usage in bytes for this weight tensor.
+    pub fn vram_bytes(&self) -> usize {
+        match self {
+            LayerWeight::Bf16(t) => t.numel() * 2,
+            LayerWeight::Q4(qt) => {
+                let [rows, cols] = qt.shape;
+                rows * cols / 2 + rows * (cols / qt.group_size) * 8
+            }
+            LayerWeight::Q4K { n, k, .. } => n * (k / 256) * 144,
+            LayerWeight::Q6K { n, k, .. } => n * (k / 256) * 210,
+        }
+    }
 }
 
 // ── Camada Transformer ────────────────────────────────────────────────────────
@@ -541,6 +576,22 @@ pub struct CausalLM {
 impl CausalLM {
     /// Helper: faz projeção com pesos BF16 ou Q4 quantizados.
     /// Despacha para backend.gemm_bf16_f32 ou backend.gemv_q4 conforme necessário.
+    /// Se q8_scratch é Some, usa dp4a path (quantize x → Q8_1, then integer GEMV).
+    /// Quantize input activations to Q8_1 format for dp4a GEMV.
+    /// Call once before a batch of project_q8() calls that share the same input.
+    fn quantize_input_q8(
+        backend: &Arc<dyn ComputeBackend>,
+        input: &AnyTensor,
+        a_offset: usize,
+        q8_scratch: &AnyTensor,
+        k: usize,
+    ) -> ModelResult<()> {
+        backend.quantize_q8(&compute_core::QuantizeQ8Params {
+            x: input, x_offset: a_offset, out: q8_scratch, k,
+        })?;
+        Ok(())
+    }
+
     fn project(
         backend: &Arc<dyn ComputeBackend>,
         weight: &LayerWeight,
@@ -551,6 +602,8 @@ impl CausalLM {
         k: usize,
         a_offset: usize,
         beta: f32,
+        q8_scratch: Option<&AnyTensor>,
+        q8_precomputed: bool,
     ) -> ModelResult<()> {
         match weight {
             LayerWeight::Bf16(w) => {
@@ -580,6 +633,52 @@ impl CausalLM {
                     out: output,
                     beta,
                 })?;
+            }
+            LayerWeight::Q4K { data, n: _, k: _ } => {
+                if let (Some(q8), true) = (q8_scratch, m == 1) {
+                    if !q8_precomputed {
+                        backend.quantize_q8(&compute_core::QuantizeQ8Params {
+                            x: input, x_offset: a_offset, out: q8, k,
+                        })?;
+                    }
+                    backend.gemv_q4k_q8(&compute_core::GemvQ4KQ8Params {
+                        m, n, k, data, x_q8: q8, out: output, beta,
+                    })?;
+                } else {
+                    backend.gemv_q4k(&GemvQ4KParams {
+                        m,
+                        n,
+                        k,
+                        data,
+                        x: input,
+                        x_offset: a_offset,
+                        out: output,
+                        beta,
+                    })?;
+                }
+            }
+            LayerWeight::Q6K { data, n: _, k: _ } => {
+                if let (Some(q8), true) = (q8_scratch, m == 1) {
+                    if !q8_precomputed {
+                        backend.quantize_q8(&compute_core::QuantizeQ8Params {
+                            x: input, x_offset: a_offset, out: q8, k,
+                        })?;
+                    }
+                    backend.gemv_q6k_q8(&compute_core::GemvQ6KQ8Params {
+                        m, n, k, data, x_q8: q8, out: output, beta,
+                    })?;
+                } else {
+                    backend.gemv_q6k(&GemvQ6KParams {
+                        m,
+                        n,
+                        k,
+                        data,
+                        x: input,
+                        x_offset: a_offset,
+                        out: output,
+                        beta,
+                    })?;
+                }
             }
         }
         Ok(())
@@ -820,20 +919,7 @@ impl CausalLM {
         // Estimativa: BF16 = 2 bytes/elem, F32 = 4 bytes/elem
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
         let f32_bytes  = |t: &AnyTensor| t.numel() * 4;
-        let layer_weight_bytes = |w: &LayerWeight| match w {
-            LayerWeight::Bf16(t) => bf16_bytes(t),
-            LayerWeight::Q4(qt) => {
-                let [rows, cols] = qt.shape;
-                // packed: rows × cols/2 bytes
-                // scales: rows × (cols/group_size) × 4 bytes
-                // zeros: rows × (cols/group_size) × 4 bytes
-                let packed_bytes = rows * cols / 2;
-                let n_groups = cols / qt.group_size;
-                let scales_bytes = rows * n_groups * 4;
-                let zeros_bytes = rows * n_groups * 4;
-                packed_bytes + scales_bytes + zeros_bytes
-            }
-        };
+        let layer_weight_bytes = |w: &LayerWeight| w.vram_bytes();
 
         let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
         for l in &layers {
@@ -886,9 +972,9 @@ impl CausalLM {
     }
 
     /// Carrega modelo a partir de arquivo GGUF (formato Ollama/llama.cpp).
-    /// Dequantiza Q4_K/Q5_K/Q6_K → F32 → BF16 no load, usa pipeline BF16 existente.
-    /// Fase 1: output correto com pesos pré-quantizados profissionalmente.
-    /// Fase 2 (futuro): kernel Q4_K_GEMV nativo para velocidade máxima.
+    /// Usa kernels nativos Q4_K/Q6_K GEMV: upload dos blocos raw quantizados
+    /// direto para GPU, dequantização on-the-fly em F32 durante dot product.
+    /// Sem intermediário BF16, sem compound error entre camadas.
     pub fn load_gguf(
         gguf_path: &Path,
         cfg: ModelCfg,
@@ -917,21 +1003,78 @@ impl CausalLM {
         }
         log::info!("  → Tensores por tipo: {:?}", type_counts);
 
-        // ── Helper: dequantize GGUF tensor → upload as BF16 to GPU ──
-        let gpu_from_gguf = |gguf_name: &str| -> ModelResult<AnyTensor> {
+        // ── Helper: upload GGUF tensor as native quantized LayerWeight ──
+        // For Q4_K/Q6_K: upload raw block bytes directly → native GEMV kernel
+        // For F32/BF16/other: dequantize → BF16 on GPU (for embed_lookup, norms)
+        //
+        // GGUF shape convention: [ne0, ne1] = [cols(k), rows(n)]
+        // PyTorch convention: [rows(n), cols(k)]
+
+        // Upload quantized weight as native LayerWeight (Q4K, Q6K, or fallback BF16)
+        let gpu_weight_from_gguf = |gguf_name: &str| -> ModelResult<LayerWeight> {
+            use crate::storage::gguf::GgmlType;
+            let info = gguf.tensors.get(gguf_name)
+                .ok_or_else(|| ModelError::Model(format!("Tensor '{}' não encontrado", gguf_name)))?;
+            // For 2D weights: GGUF shape [ne0=k, ne1=n] → n=ne1, k=ne0
+            let (n, k) = if info.shape.len() == 2 {
+                (info.shape[1], info.shape[0])
+            } else {
+                // 1D tensors: treat as [1, k]
+                (1, info.shape[0])
+            };
+
+            // Debug: IARA_GGUF_NATIVE=0 → fallback all to BF16 (old behavior)
+            //        IARA_GGUF_NATIVE=q4k → only Q4_K native, Q6_K→BF16
+            //        IARA_GGUF_NATIVE=1 or unset → all native
+            let native_mode = std::env::var("IARA_GGUF_NATIVE").unwrap_or_else(|_| "1".to_string());
+
+            let use_native_q4k = native_mode != "0";
+            let use_native_q6k = native_mode == "1" || native_mode == "q6k";
+
+            match info.dtype {
+                GgmlType::Q4_K if use_native_q4k => {
+                    let raw = gguf.tensor_bytes(gguf_name)
+                        .ok_or_else(|| ModelError::Model(format!("Raw bytes de '{}' não encontrados", gguf_name)))?;
+                    let tensor = backend.upload_raw(raw, &[n, k]);
+                    Ok(LayerWeight::Q4K { data: tensor, n, k })
+                }
+                GgmlType::Q6_K if use_native_q6k => {
+                    let raw = gguf.tensor_bytes(gguf_name)
+                        .ok_or_else(|| ModelError::Model(format!("Raw bytes de '{}' não encontrados", gguf_name)))?;
+                    let tensor = backend.upload_raw(raw, &[n, k]);
+                    Ok(LayerWeight::Q6K { data: tensor, n, k })
+                }
+                _ => {
+                    // Fallback: dequantize → BF16
+                    let bf16_data = gguf.dequantize_bf16(gguf_name)
+                        .ok_or_else(|| ModelError::Model(
+                            format!("Falha ao dequantizar tensor GGUF '{}'", gguf_name)))?;
+                    let shape: Vec<usize> = info.shape.iter().rev().cloned().collect();
+                    Ok(LayerWeight::Bf16(backend.upload_bf16(&bf16_data, &shape)))
+                }
+            }
+        };
+
+        // Upload as BF16 (for embedding, lm_head — used by embed_lookup kernel)
+        let gpu_bf16_from_gguf = |gguf_name: &str| -> ModelResult<AnyTensor> {
             let bf16_data = gguf.dequantize_bf16(gguf_name)
                 .ok_or_else(|| ModelError::Model(
                     format!("Falha ao dequantizar tensor GGUF '{}'", gguf_name)))?;
             let info = gguf.tensors.get(gguf_name)
                 .ok_or_else(|| ModelError::Model(format!("Tensor '{}' não encontrado", gguf_name)))?;
-            Ok(backend.upload_bf16(&bf16_data, &info.shape))
+            let shape: Vec<usize> = info.shape.iter().rev().cloned().collect();
+            Ok(backend.upload_bf16(&bf16_data, &shape))
         };
 
+        // Upload as F32 (for norms, biases)
         let gpu_f32_from_gguf = |gguf_name: &str| -> ModelResult<AnyTensor> {
             let f32_data = gguf.dequantize_f32(gguf_name)
                 .ok_or_else(|| ModelError::Model(
                     format!("Falha ao dequantizar tensor GGUF '{}'", gguf_name)))?;
-            Ok(backend.upload_f32(&f32_data, &[f32_data.len()]))
+            let info = gguf.tensors.get(gguf_name)
+                .ok_or_else(|| ModelError::Model(format!("Tensor '{}' não encontrado", gguf_name)))?;
+            let shape: Vec<usize> = info.shape.iter().rev().cloned().collect();
+            Ok(backend.upload_f32(&f32_data, &shape))
         };
 
         // ── Map GGUF tensor names to our architecture tensor names ──
@@ -975,8 +1118,10 @@ impl CausalLM {
 
         // ── Embedding ──
         let embed_name = resolve_name(&tmap.embed);
-        log::info!("  → embed_tokens: {}", embed_name);
-        let embed = gpu_from_gguf(&embed_name)?;
+        let embed_info = gguf.tensors.get(&embed_name)
+            .ok_or_else(|| ModelError::Model(format!("embed tensor '{}' não encontrado", embed_name)))?;
+        log::info!("  → embed_tokens: {} (shape={:?}, dtype={:?})", embed_name, embed_info.shape, embed_info.dtype);
+        let embed = gpu_bf16_from_gguf(&embed_name)?;
 
         // ── Camadas ──
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
@@ -984,7 +1129,7 @@ impl CausalLM {
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            if i % 8 == 0 { log::info!("  → layers {}/{} (GGUF dequant→BF16)", i, cfg.num_layers); }
+            if i % 8 == 0 { log::info!("  → layers {}/{} (GGUF native Q4K/Q6K)", i, cfg.num_layers); }
 
             let wq_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_q));
             let wk_name = resolve_name(&tmap.layer_tensor(i, &tmap.attn_k));
@@ -996,19 +1141,35 @@ impl CausalLM {
             let in_norm_name = resolve_name(&tmap.layer_tensor(i, &tmap.input_norm));
             let pa_norm_name = resolve_name(&tmap.layer_tensor(i, &tmap.post_attn_norm));
 
+            if i == 0 {
+                // Log ALL tensor names and shapes from first layer for debugging
+                for (label, name) in [
+                    ("wq", &wq_name), ("wk", &wk_name), ("wv", &wv_name), ("wo", &wo_name),
+                    ("wgate", &wgate_name), ("wup", &wup_name), ("wdown", &wdown_name),
+                    ("in_norm", &in_norm_name), ("pa_norm", &pa_norm_name),
+                ] {
+                    if let Some(info) = gguf.tensors.get(name) {
+                        let rev_shape: Vec<usize> = info.shape.iter().rev().cloned().collect();
+                        log::info!("  → L0 {:8}: {} → {:?} (gguf {:?}) {:?}", label, name, rev_shape, info.shape, info.dtype);
+                    } else {
+                        log::warn!("  → L0 {:8}: {} → NOT FOUND!", label, name);
+                    }
+                }
+            }
+
             // Optional biases
             let qb_name = tmap.layer_tensor_opt(i, &tmap.attn_q_bias).map(|n| resolve_name(&n));
             let kb_name = tmap.layer_tensor_opt(i, &tmap.attn_k_bias).map(|n| resolve_name(&n));
             let vb_name = tmap.layer_tensor_opt(i, &tmap.attn_v_bias).map(|n| resolve_name(&n));
 
             layers.push(TransformerLayer {
-                wq:    LayerWeight::Bf16(gpu_from_gguf(&wq_name)?),
-                wk:    LayerWeight::Bf16(gpu_from_gguf(&wk_name)?),
-                wv:    LayerWeight::Bf16(gpu_from_gguf(&wv_name)?),
-                wo:    LayerWeight::Bf16(gpu_from_gguf(&wo_name)?),
-                wgate: LayerWeight::Bf16(gpu_from_gguf(&wgate_name)?),
-                wup:   LayerWeight::Bf16(gpu_from_gguf(&wup_name)?),
-                wdown: LayerWeight::Bf16(gpu_from_gguf(&wdown_name)?),
+                wq:    gpu_weight_from_gguf(&wq_name)?,
+                wk:    gpu_weight_from_gguf(&wk_name)?,
+                wv:    gpu_weight_from_gguf(&wv_name)?,
+                wo:    gpu_weight_from_gguf(&wo_name)?,
+                wgate: gpu_weight_from_gguf(&wgate_name)?,
+                wup:   gpu_weight_from_gguf(&wup_name)?,
+                wdown: gpu_weight_from_gguf(&wdown_name)?,
                 q_bias: match &qb_name {
                     Some(name) if gguf.tensors.contains_key(name) => Some(gpu_f32_from_gguf(name)?),
                     _ => None,
@@ -1036,37 +1197,65 @@ impl CausalLM {
 
         // lm_head (may be tied with embeddings)
         let lm_head_name = resolve_name(&tmap.lm_head);
+        // lm_head: use native quant if separate, native quant from embed if tied
         let lm_head = if gguf.tensors.contains_key(&lm_head_name) {
-            LayerWeight::Bf16(gpu_from_gguf(&lm_head_name)?)
+            gpu_weight_from_gguf(&lm_head_name)?
         } else {
-            log::info!("  → lm_head: usando embed_tokens (tied weights)");
-            LayerWeight::Bf16(gpu_from_gguf(&embed_name)?)
+            // Tied weights: load embed tensor in native quant format (Q4K/Q6K)
+            // instead of dequantizing to BF16 (saves ~350MB VRAM and uses fast GEMV)
+            log::info!("  → lm_head: usando embed_tokens (tied weights, native quant)");
+            gpu_weight_from_gguf(&embed_name)?
         };
+
+        // ── Verify GPU data integrity ──
+        // Download first few values from GPU and compare with CPU dequant
+        if std::env::var("IARA_DEBUG_GGUF").map(|v| v == "1").unwrap_or(false) {
+            log::info!("🔍 GGUF debug: verifying GPU data integrity...");
+
+            // Check embed tensor (BF16)
+            let embed_gpu = backend.download_bf16_as_f32(&embed);
+            log::info!("  embed GPU first5: {:?}", &embed_gpu[..5.min(embed_gpu.len())]);
+
+            // Check layer 0 wq type
+            match &layers[0].wq {
+                LayerWeight::Bf16(t) => {
+                    let wq_gpu = backend.download_bf16_as_f32(t);
+                    log::info!("  L0.wq BF16 GPU first5: {:?}", &wq_gpu[..5.min(wq_gpu.len())]);
+                }
+                LayerWeight::Q4K { n, k, .. } => log::info!("  L0.wq Q4K native [{}×{}]", n, k),
+                LayerWeight::Q6K { n, k, .. } => log::info!("  L0.wq Q6K native [{}×{}]", n, k),
+                LayerWeight::Q4(_) => log::info!("  L0.wq Q4 (IARA quantized)"),
+            }
+
+            // Check layer 0 input_norm (F32)
+            let norm_gpu = backend.download_f32(&layers[0].input_norm_w);
+            log::info!("  L0.norm GPU first5: {:?}", &norm_gpu[..5.min(norm_gpu.len())]);
+
+            // Check layer 0 q_bias (F32)
+            if let Some(ref qb) = layers[0].q_bias {
+                let qb_gpu = backend.download_f32(qb);
+                log::info!("  L0.q_bias GPU first5: {:?}", &qb_gpu[..5.min(qb_gpu.len())]);
+            } else {
+                log::warn!("  L0.q_bias: NONE!");
+            }
+        }
 
         // ── VRAM accounting ──
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
         let f32_bytes = |t: &AnyTensor| t.numel() * 4;
-        let layer_weight_bytes = |w: &LayerWeight| match w {
-            LayerWeight::Bf16(t) => bf16_bytes(t),
-            LayerWeight::Q4(qt) => {
-                let [rows, cols] = qt.shape;
-                rows * cols / 2 + rows * (cols / qt.group_size) * 8
-            }
-        };
-
-        let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
+        let mut vram_bytes = embed.numel() * 2 + lm_head.vram_bytes();
         for l in &layers {
-            vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk)
-                        + layer_weight_bytes(&l.wv) + layer_weight_bytes(&l.wo)
-                        + layer_weight_bytes(&l.wgate) + layer_weight_bytes(&l.wup)
-                        + layer_weight_bytes(&l.wdown);
+            vram_bytes += l.wq.vram_bytes() + l.wk.vram_bytes()
+                        + l.wv.vram_bytes() + l.wo.vram_bytes()
+                        + l.wgate.vram_bytes() + l.wup.vram_bytes()
+                        + l.wdown.vram_bytes();
             vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
             vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
         }
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
 
-        log::info!("✅ Modelo GGUF [{}] carregado — VRAM: {:.2} GB (dequant→BF16)", arch.family, vram_bytes as f64 / 1e9);
+        log::info!("✅ Modelo GGUF [{}] carregado — VRAM: {:.2} GB (native Q4K/Q6K GEMV)", arch.family, vram_bytes as f64 / 1e9);
 
         Ok(Self {
             embed,
@@ -1348,13 +1537,7 @@ impl CausalLM {
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
         let f32_bytes = |t: &AnyTensor| t.numel() * 4;
 
-        let lm_head_bytes = match &lm_head {
-            LayerWeight::Bf16(t) => bf16_bytes(t),
-            LayerWeight::Q4(qt) => {
-                let [rows, cols] = qt.shape;
-                rows * cols / 2 + rows * (cols / qt.group_size) * 8
-            }
-        };
+        let lm_head_bytes = lm_head.vram_bytes();
         let mut vram_bytes = bf16_bytes(&embed) + lm_head_bytes;
         for l in &layers {
             // Pesos quantizados (Q4): ~1 byte por 2 valores + scales/zeros
@@ -1370,13 +1553,9 @@ impl CausalLM {
                 packed_bytes + scales_bytes + zeros_bytes
             };
 
-            vram_bytes += match &l.wq { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wk { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wv { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wo { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wgate { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wup { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
-            vram_bytes += match &l.wdown { LayerWeight::Bf16(t) => bf16_bytes(t), LayerWeight::Q4(qt) => q4_weight_bytes(qt) };
+            vram_bytes += l.wq.vram_bytes() + l.wk.vram_bytes() + l.wv.vram_bytes()
+                        + l.wo.vram_bytes() + l.wgate.vram_bytes()
+                        + l.wup.vram_bytes() + l.wdown.vram_bytes();
 
             vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
             vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
@@ -1760,17 +1939,7 @@ impl CausalLM {
         // ── Contabilidade de VRAM ────────────────────────────────────────────
         let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
         let f32_bytes = |t: &AnyTensor| t.numel() * 4;
-        let layer_weight_bytes = |w: &LayerWeight| match w {
-            LayerWeight::Bf16(t) => bf16_bytes(t),
-            LayerWeight::Q4(qt) => {
-                let [rows, cols] = qt.shape;
-                let packed_bytes = rows * cols / 2;
-                let n_groups = cols / qt.group_size;
-                let scales_bytes = rows * n_groups * 4;
-                let zeros_bytes = rows * n_groups * 4;
-                packed_bytes + scales_bytes + zeros_bytes
-            }
-        };
+        let layer_weight_bytes = |w: &LayerWeight| w.vram_bytes();
 
         let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
         for l in &layers {
@@ -1875,6 +2044,18 @@ impl CausalLM {
             hidden_size: h,
         })?;
 
+        // Debug: check embed lookup output
+        if std::env::var("IARA_DEBUG_GGUF").map(|v| v == "1").unwrap_or(false) {
+            static EMBED_DEBUG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !EMBED_DEBUG_DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let x_data = self.backend.download_f32(&self.scratch.x);
+                log::info!("🔍 After embed_lookup: tokens={:?}", &token_ids[..token_ids.len().min(5)]);
+                log::info!("  x[0..8] = {:?}", &x_data[..8.min(x_data.len())]);
+                let x_norm: f32 = x_data[..h].iter().map(|v| v*v).sum::<f32>().sqrt();
+                log::info!("  x row0 L2 norm = {:.6}", x_norm);
+            }
+        }
+
         // Initialize telemetry vector
         let mut layer_traces: Vec<LayerTrace> = Vec::new();
 
@@ -1895,6 +2076,12 @@ impl CausalLM {
             _ => n_layers - 1,  // Slow or None: use all layers
         };
 
+        // ── Per-operation GPU profiling (IARA_PROFILE=1) ──
+        let do_profile = std::env::var("IARA_PROFILE").map(|v| v == "1").unwrap_or(false) && n == 1;
+        static PROFILE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let do_profile = do_profile && !PROFILE_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
+        let forward_t0 = if do_profile { Some(std::time::Instant::now()) } else { None };
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Check if we should early exit based on budget
             if layer_idx > final_layer {
@@ -1904,21 +2091,67 @@ impl CausalLM {
                 );
                 break;
             }
+            let _prof_l0 = false;  // disabled: per-op profiling stalls pipeline
+            let _layer_t0: Option<std::time::Instant> = None;  // disabled: per-layer sync inflates 2×
+
+            macro_rules! prof_sync {
+                ($label:expr) => {
+                    if _prof_l0 {
+                        self.backend.device_sync();
+                        log::warn!("PROF-L0 {} @ {:?}", $label, _layer_t0.unwrap().elapsed());
+                    }
+                };
+            }
+
             // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
             Self::apply_norm(
                 &self.backend, norm_type,
                 &self.scratch.x, &layer.input_norm_w, None,
                 &self.scratch.normed, n, h, eps,
             )?;
+            prof_sync!("norm");
 
             // ── Q, K, V projections (BF16/Q4 pesos × F32 ativações → F32) ──────
             // Q/K/V escrevem em buffers independentes → sem sync entre eles.
             // Todos os kernels seguintes (bias, QK-norm, RoPE, KV-cache, SGEMM)
             // rodam no mesmo HIP stream default → ordem garantida pelo hardware.
             log::trace!("layer {layer_idx}: wq+wk+wv n={n} qd={qd} kd={kd} h={h}");
-            Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0)?;
+            // Pre-quantize normed activations once for all 3 QKV projections
+            let qkv_q8_pre = if n == 1 {
+                if let Some(q8) = self.scratch.q8_scratch.as_ref() {
+                    Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                    true
+                } else { false }
+            } else { false };
+            prof_sync!("q8_qkv");
+
+            // Try fused QKV kernel (1 launch vs 3) for decode with Q4K weights
+            static FUSED_QKV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let fused_qkv_ok = if n == 1 && qkv_q8_pre {
+                match (&layer.wq, &layer.wk, &layer.wv) {
+                    (LayerWeight::Q4K { data: dq, .. }, LayerWeight::Q4K { data: dk, .. }, LayerWeight::Q4K { data: dv, .. }) => {
+                        self.backend.fused_qkv(&compute_core::FusedQkvParams {
+                            wq_data: dq, wk_data: dk, wv_data: dv,
+                            x_q8: self.scratch.q8_scratch.as_ref().unwrap(),
+                            out_q: &self.scratch.q, out_k: &self.scratch.k, out_v: &self.scratch.v,
+                            nq: qd, nk: kd, nv: kd, k: h,
+                        }).is_ok()
+                    }
+                    _ => false,
+                }
+            } else { false };
+
+            if fused_qkv_ok {
+                if !FUSED_QKV_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("FUSED QKV: active (nq={}, nk={}, nv={}, k={})", qd, kd, kd, h);
+                }
+            } else {
+                Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), qkv_q8_pre)?;
+                prof_sync!("gemv_q");
+                Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), qkv_q8_pre)?;
+                Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), qkv_q8_pre)?;
+            }
+            prof_sync!("gemv_kv");
 
             // ── DEBUG Q4: dump first layer's projections ──
             if layer_idx == 0 && std::env::var("IARA_DEBUG_Q4").map(|v| v == "1").unwrap_or(false) {
@@ -1938,9 +2171,26 @@ impl CausalLM {
                     let q_min = q_data.iter().cloned().fold(f32::INFINITY, f32::min);
                     let q_mean = q_data.iter().sum::<f32>() / q_data.len() as f32;
                     log::info!("  q stats: min={:.6}, max={:.6}, mean={:.6}, nans={}, infs={}, zeros={}/{}", q_min, q_max, q_mean, q_nans, q_infs, q_zeros, q_data.len());
+
+                    // Manual dot product check: compute q[0] = dot(normed[0:h], wq_row0[0:h]) on CPU
+                    let wq_f32 = match &layer.wq {
+                        LayerWeight::Bf16(t) => self.backend.download_bf16_as_f32(t),
+                        _ => vec![],
+                    };
+                    if !wq_f32.is_empty() {
+                        let manual_q0: f32 = (0..h).map(|i| normed_data[i] * wq_f32[i]).sum();
+                        let manual_q1: f32 = (0..h).map(|i| normed_data[i] * wq_f32[h + i]).sum();
+                        log::info!("  Manual CPU: q[0]={:.6} (GPU={:.6}), q[1]={:.6} (GPU={:.6})",
+                            manual_q0, q_data[0], manual_q1, q_data[1]);
+                        log::info!("  wq shape: {} rows × {} cols (numel={})",
+                            wq_f32.len() / h, h, wq_f32.len());
+                        log::info!("  wq row0[0..5]: {:?}", &wq_f32[..5]);
+                        log::info!("  wq row1[0..5]: {:?}", &wq_f32[h..h+5]);
+                    }
                 }
             }
 
+            prof_sync!("qkv_done");
             // Biases opcionais (Qwen2/2.5)
             if let Some(ref bias) = layer.q_bias {
                 self.backend.add_bias_inplace(&AddBiasParams {
@@ -2003,6 +2253,7 @@ impl CausalLM {
                 })?;
             }
 
+            prof_sync!("bias_done");
             // ── RoPE (in-place) ───────────────────────────────────────────────
             let pos_start = layer.kv_k.current_len;
             self.backend.rope_inplace(&RopeParams {
@@ -2022,6 +2273,15 @@ impl CausalLM {
                 theta,
             })?;
 
+            // ── DEBUG: dump Q/K after RoPE ──
+            if layer_idx == 0 && std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
+                let q_data = self.backend.download_f32(&self.scratch.q);
+                let k_data = self.backend.download_f32(&self.scratch.k);
+                log::info!("🔬 L0 q_after_rope[0..8] = {:?}", &q_data[..8.min(q_data.len())]);
+                log::info!("🔬 L0 k_after_rope[0..8] = {:?}", &k_data[..8.min(k_data.len())]);
+            }
+
+            prof_sync!("rope_done");
             // ── Append K, V ao KV-cache ───────────────────────────────────────
             match layer.kv_k.mode {
                 kv_cache::KvCacheMode::F32 => {
@@ -2131,6 +2391,7 @@ impl CausalLM {
             //
             // For prefill (n>1): Use separate GEMM+softmax+GEMM (batched or GQA grouped).
 
+            prof_sync!("kv_done");
             let use_fused_decode = n == 1 && seq > 0;
             let mut fused_ok = false;
 
@@ -2197,12 +2458,24 @@ impl CausalLM {
                     })?;
 
                     // T7b-GQA: Softmax all Q heads in this KV group in one launch
-                    self.backend.softmax_rows(&SoftmaxParams {
-                        scores: &self.scratch.scores,
-                        offset_elems: q_start * n * seq,
-                        n_rows: heads_per_group * n,
-                        row_len: seq,
-                    })?;
+                    // Use causal mask during prefill (n > 1) to prevent attending to future tokens
+                    if n > 1 {
+                        self.backend.softmax_rows_causal(&compute_core::SoftmaxCausalParams {
+                            scores: &self.scratch.scores,
+                            offset_elems: q_start * n * seq,
+                            n_rows: heads_per_group * n,
+                            row_len: seq,
+                            n_tokens: n,
+                            query_offset: pos_start,
+                        })?;
+                    } else {
+                        self.backend.softmax_rows(&SoftmaxParams {
+                            scores: &self.scratch.scores,
+                            offset_elems: q_start * n * seq,
+                            n_rows: heads_per_group * n,
+                            row_len: seq,
+                        })?;
+                    }
 
                     // T7c-GQA: Batched Attn×V for all Q heads in this KV group
                     log::trace!("layer {layer_idx}: attn AV GQA kv_h={kv_h} q_start={q_start} batch={heads_per_group}");
@@ -2231,11 +2504,21 @@ impl CausalLM {
                 }
             }
 
+            // ── DEBUG: dump attention output before wo ──
+            if layer_idx == 0 && std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
+                let attn_data = self.backend.download_f32(&self.scratch.attn_out);
+                log::info!("🔬 L0 attn_out[0..8] = {:?}", &attn_data[..8.min(attn_data.len())]);
+                let x_before = self.backend.download_f32(&self.scratch.x);
+                log::info!("🔬 L0 x_before_wo[0..8] = {:?}", &x_before[..8.min(x_before.len())]);
+            }
+
+            prof_sync!("attn_done");
             // ── Output projection: attn_out × wo^T → x (residual) ─────────────
             // x = x + attn_out × wo^T  (beta=1.0 para acumular em x)
             log::trace!("layer {layer_idx}: wo");
-            Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0)?;
+            Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
 
+            prof_sync!("wo_done");
             // ── Post-attention Normalization ───────────────────────────────────
             Self::apply_norm(
                 &self.backend, norm_type,
@@ -2362,21 +2645,68 @@ impl CausalLM {
 
                 } else {
                     // Weights not ready yet — fallback to dense for this layer
-                    Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
-                    Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+                    // Pre-quantize normed for gate+up (same input)
+                    let gu_q8_pre = if n == 1 {
+                        if let Some(q8) = self.scratch.q8_scratch.as_ref() {
+                            Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                            true
+                        } else { false }
+                    } else { false };
+                    Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;
+                    Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;
                     Self::apply_activation(&self.backend, activation, &self.scratch.gate, &self.scratch.up, n, it)?;
-                    Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+                    Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
                 }
             } else {
                 // ── DENSE MLP PATH (also used for calibration) ─────────────────
                 log::trace!("layer {layer_idx}: wgate+wup n={n} it={it} h={h}");
-                Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
-                Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
 
-                Self::apply_activation(
-                    &self.backend, activation,
-                    &self.scratch.gate, &self.scratch.up, n, it,
-                )?;
+                // Pre-quantize normed for gate+up (same input)
+                let gu_q8_pre = if n == 1 {
+                    if let Some(q8) = self.scratch.q8_scratch.as_ref() {
+                        Self::quantize_input_q8(&self.backend, &self.scratch.normed, 0, q8, h)?;
+                        true
+                    } else { false }
+                } else { false };
+
+                // Try fused gate+up+SiLU kernel (1 launch vs 3) for decode
+                let fused_mlp_ok = if n == 1 && gu_q8_pre && !is_calibrating {
+                    match (&layer.wgate, &layer.wup) {
+                        (LayerWeight::Q4K { data: gd, .. }, LayerWeight::Q4K { data: ud, .. }) => {
+                            self.backend.fused_gate_up_silu(&compute_core::FusedGateUpSiluParams {
+                                gate_data: gd, up_data: ud,
+                                x_q8: self.scratch.q8_scratch.as_ref().unwrap(),
+                                out: &self.scratch.gate, n: it, k: h,
+                            }, false).is_ok()
+                        }
+                        (LayerWeight::Q6K { data: gd, .. }, LayerWeight::Q6K { data: ud, .. }) => {
+                            self.backend.fused_gate_up_silu(&compute_core::FusedGateUpSiluParams {
+                                gate_data: gd, up_data: ud,
+                                x_q8: self.scratch.q8_scratch.as_ref().unwrap(),
+                                out: &self.scratch.gate, n: it, k: h,
+                            }, true).is_ok()
+                        }
+                        _ => false,
+                    }
+                } else { false };
+
+                if fused_mlp_ok {
+                    static FUSED_MLP_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !FUSED_MLP_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!("FUSED MLP: active (n={}, k={})", it, h);
+                    }
+                }
+                if !fused_mlp_ok {
+                    Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;
+                    prof_sync!("mlp_gate");
+                    Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;
+                    prof_sync!("mlp_up");
+                    Self::apply_activation(
+                        &self.backend, activation,
+                        &self.scratch.gate, &self.scratch.up, n, it,
+                    )?;
+                }
+                prof_sync!("mlp_silu");
 
                 // Calibration: intercept gate activations after SiLU*mul
                 if is_calibrating {
@@ -2397,9 +2727,28 @@ impl CausalLM {
                 }
 
                 // down_proj: x = x + swiglu × wdown^T (beta=1 acumula em x)
-                Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+                Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
+                prof_sync!("mlp_down");
+            }
+
+            prof_sync!("mlp_done");
+            // ── DEBUG: dump x after full layer ──
+            if std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
+                let x_after = self.backend.download_f32(&self.scratch.x);
+                let x_norm: f32 = x_after[..h].iter().map(|v| v*v).sum::<f32>().sqrt();
+                if layer_idx == 0 {
+                    log::info!("🔬 L0 x_after_mlp[0..8] = {:?}", &x_after[..8.min(x_after.len())]);
+                }
+                log::info!("🔬 L{} x row0 L2 = {:.4}, first4=[{:.4},{:.4},{:.4},{:.4}]",
+                    layer_idx, x_norm, x_after[0], x_after[1], x_after[2], x_after[3]);
             }
             log::trace!("layer {layer_idx}: done");
+
+            if let Some(t0) = _layer_t0 {
+                self.backend.device_sync();
+                let us = t0.elapsed().as_micros();
+                log::warn!("PROFILE L{}: {}μs ({:.2}ms)", layer_idx, us, us as f64 / 1000.0);
+            }
 
             // ── Phase coherence check for early exit (decode-only) ────────────────
             // Only check at the 2 boundary layers (fast and medium) to avoid
@@ -2563,6 +2912,10 @@ impl CausalLM {
         }
 
         // ── Final Normalization ──────────────────────────────────────────────
+        if let Some(t0) = forward_t0 {
+            self.backend.device_sync();
+            log::warn!("PROF layers_done @ {:?}", t0.elapsed());
+        }
         Self::apply_norm(
             &self.backend, norm_type,
             &self.scratch.x, &self.norm_w, self.norm_b.as_ref(),
@@ -2576,10 +2929,18 @@ impl CausalLM {
             &self.backend, &self.lm_head,
             &self.scratch.normed, &self.scratch.logits,
             1, vocab, h, (n - 1) * h, 0.0,
+            self.scratch.q8_scratch.as_ref(), false,
         )?;
 
         // ── Download logits: único to_host() de todo o forward ───────────────
+        if let Some(t0) = forward_t0 {
+            self.backend.device_sync();
+            log::warn!("PROF lm_head_done @ {:?}", t0.elapsed());
+        }
         let logits = self.backend.download_f32(&self.scratch.logits);
+        if let Some(t0) = forward_t0 {
+            log::warn!("PROF logits_download_done @ {:?}", t0.elapsed());
+        }
 
         Ok((logits, layer_traces))
     }
@@ -2661,9 +3022,9 @@ impl CausalLM {
             )?;
 
             // ── Q, K, V projections ──
-            Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0)?;
+            Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), false)?;
+            Self::project(&self.backend, &layer.wk, &self.scratch.normed, &self.scratch.k, n, kd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), false)?;
+            Self::project(&self.backend, &layer.wv, &self.scratch.normed, &self.scratch.v, n, kd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             // ── Optional biases ──
             if let Some(ref bias) = layer.q_bias {
@@ -2989,7 +3350,7 @@ impl CausalLM {
             }
 
             // ── Output projection ──
-            Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0)?;
+            Self::project(&self.backend, &layer.wo, &self.scratch.attn_out, &self.scratch.x, n, h, qd, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             // ── Post-attention Normalization ──
             Self::apply_norm(
@@ -2999,8 +3360,8 @@ impl CausalLM {
             )?;
 
             // ── MLP: gate_proj + up_proj ──
-            Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0)?;
-            Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0)?;
+            Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), false)?;
+            Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             // ── Activation: gate = activation(gate) * up ──
             Self::apply_activation(
@@ -3030,7 +3391,7 @@ impl CausalLM {
             }
 
             // ── Down projection: residual add ──
-            Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0)?;
+            Self::project(&self.backend, &layer.wdown, &self.scratch.gate, &self.scratch.x, n, h, it, 0, 1.0, self.scratch.q8_scratch.as_ref(), false)?;
 
             // ── Download output hidden state to compute residual_delta and phase_coherence ──
             let x_data = self.backend.download_f32(&self.scratch.x);
@@ -3074,6 +3435,7 @@ impl CausalLM {
             &self.backend, &self.lm_head,
             &self.scratch.normed, &self.scratch.logits,
             1, vocab, h, (n - 1) * h, 0.0,
+            self.scratch.q8_scratch.as_ref(), false,
         )?;
 
         // ── Download logits ──

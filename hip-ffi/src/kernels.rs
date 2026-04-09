@@ -48,6 +48,7 @@ pub struct GpuKernels {
     fn_rope_inplace: hipFunction_t,
     fn_silu_mul: hipFunction_t,
     fn_softmax_rows: hipFunction_t,
+    fn_softmax_rows_causal: hipFunction_t,
     fn_copy_kv_cache: hipFunction_t,
     fn_f32_to_bf16: hipFunction_t,
     fn_dequant_gemv_q4: hipFunction_t,
@@ -66,6 +67,17 @@ pub struct GpuKernels {
     fn_kuramoto_coherence: hipFunction_t,
     fn_topk_select: hipFunction_t,
     fn_fused_attention_decode: hipFunction_t,
+    fn_dequant_gemv_q4k: hipFunction_t,
+    fn_dequant_gemv_q6k: hipFunction_t,
+    fn_quantize_f32_q8_1: hipFunction_t,
+    fn_gemv_q4k_q8: hipFunction_t,
+    fn_gemv_q6k_q8: hipFunction_t,
+    fn_fused_gate_up_silu_q4k: hipFunction_t,
+    fn_fused_gate_up_silu_q6k: hipFunction_t,
+    fn_gemv_q4k_q8_multi: hipFunction_t,
+    fn_gemv_q6k_q8_multi: hipFunction_t,
+    fn_fused_qkv_q4k: hipFunction_t,
+    fn_fused_rms_norm_quantize: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -93,6 +105,7 @@ impl GpuKernels {
         let fn_rope_inplace = get_fn!("rope_inplace");
         let fn_silu_mul = get_fn!("silu_mul_inplace");
         let fn_softmax_rows = get_fn!("softmax_rows");
+        let fn_softmax_rows_causal = get_fn!("softmax_rows_causal");
         let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
         let fn_f32_to_bf16 = get_fn!("f32_to_bf16");
         let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4");
@@ -114,6 +127,17 @@ impl GpuKernels {
         let fn_kuramoto_coherence = get_fn!("kuramoto_coherence");
         let fn_topk_select = get_fn!("topk_select");
         let fn_fused_attention_decode = get_fn!("fused_attention_decode");
+        let fn_dequant_gemv_q4k = get_fn!("dequant_gemv_q4k");
+        let fn_dequant_gemv_q6k = get_fn!("dequant_gemv_q6k");
+        let fn_quantize_f32_q8_1 = get_fn!("quantize_f32_q8_1");
+        let fn_gemv_q4k_q8 = get_fn!("gemv_q4k_q8");
+        let fn_gemv_q6k_q8 = get_fn!("gemv_q6k_q8");
+        let fn_fused_gate_up_silu_q4k = get_fn!("fused_gate_up_silu_q4k");
+        let fn_fused_gate_up_silu_q6k = get_fn!("fused_gate_up_silu_q6k");
+        let fn_gemv_q4k_q8_multi = get_fn!("gemv_q4k_q8_multi");
+        let fn_gemv_q6k_q8_multi = get_fn!("gemv_q6k_q8_multi");
+        let fn_fused_qkv_q4k = get_fn!("fused_qkv_q4k");
+        let fn_fused_rms_norm_quantize = get_fn!("fused_rms_norm_quantize");
 
         Ok(Self {
             module,
@@ -123,6 +147,7 @@ impl GpuKernels {
             fn_rope_inplace,
             fn_silu_mul,
             fn_softmax_rows,
+            fn_softmax_rows_causal,
             fn_copy_kv_cache,
             fn_f32_to_bf16,
             fn_dequant_gemv_q4,
@@ -141,6 +166,17 @@ impl GpuKernels {
             fn_kuramoto_coherence,
             fn_topk_select,
             fn_fused_attention_decode,
+            fn_dequant_gemv_q4k,
+            fn_dequant_gemv_q6k,
+            fn_quantize_f32_q8_1,
+            fn_gemv_q4k_q8,
+            fn_gemv_q6k_q8,
+            fn_fused_gate_up_silu_q4k,
+            fn_fused_gate_up_silu_q6k,
+            fn_gemv_q4k_q8_multi,
+            fn_gemv_q6k_q8_multi,
+            fn_fused_qkv_q4k,
+            fn_fused_rms_norm_quantize,
         })
     }
 }
@@ -473,6 +509,50 @@ impl GpuKernels {
         )
     }
 
+    /// Launch `softmax_rows_causal` — causal masked softmax for prefill attention.
+    ///
+    /// # Safety
+    /// `scores` must point to at least `n_rows * seq_len` contiguous f32 on device.
+    pub unsafe fn softmax_rows_causal(
+        &self,
+        scores: *mut f32,
+        n_rows: i32,
+        seq_len: i32,
+        n_tokens: i32,
+        query_offset: i32,
+    ) -> Result<(), HipError> {
+        let bsz = {
+            let mut b = 64u32;
+            while b < (seq_len as u32).min(1024) {
+                b <<= 1;
+            }
+            b.min(1024)
+        };
+        let shared_bytes = bsz * std::mem::size_of::<f32>() as u32;
+
+        let grid = (n_rows as u32, 1, 1);
+        let block = (bsz, 1, 1);
+
+        let mut p_scores = scores;
+        let mut p_seq_len = seq_len;
+        let mut p_n_tokens = n_tokens;
+        let mut p_query_offset = query_offset;
+
+        hip_launch_kernel(
+            self.fn_softmax_rows_causal,
+            grid,
+            block,
+            shared_bytes,
+            ptr::null_mut(),
+            &mut [
+                &mut p_scores as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq_len as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n_tokens as *mut i32 as *mut std::ffi::c_void,
+                &mut p_query_offset as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
     // -------------------------------------------------------------------------
     // Kernel 7: copy_to_kv_cache
     //
@@ -622,6 +702,502 @@ impl GpuKernels {
                 &mut p_k as *mut i32 as *mut std::ffi::c_void,
                 &mut p_group_size as *mut i32 as *mut std::ffi::c_void,
                 &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Native GGML Q4_K GEMV — raw Q4_K blocks, dequant on-the-fly in F32
+    // Grid : (N, M, 1)  — one block per output row per token
+    // Block: (256, 1, 1) — threads stride over qs bytes
+    // Shared: 8 floats = 32 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// GGML Q4_K GEMV: operates directly on raw Q4_K blocks on GPU.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn dequant_gemv_q4k(
+        &self,
+        data: *const u8,   // [n * (k/256) * 144] raw Q4_K blocks
+        x: *const f32,     // [m, k] F32 activations
+        out: *mut f32,     // [m, n] F32 output
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (256u32, 1, 1);
+        let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
+
+        let mut p_data = data;
+        let mut p_x = x;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_dequant_gemv_q4k,
+            grid,
+            block,
+            shared_mem,
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Native GGML Q6_K GEMV — raw Q6_K blocks, dequant on-the-fly in F32
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// GGML Q6_K GEMV: operates directly on raw Q6_K blocks on GPU.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn dequant_gemv_q6k(
+        &self,
+        data: *const u8,   // [n * (k/256) * 210] raw Q6_K blocks
+        x: *const f32,     // [m, k] F32 activations
+        out: *mut f32,     // [m, n] F32 output
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (256u32, 1, 1);
+        let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
+
+        let mut p_data = data;
+        let mut p_x = x;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_dequant_gemv_q6k,
+            grid,
+            block,
+            shared_mem,
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // quantize_f32_q8_1: Quantize F32 activations → Q8_1 blocks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Quantize F32 activations to Q8_1 format for fast integer GEMV.
+    ///
+    /// # Safety
+    /// `x` must point to `k` f32 values. `out` must have space for `(k/32)*36` bytes.
+    pub unsafe fn quantize_f32_q8_1(
+        &self,
+        x: *const f32,      // [K] F32 activations
+        out: *mut u8,        // [K/32 * 36] Q8_1 blocks
+        k: i32,
+    ) -> Result<(), HipError> {
+        let n_blocks = k / 32;
+        // 8 warps per block (256 threads), each warp handles one Q8_1 block
+        let grid = ((n_blocks as u32 + 7) / 8, 1, 1);
+        let block = (256u32, 1, 1);
+
+        let mut p_x = x;
+        let mut p_out = out;
+        let mut p_k = k;
+
+        hip_launch_kernel(
+            self.fn_quantize_f32_q8_1,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut u8 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q4k_q8: Q4_K × Q8_1 GEMV with dp4a
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Q4_K × Q8_1 GEMV with dp4a integer dot product.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations.
+    pub unsafe fn gemv_q4k_q8(
+        &self,
+        data: *const u8,     // [N * (K/256) * 144] raw Q4_K blocks
+        x_q8: *const u8,     // [M * (K/32) * 36] Q8_1 blocks
+        out: *mut f32,       // [M, N] output
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);  // single warp (wave32)
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q4k_q8,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q4k_q8_multi: Multi-row Q4_K × Q8_1 GEMV (8 rows per block)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Multi-row Q4_K × Q8_1 GEMV. 8 rows per block, sharing Q8 input via LDS.
+    /// Better for large N (lm_head with N=151936).
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations.
+    pub unsafe fn gemv_q4k_q8_multi(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, m.max(1) as u32, 1);
+        let block = (32u32, 8, 1);  // 8 warps per block
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q4k_q8_multi,
+            grid,
+            block,
+            0,  // shared mem dynamically allocated in kernel via __shared__
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q6k_q8: Q6_K × Q8_1 GEMV with integer multiply
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Q6_K × Q8_1 GEMV with integer multiply and warp reduce.
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations.
+    pub unsafe fn gemv_q6k_q8(
+        &self,
+        data: *const u8,     // [N * (K/256) * 210] raw Q6_K blocks
+        x_q8: *const u8,     // [M * (K/32) * 36] Q8_1 blocks
+        out: *mut f32,       // [M, N] output
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q6k_q8,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q6k_q8_multi: Multi-row Q6_K × Q8_1 GEMV (8 rows per block)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub unsafe fn gemv_q6k_q8_multi(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, m.max(1) as u32, 1);
+        let block = (32u32, 8, 1);
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q6k_q8_multi,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_gate_up_silu_q4k: Fused MLP gate+up+SiLU for Q4_K weights
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub unsafe fn fused_gate_up_silu_q4k(
+        &self,
+        gate_data: *const u8,
+        up_data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, 1, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_gate = gate_data;
+        let mut p_up = up_data;
+        let mut p_x = x_q8;
+        let mut p_out = out;
+        let mut p_n = n;
+        let mut p_k = k;
+
+        hip_launch_kernel(
+            self.fn_fused_gate_up_silu_q4k,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32       as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32       as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    pub unsafe fn fused_gate_up_silu_q6k(
+        &self,
+        gate_data: *const u8,
+        up_data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, 1, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_gate = gate_data;
+        let mut p_up = up_data;
+        let mut p_x = x_q8;
+        let mut p_out = out;
+        let mut p_n = n;
+        let mut p_k = k;
+
+        hip_launch_kernel(
+            self.fn_fused_gate_up_silu_q6k,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32       as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32       as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Fused QKV Q4K — Q+K+V projections in a single launch
+    // Grid : (ceil((Nq+Nk+Nv)/8), 1, 1)
+    // Block: (32, 8, 1) — 8 warps sharing Q8 via LDS
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_qkv_q4k(
+        &self,
+        wq_data: *const u8,
+        wk_data: *const u8,
+        wv_data: *const u8,
+        x_q8: *const u8,
+        out_q: *mut f32,
+        out_k: *mut f32,
+        out_v: *mut f32,
+        nq: i32, nk: i32, nv: i32, k: i32,
+    ) -> Result<(), HipError> {
+        let total = nq + nk + nv;
+        let grid = (((total + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+
+        let mut p_wq = wq_data;
+        let mut p_wk = wk_data;
+        let mut p_wv = wv_data;
+        let mut p_x = x_q8;
+        let mut p_oq = out_q;
+        let mut p_ok = out_k;
+        let mut p_ov = out_v;
+        let mut p_nq = nq;
+        let mut p_nk = nk;
+        let mut p_nv = nv;
+        let mut p_k = k;
+
+        hip_launch_kernel(
+            self.fn_fused_qkv_q4k,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_wq as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_wk as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_wv as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x  as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_oq as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_ok as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_ov as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_nq as *mut i32       as *mut std::ffi::c_void,
+                &mut p_nk as *mut i32       as *mut std::ffi::c_void,
+                &mut p_nv as *mut i32       as *mut std::ffi::c_void,
+                &mut p_k  as *mut i32       as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Fused RMSNorm + Quantize Q8_1
+    // Grid : (1, 1, 1) — single block for 1 token
+    // Block: (1024, 1, 1)
+    // Shared: (1024 + hidden) * 4 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn fused_rms_norm_quantize(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out_f32: *mut f32,
+        out_q8: *mut u8,
+        hidden: i32,
+        eps: f32,
+    ) -> Result<(), HipError> {
+        let block_size = 1024i32.min(hidden.next_power_of_two());
+        let grid = (1u32, 1, 1);
+        let block = (block_size as u32, 1, 1);
+        let shared_bytes = ((block_size + hidden) as u32) * 4; // reduction + normed buf
+
+        let mut p_x = x;
+        let mut p_w = w;
+        let mut p_of = out_f32;
+        let mut p_oq = out_q8;
+        let mut p_h = hidden;
+        let mut p_e = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_norm_quantize,
+            grid,
+            block,
+            shared_bytes,
+            ptr::null_mut(),
+            &mut [
+                &mut p_x  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_w  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_of as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_oq as *mut *mut u8    as *mut std::ffi::c_void,
+                &mut p_h  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_e  as *mut f32        as *mut std::ffi::c_void,
             ],
         )
     }
@@ -1220,20 +1796,20 @@ impl GpuKernels {
     /// All pointers must point to valid GPU allocations.
     pub unsafe fn fused_attention_decode(
         &self,
-        q: *const f32,          // [1, n_heads * head_dim]
-        k_cache: *const f32,    // [max_seq, n_kv_heads * head_dim]
-        v_cache: *const f32,    // [max_seq, n_kv_heads * head_dim]
-        out: *mut f32,          // [1, n_heads * head_dim]
+        q: *const f32,          // [n_heads * head_dim]
+        k_cache: *const f32,    // [seq_len, n_kv_heads * head_dim]
+        v_cache: *const f32,    // [seq_len, n_kv_heads * head_dim]
+        out: *mut f32,          // [n_heads * head_dim]
         seq_len: i32,
         head_dim: i32,
         n_heads: i32,
         n_kv_heads: i32,
-        kv_dim: i32,
         scale: f32,
     ) -> Result<(), HipError> {
         let grid = (n_heads as u32, 1, 1);
         let block = (256u32, 1, 1);
-        let shared_bytes = (256 + head_dim as u32) * 4; // floats
+        // Dynamic shared memory: seq_len floats for attention scores
+        let shared_bytes = (seq_len as u32) * 4;
 
         let mut p_q = q;
         let mut p_k = k_cache;
@@ -1243,7 +1819,6 @@ impl GpuKernels {
         let mut p_hd = head_dim;
         let mut p_nh = n_heads;
         let mut p_nk = n_kv_heads;
-        let mut p_kd = kv_dim;
         let mut p_sc = scale;
 
         hip_launch_kernel(
@@ -1261,7 +1836,6 @@ impl GpuKernels {
                 &mut p_hd as *mut i32 as *mut std::ffi::c_void,
                 &mut p_nh as *mut i32 as *mut std::ffi::c_void,
                 &mut p_nk as *mut i32 as *mut std::ffi::c_void,
-                &mut p_kd as *mut i32 as *mut std::ffi::c_void,
                 &mut p_sc as *mut f32 as *mut std::ffi::c_void,
             ],
         )

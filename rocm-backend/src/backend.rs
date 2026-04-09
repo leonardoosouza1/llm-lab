@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use compute_core::{
     params::{
-        AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params,
+        AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params, GemvQ4KParams, GemvQ6KParams,
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
-        RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
+        RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams, SoftmaxCausalParams,
+        QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
-        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams,
+        KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -184,6 +185,10 @@ impl ComputeBackend for RocmBackend {
         buf.to_host().unwrap()
     }
 
+    fn device_sync(&self) {
+        hip_ffi::safe::hip_device_sync().ok();
+    }
+
     fn download_bf16_as_f32(&self, t: &AnyTensor) -> Vec<f32> {
         let buf = t.downcast_ref::<DeviceBufferU16>()
             .expect("download_bf16_as_f32: expected BF16/u16 DeviceBuffer");
@@ -356,6 +361,20 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn softmax_rows_causal(&self, p: &SoftmaxCausalParams) -> Result<(), BackendError> {
+        let scores_ptr = unsafe { f32_mut_ptr(p.scores).add(p.offset_elems) };
+        unsafe {
+            self.kernels.softmax_rows_causal(
+                scores_ptr,
+                p.n_rows as i32,
+                p.row_len as i32,
+                p.n_tokens as i32,
+                p.query_offset as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     fn silu_mul_inplace(&self, p: &SiluMulParams) -> Result<(), BackendError> {
         unsafe {
             self.kernels.silu_mul_inplace(
@@ -416,6 +435,82 @@ impl ComputeBackend for RocmBackend {
                 p.group_size as i32,
                 p.beta,
             )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q4k(&self, p: &GemvQ4KParams) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.dequant_gemv_q4k(
+                u8_ptr(p.data),
+                x_ptr,
+                f32_mut_ptr(p.out),
+                p.m as i32,
+                p.n as i32,
+                p.k as i32,
+                p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q6k(&self, p: &GemvQ6KParams) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.dequant_gemv_q6k(
+                u8_ptr(p.data),
+                x_ptr,
+                f32_mut_ptr(p.out),
+                p.m as i32,
+                p.n as i32,
+                p.k as i32,
+                p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn quantize_q8(&self, p: &QuantizeQ8Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.quantize_f32_q8_1(x_ptr, u8_mut_ptr(p.out), p.k as i32)
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q4k_q8(&self, p: &GemvQ4KQ8Params) -> Result<(), BackendError> {
+        unsafe {
+            // Use multi-row kernel for N > 256 (MLP intermediate, lm_head)
+            // 8 warps share Q8 input via LDS, reducing global reads
+            if p.n > 256 && p.m == 1 {
+                self.kernels.gemv_q4k_q8_multi(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else {
+                self.kernels.gemv_q4k_q8(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q6k_q8(&self, p: &GemvQ6KQ8Params) -> Result<(), BackendError> {
+        unsafe {
+            if p.n > 256 && p.m == 1 {
+                self.kernels.gemv_q6k_q8_multi(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else {
+                self.kernels.gemv_q6k_q8(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
@@ -722,8 +817,51 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn fused_rms_norm_quantize(&self, p: &FusedRmsNormQuantizeParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.fused_rms_norm_quantize(
+                f32_ptr(p.input), f32_ptr(p.weight),
+                f32_mut_ptr(p.out_f32), u8_mut_ptr(p.out_q8),
+                p.hidden_size as i32, p.eps,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_qkv(&self, p: &FusedQkvParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.fused_qkv_q4k(
+                u8_ptr(p.wq_data), u8_ptr(p.wk_data), u8_ptr(p.wv_data),
+                u8_ptr(p.x_q8),
+                f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),
+                p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_gate_up_silu(&self, p: &FusedGateUpSiluParams, is_q6k: bool) -> Result<(), BackendError> {
+        unsafe {
+            let gate_ptr = u8_ptr(p.gate_data);
+            let up_ptr = u8_ptr(p.up_data);
+            let q8_ptr = u8_ptr(p.x_q8);
+            let out_ptr = f32_mut_ptr(p.out);
+            if is_q6k {
+                self.kernels.fused_gate_up_silu_q6k(
+                    gate_ptr, up_ptr, q8_ptr, out_ptr,
+                    p.n as i32, p.k as i32,
+                )
+            } else {
+                self.kernels.fused_gate_up_silu_q4k(
+                    gate_ptr, up_ptr, q8_ptr, out_ptr,
+                    p.n as i32, p.k as i32,
+                )
+            }
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     fn fused_attention_decode(&self, p: &FusedAttentionDecodeParams) -> Result<(), BackendError> {
-        let kv_dim = (p.n_kv_heads * p.head_dim) as i32;
         unsafe {
             self.kernels.fused_attention_decode(
                 f32_ptr(p.q),
@@ -734,7 +872,6 @@ impl ComputeBackend for RocmBackend {
                 p.head_dim as i32,
                 p.n_heads as i32,
                 p.n_kv_heads as i32,
-                kv_dim,
                 p.scale,
             )
         }

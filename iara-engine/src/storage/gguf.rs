@@ -32,17 +32,17 @@ pub enum GgmlType {
     Q2_K    = 10,
     Q3_K    = 11,
     Q4_K    = 12,
-    Q5_K    = 14,
-    Q6_K    = 15,
-    Q8_K    = 16,
-    IQ2_XXS = 17,
-    IQ2_XS  = 18,
-    IQ3_XXS = 19,
-    IQ1_S   = 20,
-    IQ4_NL  = 21,
-    IQ3_S   = 22,
-    IQ2_S   = 23,
-    IQ4_XS  = 24,
+    Q5_K    = 13,
+    Q6_K    = 14,
+    Q8_K    = 15,
+    IQ2_XXS = 16,
+    IQ2_XS  = 17,
+    IQ3_XXS = 18,
+    IQ1_S   = 19,
+    IQ4_NL  = 20,
+    IQ3_S   = 21,
+    IQ2_S   = 22,
+    IQ4_XS  = 23,
     BF16    = 30,
 }
 
@@ -60,9 +60,9 @@ impl GgmlType {
             10 => Some(Self::Q2_K),
             11 => Some(Self::Q3_K),
             12 => Some(Self::Q4_K),
-            14 => Some(Self::Q5_K),
-            15 => Some(Self::Q6_K),
-            16 => Some(Self::Q8_K),
+            13 => Some(Self::Q5_K),
+            14 => Some(Self::Q6_K),
+            15 => Some(Self::Q8_K),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -405,12 +405,18 @@ fn dequantize_q5_k(data: &[u8], n_elem: usize) -> Vec<f32> {
         let dmin = half::f16::from_bits(dmin_bits).to_f32();
 
         let scales = &block[4..16];   // 12 bytes
-        let qh = &block[16..48];       // 32 bytes (256 bits, 1 per value)
+        let qh = &block[16..48];       // 32 bytes: qh[l] has 8 bits for position l
         let qs = &block[48..176];      // 128 bytes
 
+        // GGML convention: qh[l] contains high bits for position l across all groups.
+        // bit 0,1 → group 0 (first half, second half)
+        // bit 2,3 → group 1
+        // bit 4,5 → group 2
+        // bit 6,7 → group 3
         let mut is = 0usize;
         let mut q_idx = 0usize;
-        let mut qh_idx = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
 
         for _j in 0..4 {
             let (sc1, m1) = get_scale_min_k4(is, scales);
@@ -421,24 +427,23 @@ fn dequantize_q5_k(data: &[u8], n_elem: usize) -> Vec<f32> {
             let d2 = d * sc2 as f32;
             let m2f = dmin * m2 as f32;
 
-            // First 32 values (low nibble + high bit)
+            // First 32 values (low nibble + high bit from u1)
             for l in 0..32 {
-                let lo = (qs[q_idx + l] & 0x0F) as u8;
-                let hi = ((qh[qh_idx + l / 8] >> (l % 8)) & 1) as u8;
-                let q = (lo | (hi << 4)) as f32;
-                output.push(d1 * q - m1f);
+                let lo = (qs[q_idx + l] & 0x0F) as u32;
+                let hi = if qh[l] & u1 != 0 { 16u32 } else { 0u32 };
+                output.push(d1 * (lo + hi) as f32 - m1f);
             }
-            // Next 32 values (high nibble + high bit)
+            // Next 32 values (high nibble + high bit from u2)
             for l in 0..32 {
-                let lo = (qs[q_idx + l] >> 4) as u8;
-                let hi = ((qh[qh_idx + (l + 32) / 8] >> ((l + 32) % 8)) & 1) as u8;
-                let q = (lo | (hi << 4)) as f32;
-                output.push(d2 * q - m2f);
+                let lo = ((qs[q_idx + l] >> 4) & 0x0F) as u32;
+                let hi = if qh[l] & u2 != 0 { 16u32 } else { 0u32 };
+                output.push(d2 * (lo + hi) as f32 - m2f);
             }
 
             q_idx += 32;
-            qh_idx += 8; // 64 bits per group of 64 values
             is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 
@@ -455,37 +460,50 @@ fn dequantize_q5_k(data: &[u8], n_elem: usize) -> Vec<f32> {
 
 fn dequantize_q6_k(data: &[u8], n_elem: usize) -> Vec<f32> {
     const QK_K: usize = 256;
-    const BLOCK_SIZE: usize = 210;
+    const BLOCK_SIZE: usize = 210; // 128 ql + 64 qh + 16 scales + 2 d
 
     let n_blocks = n_elem / QK_K;
-    let mut output = Vec::with_capacity(n_elem);
+    let mut output = vec![0.0f32; n_elem];
 
     for i in 0..n_blocks {
         let block = &data[i * BLOCK_SIZE..];
+        let out = &mut output[i * QK_K..(i + 1) * QK_K];
 
-        let ql = &block[0..128];
-        let qh = &block[128..192];
-        let scales = &block[192..208]; // 16 int8 scales
-        let d_bits = u16::from_le_bytes([block[208], block[209]]);
-        let d = half::f16::from_bits(d_bits).to_f32();
+        let ql_base = &block[0..128];
+        let qh_base = &block[128..192];
+        let sc_base = &block[192..208]; // 16 int8 scales
+        let d = half::f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
 
-        for n in 0..QK_K {
-            // Extract 6-bit value from ql (4 low bits) and qh (2 high bits)
-            let ql_idx = n / 2;
-            let ql_val = if n % 2 == 0 {
-                ql[ql_idx] & 0x0F
-            } else {
-                ql[ql_idx] >> 4
-            };
+        // Process 2 groups of 128 values each
+        // GGML reference: for each group of 128, process 4 sub-groups of 32
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
+        let mut y_off = 0usize;
 
-            let qh_idx = n / 4;
-            let qh_shift = (n % 4) * 2;
-            let qh_val = (qh[qh_idx] >> qh_shift) & 0x03;
+        for _n_group in 0..2 {
+            let ql = &ql_base[ql_off..];
+            let qh = &qh_base[qh_off..];
+            let sc = &sc_base[sc_off..];
 
-            let q = ((ql_val | (qh_val << 4)) as i8 - 32) as f32;
-            let sc = scales[n / 16] as i8 as f32;
+            for l in 0..32 {
+                let q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i8 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
 
-            output.push(d * sc * q);
+                // GGML reference: is = l/16 selects between 2 scales per sub-group
+                let is = l / 16; // 0 for l<16, 1 for l>=16
+                out[y_off + l]      = d * sc[is]     as i8 as f32 * q1 as f32;
+                out[y_off + l + 32] = d * sc[is + 2] as i8 as f32 * q2 as f32;
+                out[y_off + l + 64] = d * sc[is + 4] as i8 as f32 * q3 as f32;
+                out[y_off + l + 96] = d * sc[is + 6] as i8 as f32 * q4 as f32;
+            }
+
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+            y_off += 128;
         }
     }
 
@@ -650,5 +668,88 @@ mod tests {
         // Value at index 32 (high nibble of first group's second half):
         // d=1.0, scale=1, q=5, min=0 → 5.0
         assert!((result[32] - 5.0).abs() < 0.01, "got {}", result[32]);
+    }
+
+    #[test]
+    fn test_gguf_dequant_stats() {
+        use std::path::Path;
+
+        let gguf_path = Path::new("/home/leonardo/projects/LLM/llm-lab/models/qwen2.5-1.5b-q4km.gguf");
+        if !gguf_path.exists() {
+            eprintln!("SKIP: GGUF file not found");
+            return;
+        }
+
+        let gguf = GgufFile::open(gguf_path).expect("Failed to open GGUF");
+
+        // Print model metadata
+        for (k, v) in &gguf.metadata {
+            if k.contains("block_count") || k.contains("embedding") || k.contains("vocab")
+               || k.contains("head_count") || k.contains("context") || k.contains("feed_forward") {
+                println!("GGUF meta: {} = {:?}", k, v);
+            }
+        }
+
+        // Check norm tensor (F32 — should be sane)
+        let norm_name = "blk.0.attn_norm.weight";
+        let norm = gguf.dequantize_f32(norm_name).expect("Failed to dequant norm");
+        println!("\n{}: len={} shape={:?}", norm_name,
+            norm.len(), gguf.tensors.get(norm_name).unwrap().shape);
+        println!("  first10: {:?}", &norm[..10.min(norm.len())]);
+        println!("  min={:.6} max={:.6} mean={:.6}",
+            norm.iter().cloned().fold(f32::MAX, f32::min),
+            norm.iter().cloned().fold(f32::MIN, f32::max),
+            norm.iter().sum::<f32>() / norm.len() as f32);
+
+        // Check Q4_K tensor (attn_q)
+        let q_name = "blk.0.attn_q.weight";
+        let q = gguf.dequantize_f32(q_name).expect("Failed to dequant q");
+        let q_info = gguf.tensors.get(q_name).unwrap();
+        println!("\n{}: len={} shape={:?} dtype={:?}", q_name, q.len(), q_info.shape, q_info.dtype);
+        println!("  first10: {:?}", &q[..10]);
+        println!("  min={:.6} max={:.6} mean={:.6} std={:.6}",
+            q.iter().cloned().fold(f32::MAX, f32::min),
+            q.iter().cloned().fold(f32::MIN, f32::max),
+            q.iter().sum::<f32>() / q.len() as f32,
+            {
+                let mean = q.iter().sum::<f32>() / q.len() as f32;
+                (q.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / q.len() as f32).sqrt()
+            });
+
+        // Check embed (Q5_K)
+        let embed_name = "token_embd.weight";
+        let embed = gguf.dequantize_f32(embed_name).expect("Failed to dequant embed");
+        let embed_info = gguf.tensors.get(embed_name).unwrap();
+        println!("\n{}: len={} shape={:?} dtype={:?}", embed_name, embed.len(), embed_info.shape, embed_info.dtype);
+        // The embed shape is [1536, 151936] in GGUF (= [hidden, vocab] in GGML ne order)
+        // After reversal: [151936, 1536] (= [vocab, hidden] in PyTorch order)
+        // Row 0 = first 1536 elements = embedding for token 0
+        println!("  Row0 (token 0) first10: {:?}", &embed[..10]);
+        println!("  Row1 (token 1) first10: {:?}", &embed[1536..1546]);
+        println!("  min={:.6} max={:.6} mean={:.6}",
+            embed.iter().cloned().fold(f32::MAX, f32::min),
+            embed.iter().cloned().fold(f32::MIN, f32::max),
+            embed.iter().sum::<f32>() / embed.len() as f32);
+
+        // Debug: print raw Q5_K block data for first block of embed
+        let embed_tinfo = gguf.tensors.get(embed_name).unwrap();
+        println!("  tensor_data_offset={:#x} tensor_offset={:#x} n_bytes={}",
+            gguf.tensor_data_offset, embed_tinfo.offset, embed_tinfo.n_bytes());
+        let embed_bytes = gguf.tensor_bytes(embed_name).unwrap();
+        let d_bits = u16::from_le_bytes([embed_bytes[0], embed_bytes[1]]);
+        let dmin_bits = u16::from_le_bytes([embed_bytes[2], embed_bytes[3]]);
+        println!("  Block0 raw: d_bits={:#06x} dmin_bits={:#06x} d={} dmin={}",
+            d_bits, dmin_bits,
+            half::f16::from_bits(d_bits).to_f32(),
+            half::f16::from_bits(dmin_bits).to_f32());
+        println!("  Block0 scales: {:?}", &embed_bytes[4..16]);
+        println!("  Block0 qh[0..8]: {:?}", &embed_bytes[16..24]);
+        println!("  Block0 qs[0..8]: {:?}", &embed_bytes[48..56]);
+
+        // Sanity: values should be small (typical range ±0.1 for embeddings)
+        let max_abs = embed.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        println!("  max_abs={:.4}", max_abs);
+        assert!(max_abs < 10.0, "Embed values too large: max_abs={}", max_abs);
+        assert!(max_abs > 0.001, "Embed values too small (all zeros?): max_abs={}", max_abs);
     }
 }

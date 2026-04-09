@@ -30,7 +30,7 @@ use opencl3::types::{cl_float, cl_int, cl_mem, cl_uint, cl_ushort, CL_BLOCKING};
 use compute_core::{
     AddBiasParams, AnyTensor, BackendError, ComputeBackend, DType,
     EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, KvCacheParams, LayerNormParams, RmsNormParams,
-    RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams,
+    RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams, SoftmaxCausalParams,
     KvCacheInt8AppendParams, KvCacheInt8ReadParams,
 };
 
@@ -764,6 +764,10 @@ impl ComputeBackend for OpenClBackend {
                 .map_err(|e| BackendError::Kernel(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn softmax_rows_causal(&self, _p: &SoftmaxCausalParams) -> Result<(), BackendError> {
+        Err(BackendError::Kernel("softmax_rows_causal not yet implemented for OpenCL".into()))
     }
 
     fn silu_mul_inplace(&self, p: &SiluMulParams) -> Result<(), BackendError> {

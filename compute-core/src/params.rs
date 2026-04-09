@@ -128,6 +128,16 @@ pub struct SoftmaxParams<'a> {
     pub row_len: usize,
 }
 
+/// Causal softmax row-wise (in-place) — masks future key positions
+pub struct SoftmaxCausalParams<'a> {
+    pub scores: &'a AnyTensor,
+    pub offset_elems: usize,
+    pub n_rows: usize,
+    pub row_len: usize,
+    pub n_tokens: usize,      // query tokens in this batch
+    pub query_offset: usize,  // position of first query token in sequence
+}
+
 /// SwiGLU: gate = silu(gate) * up (in-place em gate)
 pub struct SiluMulParams<'a> {
     pub gate: &'a AnyTensor,    // [n_tokens, intermediate] F32 (modificado in-place)
@@ -168,6 +178,99 @@ pub struct GemvQ4Params<'a> {
     pub x_offset: usize,           // offset em floats para x (para selecionar token específico)
     pub out: &'a AnyTensor,        // [m, n] F32 saída
     pub beta: f32,                 // 0.0 sobrescreve, 1.0 acumula (residual)
+}
+
+/// Native GGML Q4_K GEMV: raw Q4_K blocks × F32 activations → F32 output.
+/// Dequantizes on-the-fly in F32 — no BF16 intermediate, no error compounding.
+/// Each weight row is stored as consecutive Q4_K blocks (144 bytes per 256 values).
+pub struct GemvQ4KParams<'a> {
+    pub m: usize,                  // batch size (n_tokens, typically 1 for decode)
+    pub n: usize,                  // output dimension (rows of weight matrix)
+    pub k: usize,                  // input dimension (columns, must be multiple of 256)
+    pub data: &'a AnyTensor,       // [n * (k/256) * 144] raw Q4_K block bytes on GPU
+    pub x: &'a AnyTensor,          // [m, k] F32 input activations
+    pub x_offset: usize,           // offset in floats into x (for selecting specific token)
+    pub out: &'a AnyTensor,        // [m, n] F32 output
+    pub beta: f32,                 // 0.0=overwrite, 1.0=accumulate
+}
+
+/// Native GGML Q6_K GEMV: raw Q6_K blocks × F32 activations → F32 output.
+/// Same approach as Q4_K but for 6-bit quantization (210 bytes per 256 values).
+pub struct GemvQ6KParams<'a> {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,                  // must be multiple of 256
+    pub data: &'a AnyTensor,       // [n * (k/256) * 210] raw Q6_K block bytes on GPU
+    pub x: &'a AnyTensor,          // [m, k] F32 input activations
+    pub x_offset: usize,
+    pub out: &'a AnyTensor,        // [m, n] F32 output
+    pub beta: f32,
+}
+
+///// Quantize F32 activations to Q8_1 blocks for integer GEMV.
+pub struct QuantizeQ8Params<'a> {
+    pub x: &'a AnyTensor,          // [k] F32 input
+    pub x_offset: usize,           // offset in floats
+    pub out: &'a AnyTensor,        // [(k/32)*36] u8 output Q8_1 blocks
+    pub k: usize,                  // input dimension, must be multiple of 32
+}
+
+/// Q4_K × Q8_1 GEMV with dp4a integer dot product.
+pub struct GemvQ4KQ8Params<'a> {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub data: &'a AnyTensor,       // [n * (k/256) * 144] raw Q4_K blocks
+    pub x_q8: &'a AnyTensor,      // [(k/32)*36] Q8_1 blocks (pre-quantized)
+    pub out: &'a AnyTensor,        // [m, n] F32 output
+    pub beta: f32,
+}
+
+/// Q6_K × Q8_1 GEMV with integer multiply.
+pub struct GemvQ6KQ8Params<'a> {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub data: &'a AnyTensor,       // [n * (k/256) * 210] raw Q6_K blocks
+    pub x_q8: &'a AnyTensor,      // [(k/32)*36] Q8_1 blocks (pre-quantized)
+    pub out: &'a AnyTensor,        // [m, n] F32 output
+    pub beta: f32,
+}
+
+/// Fused RMSNorm + Quantize Q8_1: normalize and quantize in one kernel launch.
+pub struct FusedRmsNormQuantizeParams<'a> {
+    pub input: &'a AnyTensor,     // [hidden] F32 input
+    pub weight: &'a AnyTensor,    // [hidden] F32 RMSNorm weight
+    pub out_f32: &'a AnyTensor,   // [hidden] F32 normed output
+    pub out_q8: &'a AnyTensor,    // [(hidden/32)*36] Q8_1 output
+    pub hidden_size: usize,
+    pub eps: f32,
+}
+
+/// Fused QKV projection: compute Q, K, V from same Q8_1 input in one kernel launch.
+pub struct FusedQkvParams<'a> {
+    pub wq_data: &'a AnyTensor,   // [Nq * nblk * 144] Q weights (Q4K)
+    pub wk_data: &'a AnyTensor,   // [Nk * nblk * 144] K weights (Q4K)
+    pub wv_data: &'a AnyTensor,   // [Nv * nblk * 144] V weights (Q4K)
+    pub x_q8: &'a AnyTensor,     // [(K/32)*36] Q8_1 input
+    pub out_q: &'a AnyTensor,    // [Nq] Q output
+    pub out_k: &'a AnyTensor,    // [Nk] K output
+    pub out_v: &'a AnyTensor,    // [Nv] V output
+    pub nq: usize,               // Q output dim
+    pub nk: usize,               // K output dim
+    pub nv: usize,               // V output dim
+    pub k: usize,                // input dim (hidden_size)
+}
+
+/// Fused MLP gate+up+SiLU kernel: out[i] = SiLU(gate_dot[i]) * up_dot[i]
+/// Both gate and up weight matrices are Q4_K or Q6_K, input is Q8_1.
+pub struct FusedGateUpSiluParams<'a> {
+    pub gate_data: &'a AnyTensor,  // gate weight raw bytes
+    pub up_data: &'a AnyTensor,    // up weight raw bytes
+    pub x_q8: &'a AnyTensor,      // pre-quantized Q8_1 input
+    pub out: &'a AnyTensor,        // [N] F32 output (gate buffer reused)
+    pub n: usize,                  // intermediate_size (output dim)
+    pub k: usize,                  // hidden_size (input dim)
 }
 
 /// Gravity Score: calcula importância semântica por token

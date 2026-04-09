@@ -36,8 +36,19 @@ pub trait ComputeBackend: Send + Sync + 'static {
     /// Aloca buffer Q4 não inicializado no device.
     fn alloc_q4(&self, shape: &[usize]) -> AnyTensor;
 
+    /// Upload raw bytes to device (for GGML quantized blocks: Q4_K, Q6_K, etc.).
+    /// Shape is informational only — the actual buffer size is data.len() bytes.
+    fn upload_raw(&self, data: &[u8], shape: &[usize]) -> AnyTensor {
+        // Default: delegate to upload_q4 which stores as u8
+        self.upload_q4(data, shape)
+    }
+
     /// Download de tensor F32 device → Vec<f32> host. Sincroniza o device.
     fn download_f32(&self, t: &AnyTensor) -> Vec<f32>;
+
+    /// Synchronize device (wait for all pending GPU operations to complete).
+    /// Default implementation is a no-op (for CPU backends).
+    fn device_sync(&self) {}
 
     /// Download de tensor BF16 device → Vec<f32> host, convertendo BF16→F32.
     /// Default: tenta download_f32 (para backends que armazenam tudo como F32).
@@ -58,17 +69,59 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn layer_norm           (&self, p: &LayerNormParams)          -> Result<(), BackendError>;
     fn rope_inplace         (&self, p: &RopeParams)               -> Result<(), BackendError>;
     fn softmax_rows         (&self, p: &SoftmaxParams)            -> Result<(), BackendError>;
+    fn softmax_rows_causal  (&self, p: &SoftmaxCausalParams)     -> Result<(), BackendError>;
     fn silu_mul_inplace     (&self, p: &SiluMulParams)            -> Result<(), BackendError>;
     fn gelu_mul_inplace     (&self, p: &GeluMulParams)            -> Result<(), BackendError>;
     fn copy_to_kv_cache     (&self, p: &KvCacheParams)            -> Result<(), BackendError>;
     fn add_bias_inplace     (&self, p: &AddBiasParams)            -> Result<(), BackendError>;
     fn gemv_q4              (&self, p: &GemvQ4Params)             -> Result<(), BackendError>;
+
+    /// Native GGML Q4_K GEMV: operates directly on raw Q4_K blocks on device.
+    /// Dequantizes on-the-fly in F32, no BF16 intermediate.
+    fn gemv_q4k             (&self, _p: &GemvQ4KParams)           -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q4k".into()))
+    }
+
+    /// Native GGML Q6_K GEMV: operates directly on raw Q6_K blocks on device.
+    fn gemv_q6k             (&self, _p: &GemvQ6KParams)           -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q6k".into()))
+    }
+    /// Quantize F32 activations to Q8_1 blocks for fast integer GEMV.
+    fn quantize_q8          (&self, _p: &QuantizeQ8Params)        -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("quantize_q8".into()))
+    }
+    /// Q4_K × Q8_1 GEMV with dp4a integer dot product.
+    fn gemv_q4k_q8          (&self, _p: &GemvQ4KQ8Params)        -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q4k_q8".into()))
+    }
+    /// Q6_K × Q8_1 GEMV with integer multiply.
+    fn gemv_q6k_q8          (&self, _p: &GemvQ6KQ8Params)        -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q6k_q8".into()))
+    }
+
     fn gravity_score        (&self, p: &GravityScoreParams)       -> Result<(), BackendError>;
     fn cfc_forward          (&self, p: &CfcForwardParams)         -> Result<(), BackendError>;
     fn kv_cache_quantized_append(&self, p: &KvCacheQuantizedParams) -> Result<(), BackendError>;
     fn fused_norm_bias_rope (&self, p: &FusedNormBiasRopeParams)  -> Result<(), BackendError>;
     fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError>;
     fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError>;
+
+    /// Fused RMSNorm + Q8 quantize in one kernel (saves 1 launch per norm+quantize pair).
+    fn fused_rms_norm_quantize(&self, _p: &FusedRmsNormQuantizeParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_norm_quantize".into()))
+    }
+
+    /// Fused QKV projection: compute Q, K, V from same input in one kernel launch.
+    /// Default: returns NotImplemented (fallback to separate Q + K + V projections).
+    fn fused_qkv(&self, _p: &FusedQkvParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_qkv".into()))
+    }
+
+    /// Fused MLP gate+up+SiLU: out[i] = SiLU(dot(gate[i], x)) * dot(up[i], x) in one kernel.
+    /// Default: returns NotImplemented (fallback to separate gate + up + silu_mul).
+    fn fused_gate_up_silu(&self, _p: &FusedGateUpSiluParams, _is_q6k: bool) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_gate_up_silu".into()))
+    }
 
     /// Fused single-token attention: Q×K^T → softmax → ×V in one kernel (decode n=1).
     /// Default: returns NotImplemented (fallback to separate GEMM+softmax+GEMM).

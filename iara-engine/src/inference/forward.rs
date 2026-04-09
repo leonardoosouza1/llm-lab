@@ -102,6 +102,20 @@ pub fn forward_traced_buffered(
     })
 }
 
+/// Fast decode step — skips top_logits and layer_traces for maximum throughput.
+/// Returns only (token_id, token_str). Avoids 152K Vec allocation per token.
+pub fn forward_decode_fast(
+    model: &mut CausalLM,
+    token_ids: &[u32],
+    sampling: &SamplingParams,
+    sampling_buf: &mut SamplingBuffer,
+) -> ModelResult<(u32, String)> {
+    let (logits, _layer_traces) = model.forward(token_ids, None)?;
+    let token_id  = sample_token_buffered(&logits, sampling, sampling_buf);
+    let token_str = tokenizer::token_id_to_text(token_id);
+    Ok((token_id, token_str))
+}
+
 /// Legacy wrapper — allocates a SamplingBuffer per call.
 /// Use `forward_traced_buffered` for hot decode loops.
 pub fn forward_traced(
