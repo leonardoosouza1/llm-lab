@@ -2980,7 +2980,7 @@ impl CausalLM {
             self.scratch.q8_scratch.as_ref(), false,
         )?;
 
-        // ── Download logits: único to_host() de todo o forward ───────────────
+        // ── Download logits OR GPU argmax ────────────────────────────────────
         if let Some(t0) = forward_t0 {
             self.backend.device_sync();
             log::warn!("PROF lm_head_done @ {:?}", t0.elapsed());
@@ -2991,6 +2991,35 @@ impl CausalLM {
         }
 
         Ok((logits, layer_traces))
+    }
+
+    /// Fast greedy forward: runs entire forward pass and returns token_id via GPU argmax.
+    /// Skips downloading 608KB of logits — only downloads 4 bytes (the argmax index).
+    pub fn forward_greedy(&mut self, token_ids: &[u32]) -> ModelResult<u32> {
+        let vocab = self.cfg.vocab_size;
+
+        // Run full forward which computes logits on device AND downloads them
+        let (logits, _) = self.forward(token_ids, None)?;
+
+        // GPU argmax on device tensor (logits still in scratch.logits)
+        match self.backend.gpu_argmax(&self.scratch.logits, vocab) {
+            Ok(token_id) => {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    log::warn!("GPU ARGMAX: active (vocab={})", vocab);
+                }
+                Ok(token_id as u32)
+            }
+            Err(_) => {
+                // Fallback: CPU argmax on downloaded logits
+                Ok(logits.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0))
+            }
+        }
     }
 
     /// Forward pass with deep per-token trace capturing rich telemetry.

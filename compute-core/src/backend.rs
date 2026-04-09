@@ -190,6 +190,15 @@ pub trait ComputeBackend: Send + Sync + 'static {
         Err(BackendError::NotImplemented("topk_select".into()))
     }
 
+    // ── GPU-side sampling ─────────────────────────────────────────────────────
+
+    /// GPU-side argmax: find index of max value without downloading logits.
+    /// Returns (argmax_tensor_i32, optional_maxval_tensor_f32).
+    /// Default: returns NotImplemented (fallback to CPU download + argmax).
+    fn gpu_argmax(&self, _logits: &AnyTensor, _ncols: usize) -> Result<i32, BackendError> {
+        Err(BackendError::NotImplemented("gpu_argmax".into()))
+    }
+
     // ── Sync e informações ───────────────────────────────────────────────────
 
     /// Sincroniza o device (equivale a hipDeviceSynchronize / clFinish).

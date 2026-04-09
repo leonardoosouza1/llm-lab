@@ -86,6 +86,7 @@ pub struct RocmBackend {
     kernels: hip_ffi::GpuKernels,
     tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
     act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
+    argmax_buf: hip_ffi::safe::DeviceBuffer<i32>,
 }
 
 // SAFETY: `BlasHandle` and `GpuKernels` both declare `unsafe impl Send + Sync`
@@ -116,11 +117,16 @@ impl RocmBackend {
         let act_bf16 = hip_ffi::safe::DeviceBuffer::<u16>::alloc(4096 * 8192)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc act_bf16: {e}")))?;
 
+        // Pre-allocate argmax result buffer (1 i32 on device)
+        let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
+            .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
+
         Ok(Self {
             blas,
             kernels,
             tok_buf: std::sync::Mutex::new(tok_buf),
             act_bf16: std::sync::Mutex::new(act_bf16),
+            argmax_buf,
         })
     }
 }
@@ -771,6 +777,27 @@ impl ComputeBackend for RocmBackend {
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    // ── GPU-side sampling ──────────────────────────────────────────────────────
+
+    fn gpu_argmax(&self, logits: &AnyTensor, ncols: usize) -> Result<i32, BackendError> {
+        let logits_ptr = f32_ptr(logits);
+        let dst_ptr = self.argmax_buf.as_ptr() as *mut i32;
+        unsafe {
+            self.kernels.argmax_f32(
+                logits_ptr,
+                dst_ptr,
+                std::ptr::null_mut(),  // no max value needed
+                ncols as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))?;
+
+        // Download just 4 bytes instead of 608KB
+        let result = self.argmax_buf.to_host()
+            .map_err(|e| BackendError::Kernel(e.to_string()))?;
+        Ok(result[0])
     }
 
     // ── Sync and info ─────────────────────────────────────────────────────────

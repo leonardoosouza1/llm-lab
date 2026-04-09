@@ -1257,7 +1257,7 @@ extern "C" __global__ void gemv_q4k_q8(
 // Block: (32, 8, 1) — 8 warps, each handles one row
 // ---------------------------------------------------------------------------
 #define MULTI_ROWS 8
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 4)
 extern "C" __global__ void gemv_q4k_q8_multi(
     const unsigned char* __restrict__ w_data,  // [N * nblk * 144] raw Q4_K
     const unsigned char* __restrict__ x_q8,    // [M * (K/32) * 36] Q8_1 blocks
@@ -1442,7 +1442,7 @@ extern "C" __global__ void gemv_q6k_q8(
 // Block: (32, 8, 1)
 // ---------------------------------------------------------------------------
 #define MULTI_ROWS_Q6 8
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 4)
 extern "C" __global__ void gemv_q6k_q8_multi(
     const unsigned char* __restrict__ w_data,
     const unsigned char* __restrict__ x_q8,
@@ -1535,7 +1535,7 @@ extern "C" __global__ void gemv_q6k_q8_multi(
 // Block: (32, 8, 1) — 8 warps
 // ---------------------------------------------------------------------------
 #define FUSED_QKV_ROWS 8
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 4)
 extern "C" __global__ void fused_qkv_q4k(
     const unsigned char* __restrict__ wq_data,  // [Nq * nblk * 144] Q weights
     const unsigned char* __restrict__ wk_data,  // [Nk * nblk * 144] K weights
@@ -1843,7 +1843,7 @@ extern "C" __global__ void fused_gate_up_silu_q6k(
 // Block: (32, 8, 1) — 8 warps
 // ---------------------------------------------------------------------------
 #define FUSED_MLP_ROWS 8
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 4)
 extern "C" __global__ void fused_gate_up_silu_q4k_multi(
     const unsigned char* __restrict__ gate_data,
     const unsigned char* __restrict__ up_data,
@@ -2859,6 +2859,90 @@ extern "C" __global__ void topk_select(
             }
         }
         count = filled;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: argmax_f32 — GPU-side argmax over F32 logits
+//
+// Finds the index of the maximum value in a row of floats.
+// Eliminates the need to download 608KB of logits to CPU for greedy sampling.
+//
+// Grid : (1, 1, 1)   — single row (last token logits)
+// Block: (1024, 1, 1) — 32 warps
+//
+// Phase 1: Each thread scans with stride, finds local max
+// Phase 2: Warp reduction via __shfl_xor
+// Phase 3: Inter-warp reduction via shared memory
+// Phase 4: Thread 0 writes argmax index + max value
+// ---------------------------------------------------------------------------
+__launch_bounds__(1024, 1)
+extern "C" __global__ void argmax_f32(
+    const float* __restrict__ x,      // [ncols] logits
+    int*         __restrict__ dst,     // [1] output argmax index
+    float*       __restrict__ dst_val, // [1] output max value (optional, can be NULL)
+    int ncols
+) {
+    const int tid = threadIdx.x;
+
+    float maxval = -1e30f;
+    int   argmax = 0;
+
+    // Phase 1: Strided scan
+    for (int col = tid; col < ncols; col += blockDim.x) {
+        const float val = x[col];
+        if (val > maxval) {
+            maxval = val;
+            argmax = col;
+        }
+    }
+
+    // Phase 2: Warp reduction via __shfl_xor
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float val = __shfl_xor(maxval, offset);
+        const int   col = __shfl_xor(argmax, offset);
+        if (val > maxval) {
+            maxval = val;
+            argmax = col;
+        }
+    }
+
+    // Phase 3: Inter-warp reduction via shared memory
+    const int lane_id = tid & 31;
+    const int warp_id = tid >> 5;
+    const int n_warps = blockDim.x >> 5;  // 1024/32 = 32
+
+    __shared__ float shared_maxval[32];
+    __shared__ int   shared_argmax[32];
+
+    if (lane_id == 0) {
+        shared_maxval[warp_id] = maxval;
+        shared_argmax[warp_id] = argmax;
+    }
+    __syncthreads();
+
+    // Warp 0 does final reduction
+    if (warp_id == 0) {
+        maxval = (lane_id < n_warps) ? shared_maxval[lane_id] : -1e30f;
+        argmax = (lane_id < n_warps) ? shared_argmax[lane_id] : 0;
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float val = __shfl_xor(maxval, offset);
+            const int   col = __shfl_xor(argmax, offset);
+            if (val > maxval) {
+                maxval = val;
+                argmax = col;
+            }
+        }
+
+        if (lane_id == 0) {
+            dst[0] = argmax;
+            if (dst_val != nullptr) {
+                dst_val[0] = maxval;
+            }
+        }
     }
 }
 

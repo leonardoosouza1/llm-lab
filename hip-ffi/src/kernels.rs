@@ -80,6 +80,7 @@ pub struct GpuKernels {
     fn_fused_rms_norm_quantize: hipFunction_t,
     fn_fused_rope_kv_copy: hipFunction_t,
     fn_fused_gate_up_silu_q4k_multi: hipFunction_t,
+    fn_argmax_f32: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -142,6 +143,7 @@ impl GpuKernels {
         let fn_fused_rms_norm_quantize = get_fn!("fused_rms_norm_quantize");
         let fn_fused_rope_kv_copy = get_fn!("fused_rope_kv_copy");
         let fn_fused_gate_up_silu_q4k_multi = get_fn!("fused_gate_up_silu_q4k_multi");
+        let fn_argmax_f32 = get_fn!("argmax_f32");
 
         Ok(Self {
             module,
@@ -183,6 +185,7 @@ impl GpuKernels {
             fn_fused_rms_norm_quantize,
             fn_fused_rope_kv_copy,
             fn_fused_gate_up_silu_q4k_multi,
+            fn_argmax_f32,
         })
     }
 }
@@ -1932,6 +1935,49 @@ impl GpuKernels {
                 &mut p_nh as *mut i32 as *mut std::ffi::c_void,
                 &mut p_nk as *mut i32 as *mut std::ffi::c_void,
                 &mut p_sc as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // argmax_f32: GPU-side argmax over F32 logits
+    //
+    // Finds the index of the maximum value. Eliminates 608KB logits download.
+    // Grid: (1, 1, 1), Block: (1024, 1, 1)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// GPU-side argmax: returns index of maximum value in `x[0..ncols]`.
+    ///
+    /// # Safety
+    /// `x` must point to at least `ncols` f32 values on device.
+    /// `dst` must point to at least 1 i32 on device.
+    /// `dst_val` can be null or point to 1 f32 on device.
+    pub unsafe fn argmax_f32(
+        &self,
+        x: *const f32,         // [ncols] logits on device
+        dst: *mut i32,         // [1] output argmax index
+        dst_val: *mut f32,     // [1] output max value (nullable)
+        ncols: i32,
+    ) -> Result<(), HipError> {
+        let grid = (1u32, 1, 1);
+        let block = (1024u32, 1, 1);
+
+        let mut p_x = x;
+        let mut p_dst = dst;
+        let mut p_dst_val = dst_val;
+        let mut p_ncols = ncols;
+
+        hip_launch_kernel(
+            self.fn_argmax_f32,
+            grid,
+            block,
+            0,
+            ptr::null_mut(),
+            &mut [
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut i32 as *mut std::ffi::c_void,
+                &mut p_dst_val as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_ncols as *mut i32 as *mut std::ffi::c_void,
             ],
         )
     }
