@@ -1,5 +1,5 @@
 use crate::{AnyTensor, BackendError, params::*};
-use crate::params::{KvCacheInt8AppendParams, KvCacheInt8ReadParams};
+use crate::params::{KvCacheInt8AppendParams, KvCacheInt8ReadParams, KvCacheWhtAppendParams, KvCacheWhtReadParams};
 
 /// Trait principal de backend de compute.
 /// Toda implementação (ROCm, OpenCL, CPU) implementa este trait.
@@ -133,6 +133,16 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn fused_norm_bias_rope (&self, p: &FusedNormBiasRopeParams)  -> Result<(), BackendError>;
     fn kv_cache_int8_append(&self, p: &KvCacheInt8AppendParams) -> Result<(), BackendError>;
     fn kv_cache_int8_read(&self, p: &KvCacheInt8ReadParams) -> Result<(), BackendError>;
+
+    /// WHT+INT8 KV cache append (Item 4: PolarQuant).
+    fn kv_cache_wht_append(&self, _p: &KvCacheWhtAppendParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("kv_cache_wht_append".into()))
+    }
+
+    /// WHT+INT8 KV cache read/dequant (Item 4: PolarQuant).
+    fn kv_cache_wht_read(&self, _p: &KvCacheWhtReadParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("kv_cache_wht_read".into()))
+    }
 
     /// Fused RoPE + KV cache copy: apply RoPE to Q/K, copy K+V to cache (saves 3 launches).
     fn fused_rope_kv_copy(&self, _p: &FusedRopeKvCopyParams) -> Result<(), BackendError> {

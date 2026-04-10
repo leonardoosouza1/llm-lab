@@ -14,6 +14,7 @@ pub use params::{
     FusedRmsQkvQ4Params, FusedRmsGateUpSiluQ4Params,
     GravityScoreParams, CfcForwardParams,
     KvCacheQuantizedParams, FusedNormBiasRopeParams, KvCacheInt8AppendParams, KvCacheInt8ReadParams,
+    KvCacheWhtAppendParams, KvCacheWhtReadParams,
     FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
 };
 pub use backend::ComputeBackend;

@@ -92,6 +92,11 @@ pub struct GpuKernels {
     fn_fused_rms_qkv_q4_f32: hipFunction_t,
     fn_fused_rms_gate_up_silu_q4_f32: hipFunction_t,
     fn_argmax_f32: hipFunction_t,
+    // WHT KV cache kernels (Item 4)
+    fn_kv_cache_wht_quant_append: hipFunction_t,
+    fn_kv_cache_wht_dequant: hipFunction_t,
+    // Flash Attention decode kernel (Item 5)
+    fn_flash_attention_decode: hipFunction_t,
     // Wave64 GEMV kernels (2.26x faster BW on RDNA2)
     module_w64: hipModule_t,
     fn_gemv_q4k_q8_w64: hipFunction_t,
@@ -167,6 +172,9 @@ impl GpuKernels {
         let fn_fused_rms_qkv_q4_f32 = get_fn!("fused_rms_qkv_q4_f32");
         let fn_fused_rms_gate_up_silu_q4_f32 = get_fn!("fused_rms_gate_up_silu_q4_f32");
         let fn_argmax_f32 = get_fn!("argmax_f32");
+        let fn_kv_cache_wht_quant_append = get_fn!("kv_cache_wht_quant_append");
+        let fn_kv_cache_wht_dequant = get_fn!("kv_cache_wht_dequant");
+        let fn_flash_attention_decode = get_fn!("flash_attention_decode");
 
         // Load wave64 GEMV kernels
         let module_w64 = hip_module_load_data(KERNEL_W64_BYTES)?;
@@ -228,6 +236,9 @@ impl GpuKernels {
             fn_fused_rms_qkv_q4_f32,
             fn_fused_rms_gate_up_silu_q4_f32,
             fn_argmax_f32,
+            fn_kv_cache_wht_quant_append,
+            fn_kv_cache_wht_dequant,
+            fn_flash_attention_decode,
             module_w64,
             fn_gemv_q4k_q8_w64,
             fn_fused_gate_up_silu_q4k_w64,
@@ -2359,6 +2370,151 @@ impl GpuKernels {
                 &mut p_dst as *mut *mut i32 as *mut std::ffi::c_void,
                 &mut p_dst_val as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_ncols as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Item 4: WHT KV cache kernels
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// WHT + INT8 quantize + append to KV cache.
+    /// head_dim must be power of 2 and <= 128 (blockDim.x limit).
+    pub unsafe fn kv_cache_wht_quant_append(
+        &self,
+        cache_q: *mut i8,
+        cache_scales: *mut f32,
+        new_kv: *const f32,
+        insert_pos: i32,
+        n_new_tokens: i32,
+        kv_dim: i32,
+        head_dim: i32,
+        n_kv_heads: i32,
+        max_seq: i32,
+    ) -> Result<(), HipError> {
+        let grid = (n_new_tokens as u32, n_kv_heads as u32, 1);
+        let block = (head_dim as u32, 1, 1);
+        let n_warps = ((head_dim + 31) / 32) as u32;
+        let shared_bytes = (head_dim as u32 + n_warps) * 4;
+
+        let mut p_cache_q = cache_q;
+        let mut p_scales = cache_scales;
+        let mut p_new_kv = new_kv;
+        let mut p_insert = insert_pos;
+        let mut p_ntok = n_new_tokens;
+        let mut p_kvdim = kv_dim;
+        let mut p_hdim = head_dim;
+        let mut p_nkvh = n_kv_heads;
+        let mut p_maxseq = max_seq;
+
+        hip_launch_kernel(
+            self.fn_kv_cache_wht_quant_append,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_cache_q as *mut *mut i8 as *mut std::ffi::c_void,
+                &mut p_scales as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_new_kv as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_insert as *mut i32 as *mut std::ffi::c_void,
+                &mut p_ntok as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kvdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nkvh as *mut i32 as *mut std::ffi::c_void,
+                &mut p_maxseq as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Dequantize WHT INT8 KV cache to F32 (inverse WHT + scale).
+    pub unsafe fn kv_cache_wht_dequant(
+        &self,
+        output: *mut f32,
+        cache_q: *const i8,
+        cache_scales: *const f32,
+        seq_len: i32,
+        kv_dim: i32,
+        head_dim: i32,
+        n_kv_heads: i32,
+    ) -> Result<(), HipError> {
+        let grid = (seq_len as u32, n_kv_heads as u32, 1);
+        let block = (head_dim as u32, 1, 1);
+        let n_warps = ((head_dim + 31) / 32) as u32;
+        let shared_bytes = (head_dim as u32 + n_warps) * 4;
+
+        let mut p_out = output;
+        let mut p_cq = cache_q;
+        let mut p_cs = cache_scales;
+        let mut p_seqlen = seq_len;
+        let mut p_kvdim = kv_dim;
+        let mut p_hdim = head_dim;
+        let mut p_nkvh = n_kv_heads;
+
+        hip_launch_kernel(
+            self.fn_kv_cache_wht_dequant,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_cq as *mut *const i8 as *mut std::ffi::c_void,
+                &mut p_cs as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_seqlen as *mut i32 as *mut std::ffi::c_void,
+                &mut p_kvdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nkvh as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Item 5: Flash Attention 2 decode kernel
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Flash Attention 2 for single-token decode.
+    /// Uses tiled K/V processing with online softmax.
+    /// Requires head_dim <= 128 (FA_BLOCK=128 threads).
+    pub unsafe fn flash_attention_decode(
+        &self,
+        q: *const f32,
+        k_cache: *const f32,
+        v_cache: *const f32,
+        out: *mut f32,
+        seq_len: i32,
+        head_dim: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        scale: f32,
+    ) -> Result<(), HipError> {
+        // FA_TILE=32, FA_NWARPS=4, FA_BLOCK=128
+        const FA_TILE: u32 = 32;
+        const FA_NWARPS: u32 = 4;
+        const FA_BLOCK: u32 = FA_TILE * FA_NWARPS;
+
+        let grid = (n_heads as u32, 1, 1);
+        let block = (FA_BLOCK, 1, 1);
+        // Shared: 2 * FA_TILE * head_dim * 4 bytes + FA_NWARPS * 2 * 4 bytes scratch
+        let shared_bytes = 2 * FA_TILE * head_dim as u32 * 4 + (FA_NWARPS + 1) * 4;
+
+        let mut p_q = q;
+        let mut p_k = k_cache;
+        let mut p_v = v_cache;
+        let mut p_out = out;
+        let mut p_seq = seq_len;
+        let mut p_hdim = head_dim;
+        let mut p_nh = n_heads;
+        let mut p_nkv = n_kv_heads;
+        let mut p_scale = scale;
+
+        hip_launch_kernel(
+            self.fn_flash_attention_decode,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_q as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_k as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_v as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nh as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nkv as *mut i32 as *mut std::ffi::c_void,
+                &mut p_scale as *mut f32 as *mut std::ffi::c_void,
             ],
         )
     }

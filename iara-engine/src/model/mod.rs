@@ -259,8 +259,8 @@ impl ForwardScratchpad {
         let mode = kv_cache::KvCacheMode::detect();
         let (kv_k_deq, kv_v_deq) = match mode {
             kv_cache::KvCacheMode::F32 => (None, None),
-            kv_cache::KvCacheMode::Int8 => {
-                // Aloca buffers para dequantização INT8 → F32 durante atenção
+            kv_cache::KvCacheMode::Int8 | kv_cache::KvCacheMode::Wht => {
+                // Aloca buffers para dequantização INT8/WHT → F32 durante atenção
                 (
                     Some(backend.alloc_f32(&[ms, kd])),
                     Some(backend.alloc_f32(&[ms, kd])),
@@ -1564,6 +1564,7 @@ impl CausalLM {
         match kv_cache::KvCacheMode::detect() {
             kv_cache::KvCacheMode::F32 => log::info!("  → KV-cache: F32 (precisão total)"),
             kv_cache::KvCacheMode::Int8 => log::info!("  → KV-cache: INT8 (4x menos VRAM)"),
+            kv_cache::KvCacheMode::Wht => log::info!("  → KV-cache: WHT+INT8 (PolarQuant, 4x menos VRAM + outlier redistribution)"),
         }
 
         // Log QK norm detection
@@ -2077,10 +2078,10 @@ impl CausalLM {
     /// - `token_ids`: token sequence to process
     /// - `layer_budget`: how many layers to use (Fast/Medium/Slow), None = use all
     pub fn forward(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
-        self.forward_inner(token_ids, layer_budget, false)
+        self.forward_inner(token_ids, layer_budget, false, false)
     }
 
-    fn forward_inner(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>, skip_logits_download: bool) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
+    fn forward_inner(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>, skip_logits_download: bool, skip_embed: bool) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
         let _fwd_t0 = std::time::Instant::now();
         hip_ffi::safe::reset_launch_count();
         let n    = token_ids.len();
@@ -2097,16 +2098,19 @@ impl CausalLM {
         let vocab = self.cfg.vocab_size;
 
         // Embedding lookup: BF16 embed → F32 x [n, h]
-        self.backend.embed_lookup(&EmbedParams {
-            token_ids,
-            vocab: &self.embed,
-            out: &self.scratch.x,
-            n_tokens: n,
-            hidden_size: h,
-        })?;
+        // skip_embed=true means caller already did this (e.g. to keep it outside graph capture)
+        if !skip_embed {
+            self.backend.embed_lookup(&EmbedParams {
+                token_ids,
+                vocab: &self.embed,
+                out: &self.scratch.x,
+                n_tokens: n,
+                hidden_size: h,
+            })?;
+        }
 
         // Debug: check embed lookup output
-        if std::env::var("IARA_DEBUG_GGUF").map(|v| v == "1").unwrap_or(false) {
+        if !skip_embed && std::env::var("IARA_DEBUG_GGUF").map(|v| v == "1").unwrap_or(false) {
             static EMBED_DEBUG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !EMBED_DEBUG_DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let x_data = self.backend.download_f32(&self.scratch.x);
@@ -2337,8 +2341,8 @@ impl CausalLM {
 
             prof_sync!("qkv_done");
             section_time!(PROF_QKV, _sec_t0);
-            // Biases: fused into super_fused_qkv/fused_qkv kernel when active, otherwise separate launches
-            if !super_fused_qkv && !fused_qkv_ok {
+            // Biases: fused into fused_qkv kernel when active, otherwise separate launches
+            if !fused_qkv_ok {
                 if let Some(ref bias) = layer.q_bias {
                     self.backend.add_bias_inplace(&AddBiasParams {
                         tensor: &self.scratch.q,
@@ -2488,6 +2492,21 @@ impl CausalLM {
                         max_seq: self.cfg.max_seq_len,
                     })?;
                 },
+                kv_cache::KvCacheMode::Wht => {
+                    let scales = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but no scales allocated".into()))?;
+                    self.backend.kv_cache_wht_append(&compute_core::KvCacheWhtAppendParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.k,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                },
             }
 
             match layer.kv_v.mode {
@@ -2516,6 +2535,21 @@ impl CausalLM {
                         max_seq: self.cfg.max_seq_len,
                     })?;
                 },
+                kv_cache::KvCacheMode::Wht => {
+                    let scales = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but no scales allocated".into()))?;
+                    self.backend.kv_cache_wht_append(&compute_core::KvCacheWhtAppendParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.v,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                },
             }
             } // end else !fused_rope_ok (KV cache append)
 
@@ -2524,7 +2558,7 @@ impl CausalLM {
 
             let seq = layer.kv_k.current_len;
 
-            // ── Dequantize KV cache if INT8 mode ───────────────────────────────
+            // ── Dequantize KV cache if INT8 / WHT mode ────────────────────────
             let (kv_k_use, kv_v_use) = match layer.kv_k.mode {
                 kv_cache::KvCacheMode::F32 => {
                     (&layer.kv_k.data, &layer.kv_v.data)
@@ -2550,6 +2584,38 @@ impl CausalLM {
                     let scales_v = layer.kv_v.scales.as_ref()
                         .ok_or_else(|| ModelError::Model("INT8 mode but kv_v scales not allocated".into()))?;
                     self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales_v,
+                        output: kv_v_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    (kv_k_deq, kv_v_deq)
+                },
+                kv_cache::KvCacheMode::Wht => {
+                    let kv_k_deq = self.scratch.kv_k_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_k_deq not allocated".into()))?;
+                    let kv_v_deq = self.scratch.kv_v_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_v_deq not allocated".into()))?;
+
+                    let scales_k = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_k scales not allocated".into()))?;
+                    self.backend.kv_cache_wht_read(&compute_core::KvCacheWhtReadParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales_k,
+                        output: kv_k_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    let scales_v = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_v scales not allocated".into()))?;
+                    self.backend.kv_cache_wht_read(&compute_core::KvCacheWhtReadParams {
                         cache_q: &layer.kv_v.data,
                         cache_scales: scales_v,
                         output: kv_v_deq,
@@ -2680,7 +2746,7 @@ impl CausalLM {
                         lda: seq,          // leading dim of score block
                         stride_a: n * seq, // stride between score blocks
                         a_offset: q_start * n * seq,
-                        b: &layer.kv_v.data,
+                        b: kv_v_use,       // use deq buffer when INT8 mode
                         ldb: kd,           // physical stride between token rows in V
                         stride_b: 0,       // broadcast: same V head for all Q heads
                         b_offset: kv_h * hd,     // this KV group's V head
@@ -2711,16 +2777,9 @@ impl CausalLM {
             prof_sync!("wo_done");
             section_time!(PROF_WO, _sec_t0);
             // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
-            // Compute is_calibrating early so super_fused_mlp_possible can account for it.
-            let is_calibrating = self.sparse_scratch.is_some()
-                && self.sparse_scratch.as_ref().map_or(false, |ss| {
-                    ss.calibration_accum.is_some() && !ss.calibrated
-                });
-            // super_fused_mlp_possible: the fused kernel can run only when not calibrating.
-            let super_fused_mlp_possible = n == 1 && !is_calibrating && matches!(norm_type, NormType::RMSNorm)
-                && (matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }))
-                    || matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4(_), LayerWeight::Q4(_))));
-            // Skip norm+quantize only when super_fused_mlp will actually run (same conditions).
+            // Check if super-fused MLP is possible — avoids norm+quantize if weights are Q4K
+            let super_fused_mlp_possible = n == 1 && matches!(norm_type, NormType::RMSNorm)
+                && matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }));
             let mlp_q8_pre = if super_fused_mlp_possible { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                     if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
@@ -2772,6 +2831,11 @@ impl CausalLM {
                 && n == 1  // sparse path only for single-token decode
                 && self.sparse_scratch.as_ref().map_or(false, |ss| ss.calibrated)
                 && matches!(&layer.wgate, LayerWeight::Bf16(_));
+
+            let is_calibrating = self.sparse_scratch.is_some()
+                && self.sparse_scratch.as_ref().map_or(false, |ss| {
+                    ss.calibration_accum.is_some() && !ss.calibrated
+                });
 
             if use_sparse {
                 // ── CALIBRATED-SPARSE MLP PATH ──────────────────────────────
@@ -2878,22 +2942,11 @@ impl CausalLM {
                 static SUPER_FUSED_MLP_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 let super_fused_mlp = if super_fused_mlp_possible && !is_calibrating {
                     match (&layer.wgate, &layer.wup) {
-                        // GGML Q4K format
                         (LayerWeight::Q4K { data: gd, .. }, LayerWeight::Q4K { data: ud, .. }) => {
                             self.backend.fused_rms_gate_up_silu_q4k_f32(&compute_core::FusedRmsGateUpSiluQ4KF32Params {
                                 x: &self.scratch.x, norm_w: &layer.post_attn_norm_w,
                                 gate: gd, up: ud, out: &self.scratch.gate,
                                 n: it, k: h, eps, x_offset: 0,
-                            }).is_ok()
-                        }
-                        // IARA native Q4 format
-                        (LayerWeight::Q4(qtg), LayerWeight::Q4(qtu)) => {
-                            self.backend.fused_rms_gate_up_silu_q4(&compute_core::FusedRmsGateUpSiluQ4Params {
-                                x: &self.scratch.x, norm_w: &layer.post_attn_norm_w,
-                                gate_packed: &qtg.packed, gate_scales: &qtg.scales, gate_zeros: &qtg.zeros,
-                                up_packed:   &qtu.packed, up_scales:   &qtu.scales, up_zeros:   &qtu.zeros,
-                                out: &self.scratch.gate,
-                                n: it, k: h, group_size: qtg.group_size, eps,
                             }).is_ok()
                         }
                         _ => false,
@@ -3248,22 +3301,45 @@ impl CausalLM {
         static GRAPH_LOGGED: AtomicBool = AtomicBool::new(false);
 
         let vocab = self.cfg.vocab_size;
+        let n = token_ids.len();
+        let h = self.cfg.hidden_size;
         let count = GREEDY_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // Graph capture DISABLED: KV-cache position changes per-token, making graphs
-        // non-replayable without hipGraphExecKernelNodeSetParams for every node.
-        // Focus on other optimizations (async H2D, kernel fusion, etc.)
-        let _ = count;
+        // ALWAYS do embed_lookup BEFORE graph capture (host pointer unstable in graph)
+        self.backend.embed_lookup(&EmbedParams {
+            token_ids,
+            vocab: &self.embed,
+            out: &self.scratch.x,
+            n_tokens: n,
+            hidden_size: h,
+        })?;
 
-        // Forward pass — all kernels dispatched to dedicated stream
         let greedy_t0 = std::time::Instant::now();
-        let launches_before = hip_ffi::safe::get_launch_count();
-        let _ = self.forward_inner(token_ids, None, true)?;
-        let dispatch_us = greedy_t0.elapsed().as_micros();
-        let launches_this_token = hip_ffi::safe::get_launch_count() - launches_before;
+        hip_ffi::safe::reset_launch_count();
 
-        // GPU argmax runs on same stream, so properly ordered.
-        // The argmax D2H copy implicitly syncs and gives us total time.
+        // Token 0: warmup without graph capture
+        // Token 1+: capture the forward pass (excluding embed already done above)
+        let use_graph = count >= 1;
+        if use_graph {
+            self.backend.begin_graph_capture();
+        }
+
+        // Forward pass WITHOUT embed (already done above)
+        let _ = self.forward_inner(token_ids, None, true, true)?;
+        let dispatch_us = greedy_t0.elapsed().as_micros();
+        let launches_this_token = hip_ffi::safe::get_launch_count();
+
+        // End capture + launch graph (no-op if use_graph=false)
+        if use_graph {
+            let graph_ok = self.backend.end_graph_capture_and_launch();
+            if !graph_ok && !GRAPH_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!("HIP Graph capture/launch failed, falling back to direct dispatch");
+            } else if graph_ok && !GRAPH_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!("HIP Graph capture ACTIVE — kernel launches collapsed to 1 per token");
+            }
+        }
+
+        // GPU argmax runs on same stream (ordered after graph/direct kernels)
         match self.backend.gpu_argmax(&self.scratch.logits, vocab) {
             Ok(token_id) => {
                 let total_us = greedy_t0.elapsed().as_micros();
@@ -3467,6 +3543,21 @@ impl CausalLM {
                         max_seq: self.cfg.max_seq_len,
                     })?;
                 }
+                kv_cache::KvCacheMode::Wht => {
+                    let scales = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but no scales".into()))?;
+                    self.backend.kv_cache_wht_append(&compute_core::KvCacheWhtAppendParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.k,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
             }
             layer.kv_k.current_len += n;
 
@@ -3496,12 +3587,27 @@ impl CausalLM {
                         max_seq: self.cfg.max_seq_len,
                     })?;
                 }
+                kv_cache::KvCacheMode::Wht => {
+                    let scales = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but no scales".into()))?;
+                    self.backend.kv_cache_wht_append(&compute_core::KvCacheWhtAppendParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales,
+                        new_kv: &self.scratch.v,
+                        insert_pos: pos_start,
+                        n_new_tokens: n,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                        max_seq: self.cfg.max_seq_len,
+                    })?;
+                }
             }
             layer.kv_v.current_len += n;
 
             let seq = layer.kv_k.current_len;
 
-            // ── Dequantize KV cache if INT8 ──
+            // ── Dequantize KV cache if INT8 / WHT ──
             let (kv_k_use, kv_v_use) = match layer.kv_k.mode {
                 kv_cache::KvCacheMode::F32 => {
                     (&layer.kv_k.data, &layer.kv_v.data)
@@ -3527,6 +3633,38 @@ impl CausalLM {
                     let scales_v = layer.kv_v.scales.as_ref()
                         .ok_or_else(|| ModelError::Model("INT8 mode but scales not allocated".into()))?;
                     self.backend.kv_cache_int8_read(&compute_core::KvCacheInt8ReadParams {
+                        cache_q: &layer.kv_v.data,
+                        cache_scales: scales_v,
+                        output: kv_v_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    (kv_k_deq, kv_v_deq)
+                }
+                kv_cache::KvCacheMode::Wht => {
+                    let kv_k_deq = self.scratch.kv_k_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_k_deq not allocated".into()))?;
+                    let kv_v_deq = self.scratch.kv_v_deq.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but kv_v_deq not allocated".into()))?;
+
+                    let scales_k = layer.kv_k.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but scales not allocated".into()))?;
+                    self.backend.kv_cache_wht_read(&compute_core::KvCacheWhtReadParams {
+                        cache_q: &layer.kv_k.data,
+                        cache_scales: scales_k,
+                        output: kv_k_deq,
+                        seq_len: seq,
+                        kv_dim: kd,
+                        head_dim: hd,
+                        n_kv_heads: nk,
+                    })?;
+
+                    let scales_v = layer.kv_v.scales.as_ref()
+                        .ok_or_else(|| ModelError::Model("WHT mode but scales not allocated".into()))?;
+                    self.backend.kv_cache_wht_read(&compute_core::KvCacheWhtReadParams {
                         cache_q: &layer.kv_v.data,
                         cache_scales: scales_v,
                         output: kv_v_deq,

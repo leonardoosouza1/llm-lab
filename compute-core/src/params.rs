@@ -491,6 +491,30 @@ pub struct KvCacheInt8ReadParams<'a> {
     pub n_kv_heads: usize,
 }
 
+/// Params para WHT+INT8 quantize+append (Item 4: PolarQuant KV cache)
+pub struct KvCacheWhtAppendParams<'a> {
+    pub cache_q: &'a AnyTensor,       // INT8 cache [max_seq, kv_dim]
+    pub cache_scales: &'a AnyTensor,   // F32 scales [max_seq, n_kv_heads]
+    pub new_kv: &'a AnyTensor,         // F32 input [n_new_tokens, kv_dim]
+    pub insert_pos: usize,
+    pub n_new_tokens: usize,
+    pub kv_dim: usize,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+    pub max_seq: usize,
+}
+
+/// Params para dequantizar WHT INT8 KV cache
+pub struct KvCacheWhtReadParams<'a> {
+    pub cache_q: &'a AnyTensor,        // INT8 cache
+    pub cache_scales: &'a AnyTensor,    // F32 scales
+    pub output: &'a AnyTensor,          // F32 output [seq_len, kv_dim]
+    pub seq_len: usize,
+    pub kv_dim: usize,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+}
+
 // ── Sparse MLP (Kuramoto Router) ────────────────────────────────────────────
 
 /// Gather selected rows from a BF16 weight matrix into contiguous output.

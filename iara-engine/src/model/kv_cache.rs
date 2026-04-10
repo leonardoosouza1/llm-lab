@@ -15,12 +15,16 @@ pub enum KvCacheMode {
     F32,
     /// Quantizado INT8: reduz memória 4x com per-head scales
     Int8,
+    /// WHT+INT8 (PolarQuant): Walsh-Hadamard transform antes de quantizar
+    Wht,
 }
 
 impl KvCacheMode {
-    /// Detecta modo a partir de variável de ambiente IARA_KV_INT8
+    /// Detecta modo a partir de variáveis de ambiente IARA_KV_INT8 / IARA_KV_WHT
     pub fn detect() -> Self {
-        if std::env::var("IARA_KV_INT8").is_ok() {
+        if std::env::var("IARA_KV_WHT").map(|v| v == "1").unwrap_or(false) {
+            Self::Wht
+        } else if std::env::var("IARA_KV_INT8").is_ok() {
             Self::Int8
         } else {
             Self::F32
@@ -62,14 +66,14 @@ impl GpuKvCache {
 
         let data = match mode {
             KvCacheMode::F32 => backend.alloc_f32(&[max_seq_len, kv_dim]),
-            // INT8: armazenar como u8 (1 byte por elemento)
-            KvCacheMode::Int8 => backend.alloc_q4(&[max_seq_len, kv_dim]),
+            // INT8 / WHT: armazenar como u8 (1 byte por elemento)
+            KvCacheMode::Int8 | KvCacheMode::Wht => backend.alloc_q4(&[max_seq_len, kv_dim]),
         };
 
-        // Scales: [max_seq_len, n_kv_heads] F32 para modo INT8
+        // Scales: [max_seq_len, n_kv_heads] F32 para modo INT8 / WHT
         let scales = match mode {
             KvCacheMode::F32 => None,
-            KvCacheMode::Int8 => Some(backend.alloc_f32(&[max_seq_len, n_kv_heads])),
+            KvCacheMode::Int8 | KvCacheMode::Wht => Some(backend.alloc_f32(&[max_seq_len, n_kv_heads])),
         };
 
         Self {

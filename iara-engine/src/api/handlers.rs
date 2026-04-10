@@ -484,7 +484,9 @@ pub async fn load_model_handler(
     }).to_string());
 
     // ── GGUF + llama.cpp fast path ──────────────────────────────────────
-    if let Some(ref gguf_path) = gguf_file {
+    // IARA_NO_LLAMA=1 forces native IARA backend even for GGUF files (for benchmarking)
+    let use_llama_cpp = std::env::var("IARA_NO_LLAMA").map(|v| v != "1").unwrap_or(true);
+    if use_llama_cpp { if let Some(ref gguf_path) = gguf_file {
         let llama_arc = state.llama_engine.clone();
         let batch_arc = state.batch_handle.clone();
         let model_ready = state.model_ready.clone();
@@ -564,7 +566,7 @@ pub async fn load_model_handler(
                 "backend": "llama.cpp"
             })),
         ).into_response();
-    }
+    } } // end if use_llama_cpp { if let Some(ref gguf_path) = gguf_file
     // ── Legacy CausalLM path (safetensors / .iara) ──────────────────────
     // Spawn background load
     let model_arc     = state.qwen_model.clone();

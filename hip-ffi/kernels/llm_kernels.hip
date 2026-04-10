@@ -3594,3 +3594,289 @@ extern "C" __global__ void argmax_f32(
     }
 }
 
+// ============================================================================
+// ITEM 4: Walsh-Hadamard Transform KV Cache Quantization
+// ============================================================================
+// WHT + 8-bit quantize + append to INT8 KV cache.
+// WHT randomizes outliers, making scalar quant near-optimal.
+//
+// Grid : (n_new_tokens, n_kv_heads, 1)
+// Block: (head_dim, 1, 1)
+// Shared: (head_dim + n_warps) * sizeof(f32) bytes
+//
+// head_dim must be a power of 2 (64, 128, etc.)
+__launch_bounds__(128)
+extern "C" __global__ void kv_cache_wht_quant_append(
+    int8_t*       __restrict__ cache_q,      // [max_seq, kv_dim] INT8
+    float*        __restrict__ cache_scales, // [max_seq, n_kv_heads] F32
+    const float*  __restrict__ new_kv,       // [n_new_tokens, kv_dim] F32
+    int insert_pos,
+    int n_new_tokens,
+    int kv_dim,
+    int head_dim,
+    int n_kv_heads,
+    int max_seq
+) {
+    extern __shared__ float smem[];
+
+    const int tok_in_batch = blockIdx.x;
+    const int head = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (tid >= head_dim || head >= n_kv_heads || tok_in_batch >= n_new_tokens) return;
+
+    const int n_warps = (head_dim + 31) / 32;
+
+    // Load this head's elements into shared memory
+    int kv_offset = tok_in_batch * kv_dim + head * head_dim;
+    smem[tid] = new_kv[kv_offset + tid];
+    __syncthreads();
+
+    // Walsh-Hadamard Transform (butterfly)
+    for (int stride = 1; stride < head_dim; stride <<= 1) {
+        int pair = tid ^ stride;
+        if (pair > tid) {
+            float a = smem[tid];
+            float b = smem[pair];
+            smem[tid]  = a + b;
+            smem[pair] = a - b;
+        }
+        __syncthreads();
+    }
+    // Normalize by 1/sqrt(head_dim) for energy preservation
+    float scale_factor = 1.0f / sqrtf((float)head_dim);
+    smem[tid] *= scale_factor;
+    __syncthreads();
+
+    // Warp-level absolute max reduction
+    float abs_val = fabsf(smem[tid]);
+    for (int off = 16; off >= 1; off >>= 1)
+        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, off));
+
+    // Cross-warp max via tail of smem
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) smem[head_dim + warp_id] = abs_val;
+    __syncthreads();
+
+    if (tid == 0) {
+        float global_max = 0.0f;
+        for (int w = 0; w < n_warps; w++)
+            global_max = fmaxf(global_max, smem[head_dim + w]);
+        smem[head_dim] = global_max;
+    }
+    __syncthreads();
+
+    float global_max = smem[head_dim];
+    float quant_scale = (global_max > 0.0f) ? 127.0f / global_max : 1.0f;
+
+    // Quantize to INT8
+    float val = smem[tid];
+    int8_t q = (int8_t)fminf(fmaxf(roundf(val * quant_scale), -127.0f), 127.0f);
+
+    // Write to cache
+    int cache_row = insert_pos + tok_in_batch;
+    if (cache_row < max_seq) {
+        cache_q[cache_row * kv_dim + head * head_dim + tid] = q;
+        if (lane == 0) {
+            cache_scales[cache_row * n_kv_heads + head] = (global_max > 0.0f) ? global_max / 127.0f : 1.0f;
+        }
+    }
+}
+
+// kv_cache_wht_dequant — dequantize INT8 + inverse WHT
+// Inverse WHT = WHT / head_dim (since H is its own inverse scaled by d)
+//
+// Grid : (seq_len, n_kv_heads, 1)
+// Block: (head_dim, 1, 1)
+// Shared: (head_dim + n_warps) * sizeof(f32)
+extern "C" __global__ void kv_cache_wht_dequant(
+    float*        __restrict__ output,       // [seq_len, kv_dim] F32
+    const int8_t* __restrict__ cache_q,      // [max_seq, kv_dim] INT8
+    const float*  __restrict__ cache_scales, // [max_seq, n_kv_heads] F32
+    int seq_len,
+    int kv_dim,
+    int head_dim,
+    int n_kv_heads
+) {
+    extern __shared__ float smem[];
+
+    const int seq_pos = blockIdx.x;
+    const int head = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (tid >= head_dim || head >= n_kv_heads || seq_pos >= seq_len) return;
+
+    // Dequantize INT8 → F32
+    float scale = cache_scales[seq_pos * n_kv_heads + head];
+    int8_t q = cache_q[seq_pos * kv_dim + head * head_dim + tid];
+    smem[tid] = (float)q * scale;
+    __syncthreads();
+
+    // Inverse WHT (same butterfly, then normalize by 1/sqrt(head_dim))
+    for (int stride = 1; stride < head_dim; stride <<= 1) {
+        int pair = tid ^ stride;
+        if (pair > tid) {
+            float a = smem[tid];
+            float b = smem[pair];
+            smem[tid]  = a + b;
+            smem[pair] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Combined normalization: 1/sqrt(head_dim) from forward * 1/sqrt(head_dim) from inverse
+    // Since WHT forward applied 1/sqrt(d) and WHT inverse is WHT/d, we apply 1/sqrt(d) here
+    float norm = 1.0f / sqrtf((float)head_dim);
+    output[seq_pos * kv_dim + head * head_dim + tid] = smem[tid] * norm;
+}
+
+// ============================================================================
+// ITEM 5: Flash Attention 2 for Single-Token Decode
+// ============================================================================
+// FA2 for decode (n=1): processes K/V in tiles, uses online softmax.
+// Avoids O(seq_len) smem for scores — supports unlimited context.
+//
+// Grid : (n_heads, 1, 1)  — one block per Q head
+// Block: (FA_TILE * FA_NWARPS, 1, 1) where FA_TILE=32, FA_NWARPS=4
+// Shared: 2 * FA_TILE * head_dim * 4 bytes + small warp scratch
+
+#define FA_TILE 32
+#define FA_NWARPS 4
+#define FA_BLOCK (FA_TILE * FA_NWARPS)
+
+__launch_bounds__(FA_BLOCK)
+extern "C" __global__ void flash_attention_decode(
+    const float* __restrict__ q,        // [n_heads * head_dim] single query
+    const float* __restrict__ k_cache,  // [seq_len, n_kv_heads * head_dim]
+    const float* __restrict__ v_cache,  // [seq_len, n_kv_heads * head_dim]
+    float*       __restrict__ out,      // [n_heads * head_dim] output
+    int seq_len,
+    int head_dim,
+    int n_heads,
+    int n_kv_heads,
+    float scale
+) {
+    // Shared: k_tile [FA_TILE * head_dim], v_tile [FA_TILE * head_dim],
+    //         warp_scratch [FA_NWARPS * 2]
+    extern __shared__ float smem[];
+    float* k_tile = smem;
+    float* v_tile = smem + FA_TILE * head_dim;
+    float* warp_scratch = smem + 2 * FA_TILE * head_dim;
+
+    const int head = blockIdx.x;
+    if (head >= n_heads) return;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    // GQA mapping
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+
+    // Load Q into registers: each thread owns head_dim/FA_BLOCK elements
+    // For head_dim=128, FA_BLOCK=128: each thread owns exactly 1 element
+    float q_reg = (tid < head_dim) ? q[head * head_dim + tid] : 0.0f;
+
+    // Online softmax state
+    float m = -1e30f;  // running max
+    float l = 0.0f;    // running sum of exp
+    float acc = 0.0f;  // accumulator for this thread's output element
+
+    // Process K/V in tiles of FA_TILE
+    for (int tile_start = 0; tile_start < seq_len; tile_start += FA_TILE) {
+        int tile_end = tile_start + FA_TILE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_size = tile_end - tile_start;
+
+        // Load K tile: each warp handles one row, all lanes load elements
+        for (int t = warp_id; t < tile_size; t += FA_NWARPS) {
+            const float* k_row = k_cache + (tile_start + t) * kv_stride + kv_head * head_dim;
+            for (int d = lane; d < head_dim; d += 32) {
+                k_tile[t * head_dim + d] = k_row[d];
+            }
+        }
+        __syncthreads();
+
+        // Compute Q×K scores for this tile
+        // Each thread computes one score element, then all reduce within warp
+        // Since head_dim=128 and 128 threads, each thread handles one dimension
+        // We need each thread to compute ALL tile scores (not just 1)
+        // Strategy: threads cooperate, then broadcast score to all
+        // Simpler approach: each warp computes one score via parallel dot product
+        // For tile_size=32 and FA_NWARPS=4: each warp does 8 scores
+
+        // Compute tile scores (scores[t] = q_reg dot k_tile[t])
+        // Each thread has q_reg = q[tid], k_tile[t * head_dim + tid]
+        // dot = sum over tid of q_reg * k_tile[t * head_dim + tid]
+        // = warp reduce of (q_reg * k_tile[t * head_dim + lane]) for all lanes in warp
+        // But we have FA_BLOCK=128 threads total, not 32
+
+        // Use all FA_BLOCK threads to compute tile_size scores
+        // Assign: thread i computes partial sum for score (i % tile_size), dim (i / tile_size)
+        // Only valid for tile_size <= head_dim
+
+        float tile_max = -1e30f;
+        float scores[FA_TILE];  // local scores for each tile position
+
+        // Simple but correct: each thread computes full dot for ALL tile positions
+        // using its head_dim element
+        for (int t = 0; t < tile_size; t++) {
+            float partial = q_reg * k_tile[t * head_dim + (tid % head_dim)];
+            // Reduce partial across all threads that cover this dimension range
+            // For head_dim==FA_BLOCK (128): exactly 1 thread per dim per tile position
+            // Sum across the entire block (all 128 threads contribute 1 element each)
+            // Use shared memory for inter-warp reduction
+            float dot = partial;
+            // Warp-level reduce
+            for (int off = 16; off >= 1; off >>= 1)
+                dot += __shfl_xor(dot, off);
+            // Lane 0 of each warp has warp sum; store in scratch
+            if (lane == 0) warp_scratch[warp_id] = dot;
+            __syncthreads();
+            // Thread 0 reduces warp sums
+            if (tid == 0) {
+                float total = 0.0f;
+                for (int w = 0; w < FA_NWARPS; w++) total += warp_scratch[w];
+                warp_scratch[FA_NWARPS] = total * scale;  // store final score
+            }
+            __syncthreads();
+            scores[t] = warp_scratch[FA_NWARPS];
+            tile_max = fmaxf(tile_max, scores[t]);
+        }
+
+        // Load V tile
+        for (int t = warp_id; t < tile_size; t += FA_NWARPS) {
+            const float* v_row = v_cache + (tile_start + t) * kv_stride + kv_head * head_dim;
+            for (int d = lane; d < head_dim; d += 32) {
+                v_tile[t * head_dim + d] = v_row[d];
+            }
+        }
+        __syncthreads();
+
+        // Online softmax update
+        float m_new = fmaxf(m, tile_max);
+        float exp_m_diff = __expf(m - m_new);
+        float l_new = l * exp_m_diff;
+
+        // Update accumulator and running sum
+        for (int t = 0; t < tile_size; t++) {
+            float p = __expf(scores[t] - m_new);
+            l_new += p;
+            if (tid < head_dim) {
+                acc = acc * exp_m_diff + p * v_tile[t * head_dim + tid];
+            }
+        }
+
+        m = m_new;
+        l = l_new;
+        __syncthreads();
+    }
+
+    // Write output
+    if (tid < head_dim && l > 0.0f) {
+        out[head * head_dim + tid] = acc / l;
+    }
+}
+
