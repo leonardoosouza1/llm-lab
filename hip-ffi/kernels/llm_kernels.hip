@@ -1969,6 +1969,637 @@ extern "C" __global__ void fused_gate_up_silu_q4k_multi(
 #undef FUSED_MLP_ROWS
 
 // ---------------------------------------------------------------------------
+// Kernel: gemv_q4k_f32_multi — Q4_K weights × F32 activations GEMV
+//
+// Eliminates the Q8_1 intermediate quantization step between gate+up output
+// and down projection. 1 kernel instead of 2 (quantize + gemv_q8).
+//
+// Q4_K K-mapping (validated against gemv_q4k_q8_multi):
+//   group = lane/8 (0..3), lane_g = lane%8 (0..7)
+//   lo nibbles → K positions [blk*256 + group*64 + lane_g*4 .. +3]
+//   hi nibbles → K positions [blk*256 + group*64 + 32 + lane_g*4 .. +3]
+//
+// Grid : (ceil(N/8), 1, 1)  Block: (32, 8, 1) — 8 warps, each → 1 output row
+// Shared: K * sizeof(float) bytes for F32 activations
+// ---------------------------------------------------------------------------
+#define GEMV_Q4K_F32_ROWS 8
+__launch_bounds__(256, 2)
+extern "C" __global__ void gemv_q4k_f32_multi(
+    const unsigned char* __restrict__ w_data,  // [N * nblk * 144] Q4_K weights
+    const float*         __restrict__ x,       // [K] F32 activations
+    float*               __restrict__ out,     // [N] F32 output
+    int M, int N, int K, float beta
+) {
+    const int row  = blockIdx.x * GEMV_Q4K_F32_ROWS + (int)threadIdx.y;
+    const int lane = (int)threadIdx.x;
+    const int nblk = K / 256;
+
+    // Cooperative load of F32 activations into shared memory (all 8 warps)
+    extern __shared__ float x_smem[];
+    {
+        const int tid = (int)threadIdx.y * 32 + lane;
+        for (int i = tid; i < K; i += 256) {
+            x_smem[i] = x[i];
+        }
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const unsigned char* __restrict__ w_row = w_data + (size_t)row * nblk * 144;
+
+    const int group  = lane >> 3;   // 0..3
+    const int lane_g = lane & 7;    // 0..7
+
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* bp = w_row + blk * 144;
+
+        // Combined d/dmin load (1 uint32 instead of 2 fp16 loads)
+        const unsigned int dm_raw = *(const unsigned int*)bp;
+        const float d    = fp16_to_f32((unsigned short)(dm_raw & 0xFFFF));
+        const float dmin = fp16_to_f32((unsigned short)(dm_raw >> 16));
+
+        // Scales for this lane's group (lo and hi sub-blocks)
+        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
+        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
+
+        // 4 bytes of packed Q4 nibbles for this lane
+        const int q4 = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
+
+        // K-positions for lo and hi nibbles
+        const int k_lo = blk * 256 + group * 64 + lane_g * 4;
+        const int k_hi = k_lo + 32;
+
+        float dot_lo = 0.0f, sum_lo = 0.0f;
+        float dot_hi = 0.0f, sum_hi = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float xi_lo = x_smem[k_lo + i];
+            const float xi_hi = x_smem[k_hi + i];
+            dot_lo += (float)((q4 >> (i * 8))     & 0xF) * xi_lo;
+            dot_hi += (float)((q4 >> (i * 8 + 4)) & 0xF) * xi_hi;
+            sum_lo += xi_lo;
+            sum_hi += xi_hi;
+        }
+
+        // Q4_K dequant: contribution = d*sc*dot - dmin*m*sum
+        acc += d    * ((float)sc_lo * dot_lo + (float)sc_hi * dot_hi)
+             - dmin * ((float)m_lo  * sum_lo + (float)m_hi  * sum_hi);
+    }
+
+    // Warp reduction
+    for (int off = 16; off >= 1; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+
+    if (lane == 0) {
+        out[row] = (beta == 0.0f) ? acc : beta * out[row] + acc;
+    }
+}
+#undef GEMV_Q4K_F32_ROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_bf16_f32_multi — BF16 weights × F32 activations GEMV
+//
+// Replaces hipBLAS SGEMM for lm_head decode (M=1, N=vocab, K=hidden).
+// hipBLAS has large overhead for GEMM with M=1 — a custom GEMV is 2-3x faster.
+// K=1536 fits in shared memory (6 KB), making input effectively free to access.
+//
+// Grid : (ceil(N/8), 1, 1)  Block: (32, 8, 1)
+// Shared: K * sizeof(float) bytes
+// ---------------------------------------------------------------------------
+#define GEMV_BF16_ROWS 8
+__launch_bounds__(256, 2)
+extern "C" __global__ void gemv_bf16_f32_multi(
+    const unsigned short* __restrict__ w,  // [N, K] BF16 weights (u16 storage)
+    const float*          __restrict__ x,  // [K] F32 input (last token activations)
+    float*                __restrict__ out, // [N] F32 output (logits)
+    int N, int K
+) {
+    const int row  = blockIdx.x * GEMV_BF16_ROWS + (int)threadIdx.y;
+    const int lane = (int)threadIdx.x;
+
+    // Load F32 input into shared memory (all 8 warps cooperate)
+    extern __shared__ float x_smem_b[];
+    {
+        const int tid = (int)threadIdx.y * 32 + lane;
+        for (int i = tid; i < K; i += 256) {
+            x_smem_b[i] = x[i];
+        }
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const unsigned short* __restrict__ w_row = w + (size_t)row * K;
+
+    // Each of 32 lanes handles K/32 weights with stride-32 access
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 32) {
+        acc += bf16_to_f32(w_row[i]) * x_smem_b[i];
+    }
+
+    // Warp reduction
+    for (int off = 16; off >= 1; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+
+    if (lane == 0) {
+        out[row] = acc;
+    }
+}
+#undef GEMV_BF16_ROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_rms_qkv_q4k_f32 — RMSNorm + Q/K/V projection in one kernel
+//
+// Eliminates the Q8 intermediate tensor: instead of
+//   (1) fused_rms_norm_quantize → Q8
+//   (2) fused_qkv_q4k(Q8) → Q,K,V
+// we do norm + QKV in a single kernel:
+//   (1) fused_rms_qkv_q4k_f32(F32) → Q,K,V
+//
+// Algorithm:
+//   1. Load x[K] into shared memory (all 256 threads cooperate)
+//   2. Compute RMSNorm: sum_sq → scale factor
+//   3. Apply norm_w * scale in shared memory
+//   4. Each warp (8 per block) handles one output row of Q, K, or V
+//      using Q4K × F32 GEMV from the normalized shared input
+//
+// Grid : (ceil_div(Nq+Nk+Nv, 8), 1, 1)
+// Block: (32, 8, 1) — 8 warps × 32 threads
+// Shared: K * sizeof(float) bytes
+// ---------------------------------------------------------------------------
+#define FUSED_RMS_QKV_ROWS 8
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_rms_qkv_q4k_f32(
+    const float*          __restrict__ x,        // [K] F32 input (hidden state)
+    const float*          __restrict__ norm_w,   // [K] F32 RMSNorm weights
+    const unsigned char*  __restrict__ wq_data,  // [Nq * nblk * 144] Q4K Q weights
+    const unsigned char*  __restrict__ wk_data,  // [Nk * nblk * 144] Q4K K weights
+    const unsigned char*  __restrict__ wv_data,  // [Nv * nblk * 144] Q4K V weights
+    float*                __restrict__ out_q,    // [Nq] Q output
+    float*                __restrict__ out_k,    // [Nk] K output
+    float*                __restrict__ out_v,    // [Nv] V output
+    const float*          __restrict__ bias_q,   // [Nq] bias or nullptr
+    const float*          __restrict__ bias_k,   // [Nk] bias or nullptr
+    const float*          __restrict__ bias_v,   // [Nv] bias or nullptr
+    int Nq, int Nk, int Nv, int K, float eps
+) {
+    extern __shared__ float x_norm[];  // [K floats] normalized input
+
+    const int tid     = (int)threadIdx.y * 32 + (int)threadIdx.x;
+    const int lane    = (int)threadIdx.x;
+    const int warp_id = (int)threadIdx.y;
+
+    // ── Phase 1: Load x → shared, compute sum of squares ──────────────────
+    float local_sq = 0.0f;
+    for (int i = tid; i < K; i += 256) {
+        float v = x[i];
+        x_norm[i] = v;
+        local_sq += v * v;
+    }
+    __syncthreads();
+
+    // Warp-level reduce sum_sq
+    for (int off = 16; off >= 1; off >>= 1) local_sq += __shfl_down(local_sq, off);
+    __shared__ float warp_sq[8];
+    if (lane == 0) warp_sq[warp_id] = local_sq;
+    __syncthreads();
+
+    // Cross-warp reduce (warp 0 only)
+    if (warp_id == 0 && lane < 8) {
+        float val = warp_sq[lane];
+        for (int off = 4; off >= 1; off >>= 1) val += __shfl_down(val, off);
+        if (lane == 0) warp_sq[0] = val;
+    }
+    __syncthreads();
+
+    const float norm_scale = rsqrtf(warp_sq[0] / (float)K + eps);
+
+    // ── Phase 2: Apply RMSNorm scale * norm_w to shared ──────────────────
+    for (int i = tid; i < K; i += 256) {
+        x_norm[i] *= norm_scale * norm_w[i];
+    }
+    __syncthreads();
+
+    // ── Phase 3: Q4K × F32 GEMV for one output row per warp ──────────────
+    const int total_N = Nq + Nk + Nv;
+    const int vrow    = blockIdx.x * FUSED_RMS_QKV_ROWS + warp_id;
+    if (vrow >= total_N) return;
+
+    // Determine which weight matrix and output buffer
+    const unsigned char* row_w;
+    float*               out_ptr;
+    const float*         bias_ptr;
+    int                  local_row;
+    const int nblk = K / 256;
+
+    if (vrow < Nq) {
+        local_row = vrow;
+        row_w = wq_data + (size_t)local_row * nblk * 144;
+        out_ptr = out_q; bias_ptr = bias_q;
+    } else if (vrow < Nq + Nk) {
+        local_row = vrow - Nq;
+        row_w = wk_data + (size_t)local_row * nblk * 144;
+        out_ptr = out_k; bias_ptr = bias_k;
+    } else {
+        local_row = vrow - Nq - Nk;
+        row_w = wv_data + (size_t)local_row * nblk * 144;
+        out_ptr = out_v; bias_ptr = bias_v;
+    }
+
+    // Q4K × F32 inner loop (same as gemv_q4k_f32_multi)
+    const int group  = lane >> 3;
+    const int lane_g = lane & 7;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* bp = row_w + blk * 144;
+        const unsigned int dm_raw = *(const unsigned int*)bp;
+        const float d    = fp16_to_f32((unsigned short)(dm_raw & 0xFFFF));
+        const float dmin = fp16_to_f32((unsigned short)(dm_raw >> 16));
+
+        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
+        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
+
+        const int q4 = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
+        const int k_lo = blk * 256 + group * 64 + lane_g * 4;
+        const int k_hi = k_lo + 32;
+
+        float dot_lo=0, sum_lo=0, dot_hi=0, sum_hi=0;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float xi_lo = x_norm[k_lo + i], xi_hi = x_norm[k_hi + i];
+            dot_lo += (float)((q4 >> (i*8))    & 0xF) * xi_lo;
+            sum_lo += xi_lo;
+            dot_hi += (float)((q4 >> (i*8 + 4)) & 0xF) * xi_hi;
+            sum_hi += xi_hi;
+        }
+        acc += d * ((float)sc_lo * dot_lo + (float)sc_hi * dot_hi)
+             - dmin * ((float)m_lo * sum_lo + (float)m_hi * sum_hi);
+    }
+
+    for (int off = 16; off >= 1; off >>= 1) acc += __shfl_down(acc, off);
+    if (lane == 0) {
+        if (bias_ptr) acc += bias_ptr[local_row];
+        out_ptr[local_row] = acc;
+    }
+}
+#undef FUSED_RMS_QKV_ROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_rms_gate_up_silu_q4k_f32 — RMSNorm + gate+up+SiLU in one kernel
+//
+// Eliminates the Q8 intermediate for MLP:
+//   Old: fused_rms_norm_quantize → Q8 | fused_gate_up_silu_q4k_multi(Q8) → F32
+//   New: fused_rms_gate_up_silu_q4k_f32(F32) → F32  [1 launch vs 2]
+//
+// Grid : (ceil_div(N, 8), 1, 1)
+// Block: (32, 8, 1) — 8 warps × 32 threads
+// Shared: K * sizeof(float) bytes
+// ---------------------------------------------------------------------------
+#define FUSED_RMS_GUS_ROWS 8
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_rms_gate_up_silu_q4k_f32(
+    const float*          __restrict__ x,          // [K] F32 hidden state
+    const float*          __restrict__ norm_w,     // [K] F32 RMSNorm weights
+    const unsigned char*  __restrict__ gate_data,  // [N * nblk * 144] Q4K gate weights
+    const unsigned char*  __restrict__ up_data,    // [N * nblk * 144] Q4K up weights
+    float*                __restrict__ out,        // [N] F32 output: SiLU(gate) * up
+    int N, int K, float eps
+) {
+    extern __shared__ float x_norm_gus[];  // [K floats] normalized input
+
+    const int tid     = (int)threadIdx.y * 32 + (int)threadIdx.x;
+    const int lane    = (int)threadIdx.x;
+    const int warp_id = (int)threadIdx.y;
+
+    // ── Phase 1: Load x → shared, compute RMSNorm ─────────────────────────
+    float local_sq = 0.0f;
+    for (int i = tid; i < K; i += 256) {
+        float v = x[i];
+        x_norm_gus[i] = v;
+        local_sq += v * v;
+    }
+    __syncthreads();
+
+    for (int off = 16; off >= 1; off >>= 1) local_sq += __shfl_down(local_sq, off);
+    __shared__ float warp_sq_gus[8];
+    if (lane == 0) warp_sq_gus[warp_id] = local_sq;
+    __syncthreads();
+
+    if (warp_id == 0 && lane < 8) {
+        float val = warp_sq_gus[lane];
+        for (int off = 4; off >= 1; off >>= 1) val += __shfl_down(val, off);
+        if (lane == 0) warp_sq_gus[0] = val;
+    }
+    __syncthreads();
+
+    const float norm_scale_gus = rsqrtf(warp_sq_gus[0] / (float)K + eps);
+    for (int i = tid; i < K; i += 256) {
+        x_norm_gus[i] *= norm_scale_gus * norm_w[i];
+    }
+    __syncthreads();
+
+    // ── Phase 2: Gate + Up GEMV + SiLU*mul ────────────────────────────────
+    const int row  = blockIdx.x * FUSED_RMS_GUS_ROWS + warp_id;
+    if (row >= N) return;
+
+    const int nblk   = K / 256;
+    const int group  = lane >> 3;
+    const int lane_g = lane & 7;
+
+    // Helper lambda (as a macro here): Q4K × F32 dot product for one row
+    #define Q4K_F32_DOT(wdata, acc_out) \
+    { \
+        const unsigned char* row_w = (wdata) + (size_t)row * nblk * 144; \
+        float acc_ = 0.0f; \
+        for (int blk = 0; blk < nblk; blk++) { \
+            const unsigned char* bp = row_w + blk * 144; \
+            const unsigned int dm_raw = *(const unsigned int*)bp; \
+            const float d_    = fp16_to_f32((unsigned short)(dm_raw & 0xFFFF)); \
+            const float dmin_ = fp16_to_f32((unsigned short)(dm_raw >> 16)); \
+            unsigned char sc_lo_, m_lo_, sc_hi_, m_hi_; \
+            unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo_, &m_lo_); \
+            unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi_, &m_hi_); \
+            const int q4_ = *(const int*)(bp + 16 + group * 32 + lane_g * 4); \
+            const int k_lo_ = blk * 256 + group * 64 + lane_g * 4; \
+            const int k_hi_ = k_lo_ + 32; \
+            float dl=0,sl=0,dh=0,sh=0; \
+            for (int ii = 0; ii < 4; ii++) { \
+                float xl = x_norm_gus[k_lo_+ii], xh = x_norm_gus[k_hi_+ii]; \
+                dl += (float)((q4_ >> (ii*8))    & 0xF) * xl; sl += xl; \
+                dh += (float)((q4_ >> (ii*8 + 4)) & 0xF) * xh; sh += xh; \
+            } \
+            acc_ += d_ * ((float)sc_lo_ * dl + (float)sc_hi_ * dh) \
+                  - dmin_ * ((float)m_lo_ * sl + (float)m_hi_ * sh); \
+        } \
+        for (int off = 16; off >= 1; off >>= 1) acc_ += __shfl_down(acc_, off); \
+        (acc_out) = acc_; \
+    }
+
+    float gate_acc, up_acc;
+    Q4K_F32_DOT(gate_data, gate_acc);
+    Q4K_F32_DOT(up_data,   up_acc);
+    #undef Q4K_F32_DOT
+
+    if (lane == 0) {
+        // SiLU(gate) * up
+        const float silu_gate = gate_acc / (1.0f + __expf(-gate_acc));
+        out[row] = silu_gate * up_acc;
+    }
+}
+#undef FUSED_RMS_GUS_ROWS
+
+// ---------------------------------------------------------------------------
+// Kernels: fused_rms_qkv_q4_f32 + fused_rms_gate_up_silu_q4_f32
+//
+// Same as the Q4K versions above, but for IARA's native Q4 format:
+//   packed: [N, K/2] uint8 — 2 nibbles per byte (lo nibble first)
+//   scales: [N, K/group_size] float32 — per-group scale
+//   zeros:  [N, K/group_size] float32 — per-group zero
+//   dequant: w = scales[g] * nibble + zeros[g]
+//
+// These kernels save 3 kernel launches per layer compared to:
+//   fused_rms_norm_quantize → gemv_q4(Q) → gemv_q4(K) → gemv_q4(V)   (4 launches)
+// vs:
+//   fused_rms_qkv_q4_f32                                               (1 launch)
+//
+// Block: (32, ROWS=8, 1) = 256 threads
+// Grid:  (ceil_div(Nq+Nk+Nv, ROWS), 1, 1)  for QKV
+//        (ceil_div(N, ROWS), 1, 1)           for gate+up
+// Shared: K floats (normed x) + ROWS floats (warp reduction)
+// ---------------------------------------------------------------------------
+
+#define FUSED_RMS_QKV_Q4_ROWS 8
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_rms_qkv_q4_f32(
+    const float*         __restrict__ x,         // [K] F32 input hidden state
+    const float*         __restrict__ norm_w,    // [K] F32 RMSNorm weights
+    // Q weights
+    const unsigned char* __restrict__ wq_packed, // [Nq, K/2]
+    const float*         __restrict__ wq_scales, // [Nq, K/group_size]
+    const float*         __restrict__ wq_zeros,  // [Nq, K/group_size]
+    // K weights
+    const unsigned char* __restrict__ wk_packed, // [Nk, K/2]
+    const float*         __restrict__ wk_scales, // [Nk, K/group_size]
+    const float*         __restrict__ wk_zeros,  // [Nk, K/group_size]
+    // V weights
+    const unsigned char* __restrict__ wv_packed, // [Nv, K/2]
+    const float*         __restrict__ wv_scales, // [Nv, K/group_size]
+    const float*         __restrict__ wv_zeros,  // [Nv, K/group_size]
+    // Outputs
+    float*               __restrict__ out_q,     // [Nq] F32
+    float*               __restrict__ out_k,     // [Nk] F32
+    float*               __restrict__ out_v,     // [Nv] F32
+    // Optional biases (null = no bias)
+    const float*         __restrict__ bias_q,
+    const float*         __restrict__ bias_k,
+    const float*         __restrict__ bias_v,
+    int Nq, int Nk, int Nv, int K, int group_size, float eps
+) {
+    extern __shared__ float smem[];
+    float* smem_x  = smem;           // [K]
+    float* smem_ws = smem + K;       // [ROWS] warp sums for reduction
+
+    const int tid   = (int)threadIdx.x;   // 0..31 (lane within warp)
+    const int wid   = (int)threadIdx.y;   // 0..7  (warp = row slot in block)
+    const int gidx  = (int)(wid * 32 + tid);  // flat thread index 0..255
+    const int total_rows = Nq + Nk + Nv;
+
+    // ── Phase 1: Load x into shared memory (all 256 threads) ─────────────────
+    for (int i = gidx; i < K; i += 256)
+        smem_x[i] = x[i];
+    __syncthreads();
+
+    // ── Phase 2: Compute sum of squares (RMSNorm) ─────────────────────────────
+    float sum_sq = 0.0f;
+    for (int i = gidx; i < K; i += 256) {
+        float v = smem_x[i];
+        sum_sq += v * v;
+    }
+    // Warp-level reduce
+    for (int off = 16; off >= 1; off >>= 1)
+        sum_sq += __shfl_down(sum_sq, off);
+    // Collect warp sums into smem
+    if (tid == 0) smem_ws[wid] = sum_sq;
+    __syncthreads();
+    // Cross-warp reduce in warp 0
+    if (wid == 0) {
+        float val = (tid < FUSED_RMS_QKV_Q4_ROWS) ? smem_ws[tid] : 0.0f;
+        for (int off = 4; off >= 1; off >>= 1) val += __shfl_down(val, off);
+        if (tid == 0) smem_ws[0] = rsqrtf(val / (float)K + eps);  // store scale
+    }
+    __syncthreads();
+    float norm_scale = smem_ws[0];
+
+    // ── Phase 3: Apply RMSNorm weights in-place in shared memory ─────────────
+    for (int i = gidx; i < K; i += 256)
+        smem_x[i] *= norm_scale * norm_w[i];
+    __syncthreads();
+
+    // ── Phase 4: Q4 GEMV for this warp's output row ───────────────────────────
+    const int global_row = (int)blockIdx.x * FUSED_RMS_QKV_Q4_ROWS + wid;
+    if (global_row >= total_rows) return;
+
+    // Determine projection and row index
+    const unsigned char* w_packed;
+    const float*         w_scales;
+    const float*         w_zeros;
+    float*               out_ptr;
+    const float*         bias_ptr;
+    int local_row;
+    const int n_groups = K / group_size;
+
+    if (global_row < Nq) {
+        local_row = global_row;
+        w_packed = wq_packed + (size_t)local_row * (K / 2);
+        w_scales = wq_scales + (size_t)local_row * n_groups;
+        w_zeros  = wq_zeros  + (size_t)local_row * n_groups;
+        out_ptr  = out_q + local_row;
+        bias_ptr = bias_q ? bias_q + local_row : nullptr;
+    } else if (global_row < Nq + Nk) {
+        local_row = global_row - Nq;
+        w_packed = wk_packed + (size_t)local_row * (K / 2);
+        w_scales = wk_scales + (size_t)local_row * n_groups;
+        w_zeros  = wk_zeros  + (size_t)local_row * n_groups;
+        out_ptr  = out_k + local_row;
+        bias_ptr = bias_k ? bias_k + local_row : nullptr;
+    } else {
+        local_row = global_row - Nq - Nk;
+        w_packed = wv_packed + (size_t)local_row * (K / 2);
+        w_scales = wv_scales + (size_t)local_row * n_groups;
+        w_zeros  = wv_zeros  + (size_t)local_row * n_groups;
+        out_ptr  = out_v + local_row;
+        bias_ptr = bias_v ? bias_v + local_row : nullptr;
+    }
+
+    // GEMV: stride-32 over K elements
+    // Thread tid handles k = tid, tid+32, tid+64, ...
+    float acc = 0.0f;
+    for (int k = tid; k < K; k += 32) {
+        const int gi = k / group_size;
+        const float s = w_scales[gi];
+        const float z = w_zeros[gi];
+        const int byte_idx = k >> 1;
+        const uint8_t packed_byte = w_packed[byte_idx];
+        const int nibble = (k & 1) ? (int)(packed_byte >> 4) : (int)(packed_byte & 0xF);
+        acc += (s * (float)nibble + z) * smem_x[k];
+    }
+
+    // Warp reduce
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (tid == 0) {
+        if (bias_ptr) acc += *bias_ptr;
+        *out_ptr = acc;
+    }
+}
+#undef FUSED_RMS_QKV_Q4_ROWS
+
+// ---------------------------------------------------------------------------
+
+#define FUSED_RMS_GUS_Q4_ROWS 8
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_rms_gate_up_silu_q4_f32(
+    const float*         __restrict__ x,           // [K] F32 input
+    const float*         __restrict__ norm_w,      // [K] F32 RMSNorm weights
+    const unsigned char* __restrict__ gate_packed, // [N, K/2]
+    const float*         __restrict__ gate_scales, // [N, K/group_size]
+    const float*         __restrict__ gate_zeros,  // [N, K/group_size]
+    const unsigned char* __restrict__ up_packed,   // [N, K/2]
+    const float*         __restrict__ up_scales,   // [N, K/group_size]
+    const float*         __restrict__ up_zeros,    // [N, K/group_size]
+    float*               __restrict__ out,         // [N] F32: SiLU(gate) * up
+    int N, int K, int group_size, float eps
+) {
+    extern __shared__ float smem[];
+    float* smem_x  = smem;
+    float* smem_ws = smem + K;
+
+    const int tid  = (int)threadIdx.x;
+    const int wid  = (int)threadIdx.y;
+    const int gidx = (int)(wid * 32 + tid);
+
+    // ── Phase 1: Load x ───────────────────────────────────────────────────────
+    for (int i = gidx; i < K; i += 256)
+        smem_x[i] = x[i];
+    __syncthreads();
+
+    // ── Phase 2: RMSNorm sum_sq ───────────────────────────────────────────────
+    float sum_sq = 0.0f;
+    for (int i = gidx; i < K; i += 256) {
+        float v = smem_x[i];
+        sum_sq += v * v;
+    }
+    for (int off = 16; off >= 1; off >>= 1)
+        sum_sq += __shfl_down(sum_sq, off);
+    if (tid == 0) smem_ws[wid] = sum_sq;
+    __syncthreads();
+    if (wid == 0) {
+        float val = (tid < FUSED_RMS_GUS_Q4_ROWS) ? smem_ws[tid] : 0.0f;
+        for (int off = 4; off >= 1; off >>= 1) val += __shfl_down(val, off);
+        if (tid == 0) smem_ws[0] = rsqrtf(val / (float)K + eps);
+    }
+    __syncthreads();
+    float norm_scale = smem_ws[0];
+
+    // ── Phase 3: Apply norm weights ───────────────────────────────────────────
+    for (int i = gidx; i < K; i += 256)
+        smem_x[i] *= norm_scale * norm_w[i];
+    __syncthreads();
+
+    // ── Phase 4: gate+up GEMV then SiLU(gate)*up ─────────────────────────────
+    const int global_row = (int)blockIdx.x * FUSED_RMS_GUS_Q4_ROWS + wid;
+    if (global_row >= N) return;
+
+    const int n_groups = K / group_size;
+    const unsigned char* gp = gate_packed + (size_t)global_row * (K / 2);
+    const float*         gs = gate_scales + (size_t)global_row * n_groups;
+    const float*         gz = gate_zeros  + (size_t)global_row * n_groups;
+    const unsigned char* up = up_packed   + (size_t)global_row * (K / 2);
+    const float*         us = up_scales   + (size_t)global_row * n_groups;
+    const float*         uz = up_zeros    + (size_t)global_row * n_groups;
+
+    float gate_acc = 0.0f, up_acc = 0.0f;
+    for (int k = tid; k < K; k += 32) {
+        const int gi         = k / group_size;
+        const int byte_idx   = k >> 1;
+        const int nibble_pos = k & 1;
+        const uint8_t gb     = gp[byte_idx];
+        const uint8_t ub     = up[byte_idx];
+        const int gnib = nibble_pos ? (int)(gb >> 4) : (int)(gb & 0xF);
+        const int unib = nibble_pos ? (int)(ub >> 4) : (int)(ub & 0xF);
+        const float xval  = smem_x[k];
+        gate_acc += (gs[gi] * (float)gnib + gz[gi]) * xval;
+        up_acc   += (us[gi] * (float)unib + uz[gi]) * xval;
+    }
+
+    // Warp reduce
+    for (int off = 16; off >= 1; off >>= 1) {
+        gate_acc += __shfl_down(gate_acc, off);
+        up_acc   += __shfl_down(up_acc,   off);
+    }
+
+    if (tid == 0) {
+        const float silu_gate = gate_acc / (1.0f + __expf(-gate_acc));
+        out[global_row] = silu_gate * up_acc;
+    }
+}
+#undef FUSED_RMS_GUS_Q4_ROWS
+
+// ---------------------------------------------------------------------------
 // Kernel: fused_attention_decode — Single-token attention in one kernel
 //
 // For decode (n=1): computes Q×K^T → scale → softmax → ×V for one head.

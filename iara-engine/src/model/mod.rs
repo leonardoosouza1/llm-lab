@@ -622,6 +622,22 @@ impl CausalLM {
         }
         match weight {
             LayerWeight::Bf16(w) => {
+                // For decode (m=1, beta=0): custom GEMV avoids hipBLAS overhead.
+                // hipBLAS SGEMM for M=1 has ~3.5ms latency vs ~1ms theoretical BW.
+                // Only use GEMV when beta=0 (lm_head always 0; wout is 1.0 → SGEMM).
+                if m == 1 && beta == 0.0 {
+                    let gemv_result = backend.gemv_bf16_f32(&compute_core::GemvBf16F32Params {
+                        n, k, w, x: input, x_offset: a_offset, out: output,
+                    });
+                    if gemv_result.is_ok() {
+                        static BF16_GEMV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !BF16_GEMV_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("BF16 GEMV: using custom kernel (m={}, n={}, k={}) — bypasses hipBLAS", m, n, k);
+                        }
+                        return Ok(());
+                    }
+                    // Fallthrough to hipBLAS on error
+                }
                 backend.gemm_bf16_f32(&GemmBf16Params {
                     m,
                     n,
@@ -650,6 +666,22 @@ impl CausalLM {
                 })?;
             }
             LayerWeight::Q4K { data, n: _, k: _ } => {
+                // ── Fast path: Q4K × F32 GEMV (decode, m=1) ──────────────────────
+                // Eliminates the intermediate Q8_1 quantize step (saves 1 kernel launch).
+                // gemv_q4k_f32_multi dequants Q4K on-the-fly with direct F32 dot product.
+                if m == 1 {
+                    let f32_result = backend.gemv_q4k_f32(&compute_core::GemvQ4KF32Params {
+                        m, n, k, data, x: input, x_offset: a_offset, out: output, beta,
+                    });
+                    if f32_result.is_ok() {
+                        static Q4K_F32_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !Q4K_F32_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("Q4K F32: using direct F32 GEMV (m={}, n={}, k={}) — no Q8 quantize", m, n, k);
+                        }
+                        return Ok(());
+                    }
+                    // Fallthrough to Q8 path if gemv_q4k_f32 not supported
+                }
                 if let (Some(q8), true) = (q8_scratch, m == 1) {
                     static Q4K_Q8_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !Q4K_Q8_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2154,8 +2186,55 @@ impl CausalLM {
             let mut _sec_t0 = std::time::Instant::now();
 
             // ── Input Normalization (RMSNorm ou LayerNorm conforme arquitetura) ──
-            // Try fused RMSNorm+Quantize (1 launch vs 2) for decode
-            let qkv_q8_pre = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
+            // Super-fused: RMSNorm + Q/K/V projection in ONE kernel (decode only, saves norm+q8+qkv launches)
+            static SUPER_FUSED_QKV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let super_fused_qkv = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
+                match (&layer.wq, &layer.wk, &layer.wv) {
+                    // GGML Q4K format (from GGUF native loading)
+                    (LayerWeight::Q4K { data: dq, .. }, LayerWeight::Q4K { data: dk, .. }, LayerWeight::Q4K { data: dv, .. }) => {
+                        let r = self.backend.fused_rms_qkv_q4k_f32(&compute_core::FusedRmsQkvQ4KF32Params {
+                            x: &self.scratch.x, norm_w: &layer.input_norm_w,
+                            wq: dq, wk: dk, wv: dv,
+                            out_q: &self.scratch.q, out_k: &self.scratch.k, out_v: &self.scratch.v,
+                            bias_q: layer.q_bias.as_ref(), bias_k: layer.k_bias.as_ref(), bias_v: layer.v_bias.as_ref(),
+                            nq: qd, nk: kd, nv: kd, k: h, eps, x_offset: 0,
+                        });
+                        if let Err(ref e) = r {
+                            static ERR_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !ERR_LOG.swap(true, AO::Relaxed) {
+                                log::warn!("SUPER FUSED QKV Q4K FAILED: {:?}", e);
+                            }
+                        }
+                        r.is_ok()
+                    }
+                    // IARA native Q4 format (from safetensors + IARA_QUANTIZE)
+                    (LayerWeight::Q4(qtq), LayerWeight::Q4(qtk), LayerWeight::Q4(qtv)) => {
+                        let r = self.backend.fused_rms_qkv_q4(&compute_core::FusedRmsQkvQ4Params {
+                            x: &self.scratch.x, norm_w: &layer.input_norm_w,
+                            wq_packed: &qtq.packed, wq_scales: &qtq.scales, wq_zeros: &qtq.zeros,
+                            wk_packed: &qtk.packed, wk_scales: &qtk.scales, wk_zeros: &qtk.zeros,
+                            wv_packed: &qtv.packed, wv_scales: &qtv.scales, wv_zeros: &qtv.zeros,
+                            out_q: &self.scratch.q, out_k: &self.scratch.k, out_v: &self.scratch.v,
+                            bias_q: layer.q_bias.as_ref(), bias_k: layer.k_bias.as_ref(), bias_v: layer.v_bias.as_ref(),
+                            nq: qd, nk: kd, nv: kd, k: h,
+                            group_size: qtq.group_size, eps,
+                        });
+                        if let Err(ref e) = r {
+                            static ERR_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !ERR_LOG.swap(true, AO::Relaxed) {
+                                log::warn!("SUPER FUSED QKV Q4 FAILED: {:?}", e);
+                            }
+                        }
+                        r.is_ok()
+                    }
+                    _ => false,
+                }
+            } else { false };
+            if super_fused_qkv && !SUPER_FUSED_QKV_LOG.swap(true, AO::Relaxed) {
+                log::warn!("SUPER FUSED RMS+QKV: active (nq={}, nk={}, k={})", qd, kd, h);
+            }
+            // Try fused RMSNorm+Quantize (1 launch vs 2) for decode — skipped if super_fused_qkv
+            let qkv_q8_pre = if super_fused_qkv { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                     if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
                         input: &self.scratch.x, weight: &layer.input_norm_w,
@@ -2207,7 +2286,7 @@ impl CausalLM {
                 }
             } else { false };
 
-            if fused_qkv_ok {
+            if super_fused_qkv || fused_qkv_ok {
                 if !FUSED_QKV_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::warn!("FUSED QKV: active (nq={}, nk={}, nv={}, k={})", qd, kd, kd, h);
                 }
@@ -2632,7 +2711,10 @@ impl CausalLM {
             prof_sync!("wo_done");
             section_time!(PROF_WO, _sec_t0);
             // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
-            let mlp_q8_pre = if n == 1 && matches!(norm_type, NormType::RMSNorm) {
+            // Check if super-fused MLP is possible — avoids norm+quantize if weights are Q4K
+            let super_fused_mlp_possible = n == 1 && matches!(norm_type, NormType::RMSNorm)
+                && matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }));
+            let mlp_q8_pre = if super_fused_mlp_possible { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                     if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
                         input: &self.scratch.x, weight: &layer.post_attn_norm_w,
@@ -2790,8 +2872,26 @@ impl CausalLM {
                 // ── DENSE MLP PATH (also used for calibration) ─────────────────
                 log::trace!("layer {layer_idx}: wgate+wup n={n} it={it} h={h}");
 
+                // Super-fused: RMSNorm + gate+up+SiLU in ONE kernel (saves norm+q8+gate_up launches)
+                static SUPER_FUSED_MLP_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                let super_fused_mlp = if super_fused_mlp_possible && !is_calibrating {
+                    match (&layer.wgate, &layer.wup) {
+                        (LayerWeight::Q4K { data: gd, .. }, LayerWeight::Q4K { data: ud, .. }) => {
+                            self.backend.fused_rms_gate_up_silu_q4k_f32(&compute_core::FusedRmsGateUpSiluQ4KF32Params {
+                                x: &self.scratch.x, norm_w: &layer.post_attn_norm_w,
+                                gate: gd, up: ud, out: &self.scratch.gate,
+                                n: it, k: h, eps, x_offset: 0,
+                            }).is_ok()
+                        }
+                        _ => false,
+                    }
+                } else { false };
+                if super_fused_mlp && !SUPER_FUSED_MLP_LOG.swap(true, AO::Relaxed) {
+                    log::warn!("SUPER FUSED RMS+MLP: active (n={}, k={})", it, h);
+                }
+
                 // Pre-quantize normed for gate+up (reuse from fused norm+q8 if available)
-                let gu_q8_pre = if mlp_q8_pre {
+                let gu_q8_pre = if super_fused_mlp { false } else if mlp_q8_pre {
                     true  // already quantized by fused_rms_norm_quantize
                 } else if n == 1 {
                     if let Some(q8) = self.scratch.q8_scratch.as_ref() {
@@ -2800,8 +2900,8 @@ impl CausalLM {
                     } else { false }
                 } else { false };
 
-                // Try fused gate+up+SiLU kernel (1 launch vs 3) for decode
-                let fused_mlp_ok = if n == 1 && gu_q8_pre && !is_calibrating {
+                // Try fused gate+up+SiLU kernel (1 launch vs 3) for decode — skipped if super_fused_mlp
+                let fused_mlp_ok = if !super_fused_mlp && n == 1 && gu_q8_pre && !is_calibrating {
                     match (&layer.wgate, &layer.wup) {
                         (LayerWeight::Q4K { data: gd, .. }, LayerWeight::Q4K { data: ud, .. }) => {
                             self.backend.fused_gate_up_silu(&compute_core::FusedGateUpSiluParams {
@@ -2827,7 +2927,7 @@ impl CausalLM {
                         log::warn!("FUSED MLP: active (n={}, k={})", it, h);
                     }
                 }
-                if !fused_mlp_ok {
+                if !super_fused_mlp && !fused_mlp_ok {
                     Self::project(&self.backend, &layer.wgate, &self.scratch.normed, &self.scratch.gate, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;
                     prof_sync!("mlp_gate");
                     Self::project(&self.backend, &layer.wup, &self.scratch.normed, &self.scratch.up, n, it, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), gu_q8_pre)?;

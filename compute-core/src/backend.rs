@@ -94,6 +94,34 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_q4k_q8          (&self, _p: &GemvQ4KQ8Params)        -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_q4k_q8".into()))
     }
+    /// Q4_K × F32 GEMV — direct, no intermediate Q8 quantize step.
+    /// 1 kernel instead of 2 (quantize + gemv). Key speedup for down projection.
+    fn gemv_q4k_f32         (&self, _p: &GemvQ4KF32Params)       -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q4k_f32".into()))
+    }
+    /// BF16 weights × F32 activations GEMV for decode (M=1).
+    /// Replaces hipBLAS SGEMM for lm_head — eliminates library overhead.
+    fn gemv_bf16_f32        (&self, _p: &GemvBf16F32Params)      -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_bf16_f32".into()))
+    }
+    /// Fused RMSNorm + Q/K/V Q4K projection — eliminates Q8 intermediate.
+    /// Saves 1 kernel per attention layer (rms_norm_quantize + fused_qkv → single launch).
+    fn fused_rms_qkv_q4k_f32(&self, _p: &FusedRmsQkvQ4KF32Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_qkv_q4k_f32".into()))
+    }
+    /// Fused RMSNorm + gate+up+SiLU Q4K — eliminates Q8 intermediate for MLP.
+    /// Saves 1 kernel per MLP layer (rms_norm_quantize + gate_up_silu → single launch).
+    fn fused_rms_gate_up_silu_q4k_f32(&self, _p: &FusedRmsGateUpSiluQ4KF32Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_gate_up_silu_q4k_f32".into()))
+    }
+    /// Fused RMSNorm + Q/K/V projection for IARA native Q4 format (saves 3 launches).
+    fn fused_rms_qkv_q4(&self, _p: &FusedRmsQkvQ4Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_qkv_q4".into()))
+    }
+    /// Fused RMSNorm + gate+up+SiLU for IARA native Q4 format (saves 3 launches).
+    fn fused_rms_gate_up_silu_q4(&self, _p: &FusedRmsGateUpSiluQ4Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_gate_up_silu_q4".into()))
+    }
     /// Q6_K × Q8_1 GEMV with integer multiply.
     fn gemv_q6k_q8          (&self, _p: &GemvQ6KQ8Params)        -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_q6k_q8".into()))

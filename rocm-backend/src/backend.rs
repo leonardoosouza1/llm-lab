@@ -5,7 +5,9 @@ use compute_core::{
         AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params, GemvQ4KParams, GemvQ6KParams,
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams, SoftmaxCausalParams,
-        QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params,
+        QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params, GemvQ4KF32Params, GemvBf16F32Params,
+        FusedRmsQkvQ4KF32Params, FusedRmsGateUpSiluQ4KF32Params,
+        FusedRmsQkvQ4Params, FusedRmsGateUpSiluQ4Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
         KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
@@ -516,6 +518,92 @@ impl ComputeBackend for RocmBackend {
             self.kernels.gemv_q6k_q8(
                 u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                 p.m as i32, p.n as i32, p.k as i32, p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q4k_f32(&self, p: &GemvQ4KF32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.gemv_q4k_f32_multi(
+                u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                p.m as i32, p.n as i32, p.k as i32, p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_bf16_f32(&self, p: &GemvBf16F32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.gemv_bf16_f32_multi(
+                u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
+                p.n as i32, p.k as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_rms_qkv_q4k_f32(&self, p: &FusedRmsQkvQ4KF32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        let bias_q = p.bias_q.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_k = p.bias_k.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_v = p.bias_v.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        unsafe {
+            self.kernels.fused_rms_qkv_q4k_f32(
+                x_ptr,
+                f32_ptr(p.norm_w),
+                u8_ptr(p.wq), u8_ptr(p.wk), u8_ptr(p.wv),
+                f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),
+                bias_q, bias_k, bias_v,
+                p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32, p.eps,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_rms_gate_up_silu_q4k_f32(&self, p: &FusedRmsGateUpSiluQ4KF32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.fused_rms_gate_up_silu_q4k_f32(
+                x_ptr,
+                f32_ptr(p.norm_w),
+                u8_ptr(p.gate), u8_ptr(p.up),
+                f32_mut_ptr(p.out),
+                p.n as i32, p.k as i32, p.eps,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_rms_qkv_q4(&self, p: &FusedRmsQkvQ4Params) -> Result<(), BackendError> {
+        let bias_q = p.bias_q.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_k = p.bias_k.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_v = p.bias_v.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        unsafe {
+            self.kernels.fused_rms_qkv_q4_f32(
+                f32_ptr(p.x), f32_ptr(p.norm_w),
+                u8_ptr(p.wq_packed), f32_ptr(p.wq_scales), f32_ptr(p.wq_zeros),
+                u8_ptr(p.wk_packed), f32_ptr(p.wk_scales), f32_ptr(p.wk_zeros),
+                u8_ptr(p.wv_packed), f32_ptr(p.wv_scales), f32_ptr(p.wv_zeros),
+                f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),
+                bias_q, bias_k, bias_v,
+                p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32,
+                p.group_size as i32, p.eps,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_rms_gate_up_silu_q4(&self, p: &FusedRmsGateUpSiluQ4Params) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.fused_rms_gate_up_silu_q4_f32(
+                f32_ptr(p.x), f32_ptr(p.norm_w),
+                u8_ptr(p.gate_packed), f32_ptr(p.gate_scales), f32_ptr(p.gate_zeros),
+                u8_ptr(p.up_packed),   f32_ptr(p.up_scales),   f32_ptr(p.up_zeros),
+                f32_mut_ptr(p.out),
+                p.n as i32, p.k as i32, p.group_size as i32, p.eps,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))

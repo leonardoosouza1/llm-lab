@@ -104,6 +104,7 @@ pub struct LlamaEngine {
     draft: Option<LlamaCtx>,
     n_ctx: u32,
     draft_k: usize,
+    cfc_draft: super::cfc_draft::CfcDraft,
 }
 
 unsafe impl Send for LlamaEngine {}
@@ -122,7 +123,13 @@ impl LlamaEngine {
             unsafe { llama_model_n_params(target.model) } / 1_000_000,
             unsafe { llama_model_n_layer(target.model) });
 
-        Ok(Self { target, draft: None, n_ctx, draft_k: 2 })
+        let vocab_size = unsafe { llama_vocab_n_tokens(target.vocab) } as usize;
+        let cfc_draft = super::cfc_draft::CfcDraft::new(super::cfc_draft::CfcDraftConfig {
+            vocab_size,
+            ..Default::default()
+        });
+
+        Ok(Self { target, draft: None, n_ctx, draft_k: 2, cfc_draft })
     }
 
     /// Load draft model for speculative decoding.
@@ -165,7 +172,13 @@ impl LlamaEngine {
         if n_prompt == 0 { return Err("empty prompt".into()); }
 
         self.target.clear_kv();
+        self.cfc_draft.reset_state();
         let sampler = self.build_sampler(params);
+
+        // Feed prompt tokens to CfC for context
+        for &tok in &prompt_tokens {
+            self.cfc_draft.observe(tok as u32);
+        }
 
         // Prefill
         let prefill_t0 = Instant::now();
@@ -185,6 +198,10 @@ impl LlamaEngine {
             let tok = unsafe { llama_sampler_sample(sampler, self.target.ctx, -1) };
             if unsafe { llama_vocab_is_eog(self.target.vocab, tok) } { break; }
 
+            // CfC online learning: observe the token and train
+            self.cfc_draft.observe(tok as u32);
+            self.cfc_draft.train_step(tok as u32);
+
             text.push_str(&self.token_to_str(tok));
             n_decoded += 1;
 
@@ -194,6 +211,14 @@ impl LlamaEngine {
         }
 
         unsafe { llama_sampler_free(sampler) };
+
+        // Log CfC state
+        let (_, total, _) = self.cfc_draft.accuracy();
+        if total > 10 {
+            log::info!("CfC: {} samples trained, h_norm={:.2}",
+                total, self.cfc_draft.h_norm());
+        }
+
         Ok(GenerateResult {
             text, prompt_tokens: n_prompt, generated_tokens: n_decoded,
             prompt_eval_ms: prefill_ms, eval_ms: decode_t0.elapsed().as_millis(),

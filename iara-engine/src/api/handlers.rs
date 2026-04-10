@@ -475,6 +475,7 @@ pub async fn load_model_handler(
     // Unload current model immediately
     *state.qwen_model.lock().await = None;
     *state.llama_engine.lock().await = None;
+    *state.batch_handle.lock().await = None;
 
     // Broadcast loading started
     let _ = state.frame_tx.send(serde_json::json!({

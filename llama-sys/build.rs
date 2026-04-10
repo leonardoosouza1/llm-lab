@@ -45,6 +45,7 @@ fn main() {
         .use_core()
         .generate_comments(false)
         .derive_default(true)
+        .layout_tests(false)  // skip size/align assertions that fail on different libc versions
         .generate()
         .expect("Failed to generate llama bindings");
 

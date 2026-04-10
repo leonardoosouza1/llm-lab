@@ -59,13 +59,24 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let status = if ready { "ok" } else if loading { "loading" } else { "idle" };
 
     let (model_name, model_vram_gb) = {
-        let guard = state.qwen_model.lock().await;
-        match guard.as_ref() {
-            Some(m) => (
-                format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size),
-                m.vram_bytes as f64 / 1e9,
-            ),
-            None => ("none".to_string(), 0.0),
+        // Check llama.cpp engine first
+        let llama_guard = state.llama_engine.lock().await;
+        if let Some(engine) = llama_guard.as_ref() {
+            let info = engine.model_info();
+            (
+                format!("llama.cpp-{}L-{}h", info.n_layers, info.n_embd),
+                info.model_size as f64 / 1e9,
+            )
+        } else {
+            drop(llama_guard);
+            let guard = state.qwen_model.lock().await;
+            match guard.as_ref() {
+                Some(m) => (
+                    format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size),
+                    m.vram_bytes as f64 / 1e9,
+                ),
+                None => ("none".to_string(), 0.0),
+            }
         }
     };
 

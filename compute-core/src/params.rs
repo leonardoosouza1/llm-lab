@@ -215,6 +215,115 @@ pub struct QuantizeQ8Params<'a> {
     pub k: usize,                  // input dimension, must be multiple of 32
 }
 
+/// Q4_K × F32 GEMV — direct F32 activations, no Q8 intermediate.
+/// Eliminates quantize step between fused_gate_up_silu output and down projection.
+pub struct GemvQ4KF32Params<'a> {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub data: &'a AnyTensor,   // [n * (k/256) * 144] raw Q4_K blocks
+    pub x: &'a AnyTensor,      // [k] F32 activations
+    pub x_offset: usize,       // element offset into x (for last-token select)
+    pub out: &'a AnyTensor,    // [m, n] F32 output
+    pub beta: f32,
+}
+
+/// BF16 weights × F32 activations GEMV — replaces hipBLAS for decode (M=1).
+/// Used for lm_head: N=vocab_size, K=hidden_size.
+pub struct GemvBf16F32Params<'a> {
+    pub n: usize,              // output dim (vocab_size)
+    pub k: usize,              // input dim (hidden_size)
+    pub w: &'a AnyTensor,     // [n, k] BF16 weights
+    pub x: &'a AnyTensor,     // [k] F32 activations (last token)
+    pub x_offset: usize,       // element offset into x
+    pub out: &'a AnyTensor,   // [n] F32 output
+}
+
+/// Fused RMSNorm + Q/K/V Q4K projection in one kernel.
+/// Eliminates Q8 intermediate tensor: saves 1 launch per attention layer.
+pub struct FusedRmsQkvQ4KF32Params<'a> {
+    pub x: &'a AnyTensor,       // [k] F32 hidden state (input, read-only)
+    pub norm_w: &'a AnyTensor,  // [k] F32 RMSNorm weights
+    pub wq: &'a AnyTensor,      // [nq * (k/256) * 144] Q4K Q weights
+    pub wk: &'a AnyTensor,      // [nk * (k/256) * 144] Q4K K weights
+    pub wv: &'a AnyTensor,      // [nv * (k/256) * 144] Q4K V weights
+    pub out_q: &'a AnyTensor,   // [nq] F32 Q output
+    pub out_k: &'a AnyTensor,   // [nk] F32 K output
+    pub out_v: &'a AnyTensor,   // [nv] F32 V output
+    pub bias_q: Option<&'a AnyTensor>,
+    pub bias_k: Option<&'a AnyTensor>,
+    pub bias_v: Option<&'a AnyTensor>,
+    pub nq: usize,
+    pub nk: usize,
+    pub nv: usize,
+    pub k: usize,
+    pub eps: f32,
+    pub x_offset: usize,
+}
+
+/// Fused RMSNorm + gate+up+SiLU Q4K in one kernel.
+/// Eliminates Q8 intermediate for MLP: saves 1 launch per MLP layer.
+pub struct FusedRmsGateUpSiluQ4KF32Params<'a> {
+    pub x: &'a AnyTensor,       // [k] F32 hidden state
+    pub norm_w: &'a AnyTensor,  // [k] F32 RMSNorm weights
+    pub gate: &'a AnyTensor,    // [n * (k/256) * 144] Q4K gate weights
+    pub up: &'a AnyTensor,      // [n * (k/256) * 144] Q4K up weights
+    pub out: &'a AnyTensor,     // [n] F32 output (SiLU(gate) * up)
+    pub n: usize,
+    pub k: usize,
+    pub eps: f32,
+    pub x_offset: usize,
+}
+
+/// Fused RMSNorm + Q/K/V projection for IARA native Q4 format.
+/// Saves 3 kernel launches (norm+q8 + wq + wk + wv → 1 kernel).
+pub struct FusedRmsQkvQ4Params<'a> {
+    pub x: &'a AnyTensor,       // [k] F32 hidden state
+    pub norm_w: &'a AnyTensor,  // [k] F32 RMSNorm weights
+    // Q4 weight tensors (packed nibbles)
+    pub wq_packed: &'a AnyTensor,
+    pub wq_scales: &'a AnyTensor,
+    pub wq_zeros:  &'a AnyTensor,
+    pub wk_packed: &'a AnyTensor,
+    pub wk_scales: &'a AnyTensor,
+    pub wk_zeros:  &'a AnyTensor,
+    pub wv_packed: &'a AnyTensor,
+    pub wv_scales: &'a AnyTensor,
+    pub wv_zeros:  &'a AnyTensor,
+    // Outputs
+    pub out_q: &'a AnyTensor,
+    pub out_k: &'a AnyTensor,
+    pub out_v: &'a AnyTensor,
+    // Optional biases
+    pub bias_q: Option<&'a AnyTensor>,
+    pub bias_k: Option<&'a AnyTensor>,
+    pub bias_v: Option<&'a AnyTensor>,
+    pub nq: usize,
+    pub nk: usize,
+    pub nv: usize,
+    pub k: usize,
+    pub group_size: usize,
+    pub eps: f32,
+}
+
+/// Fused RMSNorm + gate+up+SiLU for IARA native Q4 format.
+/// Saves 3 kernel launches (norm+q8 + wgate + wup + silu → 1 kernel).
+pub struct FusedRmsGateUpSiluQ4Params<'a> {
+    pub x: &'a AnyTensor,
+    pub norm_w: &'a AnyTensor,
+    pub gate_packed: &'a AnyTensor,
+    pub gate_scales: &'a AnyTensor,
+    pub gate_zeros:  &'a AnyTensor,
+    pub up_packed:   &'a AnyTensor,
+    pub up_scales:   &'a AnyTensor,
+    pub up_zeros:    &'a AnyTensor,
+    pub out: &'a AnyTensor,
+    pub n: usize,
+    pub k: usize,
+    pub group_size: usize,
+    pub eps: f32,
+}
+
 /// Q4_K × Q8_1 GEMV with dp4a integer dot product.
 pub struct GemvQ4KQ8Params<'a> {
     pub m: usize,

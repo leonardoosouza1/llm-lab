@@ -85,6 +85,12 @@ pub struct GpuKernels {
     fn_fused_rms_norm_quantize: hipFunction_t,
     fn_fused_rope_kv_copy: hipFunction_t,
     fn_fused_gate_up_silu_q4k_multi: hipFunction_t,
+    fn_gemv_q4k_f32_multi: hipFunction_t,
+    fn_gemv_bf16_f32_multi: hipFunction_t,
+    fn_fused_rms_qkv_q4k_f32: hipFunction_t,
+    fn_fused_rms_gate_up_silu_q4k_f32: hipFunction_t,
+    fn_fused_rms_qkv_q4_f32: hipFunction_t,
+    fn_fused_rms_gate_up_silu_q4_f32: hipFunction_t,
     fn_argmax_f32: hipFunction_t,
     // Wave64 GEMV kernels (2.26x faster BW on RDNA2)
     module_w64: hipModule_t,
@@ -154,6 +160,12 @@ impl GpuKernels {
         let fn_fused_rms_norm_quantize = get_fn!("fused_rms_norm_quantize");
         let fn_fused_rope_kv_copy = get_fn!("fused_rope_kv_copy");
         let fn_fused_gate_up_silu_q4k_multi = get_fn!("fused_gate_up_silu_q4k_multi");
+        let fn_gemv_q4k_f32_multi = get_fn!("gemv_q4k_f32_multi");
+        let fn_gemv_bf16_f32_multi = get_fn!("gemv_bf16_f32_multi");
+        let fn_fused_rms_qkv_q4k_f32 = get_fn!("fused_rms_qkv_q4k_f32");
+        let fn_fused_rms_gate_up_silu_q4k_f32 = get_fn!("fused_rms_gate_up_silu_q4k_f32");
+        let fn_fused_rms_qkv_q4_f32 = get_fn!("fused_rms_qkv_q4_f32");
+        let fn_fused_rms_gate_up_silu_q4_f32 = get_fn!("fused_rms_gate_up_silu_q4_f32");
         let fn_argmax_f32 = get_fn!("argmax_f32");
 
         // Load wave64 GEMV kernels
@@ -209,6 +221,12 @@ impl GpuKernels {
             fn_fused_rms_norm_quantize,
             fn_fused_rope_kv_copy,
             fn_fused_gate_up_silu_q4k_multi,
+            fn_gemv_q4k_f32_multi,
+            fn_gemv_bf16_f32_multi,
+            fn_fused_rms_qkv_q4k_f32,
+            fn_fused_rms_gate_up_silu_q4k_f32,
+            fn_fused_rms_qkv_q4_f32,
+            fn_fused_rms_gate_up_silu_q4_f32,
             fn_argmax_f32,
             module_w64,
             fn_gemv_q4k_q8_w64,
@@ -1189,6 +1207,313 @@ impl GpuKernels {
                 &mut p_out  as *mut *mut f32  as *mut std::ffi::c_void,
                 &mut p_n    as *mut i32       as *mut std::ffi::c_void,
                 &mut p_k    as *mut i32       as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q4k_f32_multi — Q4_K × F32 GEMV (no intermediate Q8 quantize)
+    // Eliminates the quantize step between gate+up output and down projection.
+    // Grid : (ceil(N/8), M, 1)  Block: (32, 8, 1)
+    // Shared: K * sizeof(float) bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_q4k_f32_multi(
+        &self,
+        w_data: *const u8,  // [N * (K/256) * 144] raw Q4_K blocks
+        x: *const f32,      // [K] F32 activations
+        out: *mut f32,      // [N] F32 output
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, m.max(1) as u32, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4) as u32;  // K floats in shared memory
+
+        let mut p_data = w_data;
+        let mut p_x    = x;
+        let mut p_out  = out;
+        let mut p_m    = m;
+        let mut p_n    = n;
+        let mut p_k    = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q4k_f32_multi,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_bf16_f32_multi — BF16 weights × F32 activations GEMV
+    // Replaces hipBLAS SGEMM for lm_head decode (M=1, N=vocab, K=hidden).
+    // Grid : (ceil(N/8), 1, 1)  Block: (32, 8, 1)
+    // Shared: K * sizeof(float) bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn gemv_bf16_f32_multi(
+        &self,
+        w: *const u16,   // [N, K] BF16 weights
+        x: *const f32,   // [K] F32 activations
+        out: *mut f32,   // [N] F32 output
+        n: i32,
+        k: i32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4) as u32;  // K floats in shared memory
+
+        let mut p_w   = w;
+        let mut p_x   = x;
+        let mut p_out = out;
+        let mut p_n   = n;
+        let mut p_k   = k;
+
+        hip_launch_kernel(
+            self.fn_gemv_bf16_f32_multi,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_w   as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_x   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_n   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_rms_qkv_q4k_f32 — RMSNorm + Q/K/V projections in one kernel
+    // Eliminates Q8 intermediate: rms_norm_quantize + fused_qkv → single launch
+    // Grid : (ceil((Nq+Nk+Nv)/8), 1, 1)
+    // Block: (32, 8, 1) — 8 warps, shared = K floats
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_rms_qkv_q4k_f32(
+        &self,
+        x: *const f32,
+        norm_w: *const f32,
+        wq_data: *const u8,
+        wk_data: *const u8,
+        wv_data: *const u8,
+        out_q: *mut f32,
+        out_k: *mut f32,
+        out_v: *mut f32,
+        bias_q: *const f32,
+        bias_k: *const f32,
+        bias_v: *const f32,
+        nq: i32, nk: i32, nv: i32, k: i32, eps: f32,
+    ) -> Result<(), HipError> {
+        let total = nq + nk + nv;
+        let grid = (((total + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4) as u32;  // K floats in shared
+
+        let mut p_x      = x;
+        let mut p_nw     = norm_w;
+        let mut p_wq     = wq_data;
+        let mut p_wk     = wk_data;
+        let mut p_wv     = wv_data;
+        let mut p_oq     = out_q;
+        let mut p_ok     = out_k;
+        let mut p_ov     = out_v;
+        let mut p_bq     = bias_q;
+        let mut p_bk     = bias_k;
+        let mut p_bv     = bias_v;
+        let mut p_nq     = nq;
+        let mut p_nk     = nk;
+        let mut p_nv     = nv;
+        let mut p_k      = k;
+        let mut p_eps    = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_qkv_q4k_f32,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_x   as *mut *const f32  as *mut std::ffi::c_void,
+                &mut p_nw  as *mut *const f32  as *mut std::ffi::c_void,
+                &mut p_wq  as *mut *const u8   as *mut std::ffi::c_void,
+                &mut p_wk  as *mut *const u8   as *mut std::ffi::c_void,
+                &mut p_wv  as *mut *const u8   as *mut std::ffi::c_void,
+                &mut p_oq  as *mut *mut f32    as *mut std::ffi::c_void,
+                &mut p_ok  as *mut *mut f32    as *mut std::ffi::c_void,
+                &mut p_ov  as *mut *mut f32    as *mut std::ffi::c_void,
+                &mut p_bq  as *mut *const f32  as *mut std::ffi::c_void,
+                &mut p_bk  as *mut *const f32  as *mut std::ffi::c_void,
+                &mut p_bv  as *mut *const f32  as *mut std::ffi::c_void,
+                &mut p_nq  as *mut i32         as *mut std::ffi::c_void,
+                &mut p_nk  as *mut i32         as *mut std::ffi::c_void,
+                &mut p_nv  as *mut i32         as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32         as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32         as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_rms_gate_up_silu_q4k_f32 — RMSNorm + gate+up+SiLU in one kernel
+    // Eliminates Q8 intermediate for MLP input
+    // Grid : (ceil(N/8), 1, 1)
+    // Block: (32, 8, 1) — 8 warps, shared = K floats
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_rms_gate_up_silu_q4k_f32(
+        &self,
+        x: *const f32,
+        norm_w: *const f32,
+        gate_data: *const u8,
+        up_data: *const u8,
+        out: *mut f32,
+        n: i32, k: i32, eps: f32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4) as u32;
+
+        let mut p_x    = x;
+        let mut p_nw   = norm_w;
+        let mut p_gate = gate_data;
+        let mut p_up   = up_data;
+        let mut p_out  = out;
+        let mut p_n    = n;
+        let mut p_k    = k;
+        let mut p_eps  = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_gate_up_silu_q4k_f32,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nw   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_gate as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_up   as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_eps  as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_rms_qkv_q4_f32 — RMSNorm + Q/K/V for IARA native Q4 format
+    // Grid : (ceil((Nq+Nk+Nv)/8), 1, 1)
+    // Block: (32, 8, 1) — shared = K*4 + 8*4 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_rms_qkv_q4_f32(
+        &self,
+        x: *const f32, norm_w: *const f32,
+        wq_packed: *const u8, wq_scales: *const f32, wq_zeros: *const f32,
+        wk_packed: *const u8, wk_scales: *const f32, wk_zeros: *const f32,
+        wv_packed: *const u8, wv_scales: *const f32, wv_zeros: *const f32,
+        out_q: *mut f32, out_k: *mut f32, out_v: *mut f32,
+        bias_q: *const f32, bias_k: *const f32, bias_v: *const f32,
+        nq: i32, nk: i32, nv: i32, k: i32, group_size: i32, eps: f32,
+    ) -> Result<(), HipError> {
+        let total = nq + nk + nv;
+        let grid = (((total + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4 + 8 * 4) as u32;
+
+        let mut p_x   = x;     let mut p_nw  = norm_w;
+        let mut p_wqp = wq_packed; let mut p_wqs = wq_scales; let mut p_wqz = wq_zeros;
+        let mut p_wkp = wk_packed; let mut p_wks = wk_scales; let mut p_wkz = wk_zeros;
+        let mut p_wvp = wv_packed; let mut p_wvs = wv_scales; let mut p_wvz = wv_zeros;
+        let mut p_oq  = out_q;  let mut p_ok  = out_k;  let mut p_ov  = out_v;
+        let mut p_bq  = bias_q; let mut p_bk  = bias_k; let mut p_bv  = bias_v;
+        let mut p_nq  = nq;     let mut p_nk  = nk;     let mut p_nv  = nv;
+        let mut p_k   = k;      let mut p_gs  = group_size; let mut p_eps = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_qkv_q4_f32,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_x   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nw  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wqp as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wqs as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wqz as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wkp as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wks as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wkz as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wvp as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wvs as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wvz as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_oq  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ok  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ov  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_bq  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bk  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bv  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nq  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nk  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nv  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_gs  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_rms_gate_up_silu_q4_f32 — RMSNorm + gate+up+SiLU for IARA Q4
+    // Grid : (ceil(N/8), 1, 1)
+    // Block: (32, 8, 1) — shared = K*4 + 8*4 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_rms_gate_up_silu_q4_f32(
+        &self,
+        x: *const f32, norm_w: *const f32,
+        gate_packed: *const u8, gate_scales: *const f32, gate_zeros: *const f32,
+        up_packed: *const u8, up_scales: *const f32, up_zeros: *const f32,
+        out: *mut f32,
+        n: i32, k: i32, group_size: i32, eps: f32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4 + 8 * 4) as u32;
+
+        let mut p_x   = x;           let mut p_nw  = norm_w;
+        let mut p_gp  = gate_packed; let mut p_gs  = gate_scales; let mut p_gz  = gate_zeros;
+        let mut p_up  = up_packed;   let mut p_us  = up_scales;   let mut p_uz  = up_zeros;
+        let mut p_out = out;
+        let mut p_n   = n;           let mut p_k   = k;
+        let mut p_grs = group_size;  let mut p_eps = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_gate_up_silu_q4_f32,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_x   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nw  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_gp  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_gs  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_gz  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_up  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_us  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_uz  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_n   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_grs as *mut i32        as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32        as *mut std::ffi::c_void,
             ],
         )
     }
