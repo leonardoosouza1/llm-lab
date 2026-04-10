@@ -2337,8 +2337,8 @@ impl CausalLM {
 
             prof_sync!("qkv_done");
             section_time!(PROF_QKV, _sec_t0);
-            // Biases: fused into fused_qkv kernel when active, otherwise separate launches
-            if !fused_qkv_ok {
+            // Biases: fused into super_fused_qkv/fused_qkv kernel when active, otherwise separate launches
+            if !super_fused_qkv && !fused_qkv_ok {
                 if let Some(ref bias) = layer.q_bias {
                     self.backend.add_bias_inplace(&AddBiasParams {
                         tensor: &self.scratch.q,
@@ -2711,9 +2711,16 @@ impl CausalLM {
             prof_sync!("wo_done");
             section_time!(PROF_WO, _sec_t0);
             // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
-            // Check if super-fused MLP is possible — avoids norm+quantize if weights are Q4K
-            let super_fused_mlp_possible = n == 1 && matches!(norm_type, NormType::RMSNorm)
-                && matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }));
+            // Compute is_calibrating early so super_fused_mlp_possible can account for it.
+            let is_calibrating = self.sparse_scratch.is_some()
+                && self.sparse_scratch.as_ref().map_or(false, |ss| {
+                    ss.calibration_accum.is_some() && !ss.calibrated
+                });
+            // super_fused_mlp_possible: the fused kernel can run only when not calibrating.
+            let super_fused_mlp_possible = n == 1 && !is_calibrating && matches!(norm_type, NormType::RMSNorm)
+                && (matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }))
+                    || matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4(_), LayerWeight::Q4(_))));
+            // Skip norm+quantize only when super_fused_mlp will actually run (same conditions).
             let mlp_q8_pre = if super_fused_mlp_possible { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                     if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
@@ -2765,11 +2772,6 @@ impl CausalLM {
                 && n == 1  // sparse path only for single-token decode
                 && self.sparse_scratch.as_ref().map_or(false, |ss| ss.calibrated)
                 && matches!(&layer.wgate, LayerWeight::Bf16(_));
-
-            let is_calibrating = self.sparse_scratch.is_some()
-                && self.sparse_scratch.as_ref().map_or(false, |ss| {
-                    ss.calibration_accum.is_some() && !ss.calibrated
-                });
 
             if use_sparse {
                 // ── CALIBRATED-SPARSE MLP PATH ──────────────────────────────
@@ -2876,11 +2878,22 @@ impl CausalLM {
                 static SUPER_FUSED_MLP_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 let super_fused_mlp = if super_fused_mlp_possible && !is_calibrating {
                     match (&layer.wgate, &layer.wup) {
+                        // GGML Q4K format
                         (LayerWeight::Q4K { data: gd, .. }, LayerWeight::Q4K { data: ud, .. }) => {
                             self.backend.fused_rms_gate_up_silu_q4k_f32(&compute_core::FusedRmsGateUpSiluQ4KF32Params {
                                 x: &self.scratch.x, norm_w: &layer.post_attn_norm_w,
                                 gate: gd, up: ud, out: &self.scratch.gate,
                                 n: it, k: h, eps, x_offset: 0,
+                            }).is_ok()
+                        }
+                        // IARA native Q4 format
+                        (LayerWeight::Q4(qtg), LayerWeight::Q4(qtu)) => {
+                            self.backend.fused_rms_gate_up_silu_q4(&compute_core::FusedRmsGateUpSiluQ4Params {
+                                x: &self.scratch.x, norm_w: &layer.post_attn_norm_w,
+                                gate_packed: &qtg.packed, gate_scales: &qtg.scales, gate_zeros: &qtg.zeros,
+                                up_packed:   &qtu.packed, up_scales:   &qtu.scales, up_zeros:   &qtu.zeros,
+                                out: &self.scratch.gate,
+                                n: it, k: h, group_size: qtg.group_size, eps,
                             }).is_ok()
                         }
                         _ => false,
