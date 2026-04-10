@@ -2134,7 +2134,8 @@ impl GpuKernels {
         let grid = (ceil_div(total_n, rows_per_block), 1, 1);
         let block = (64u32, rows_per_block, 1);
         let nq8 = k / 32;
-        let shared_bytes = (nq8 * 36) as u32;
+        // +32 bytes: rows_per_block(4) × 2 halves × 4 bytes for LDS cross-half accumulator slots
+        let shared_bytes = (nq8 * 36 + 32) as u32;
 
         let mut p_wq = wq_data; let mut p_wk = wk_data; let mut p_wv = wv_data;
         let mut p_x = x_q8;

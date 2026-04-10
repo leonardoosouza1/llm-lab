@@ -10,6 +10,7 @@ mod fire_test;  // Performance stress test ("fire test")
 mod generation;
 mod hardware;
 mod inference;
+mod llama;
 mod lnn;
 mod model;
 mod speculative; // Speculative decoding framework
@@ -311,6 +312,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quantize_on_load,
         enable_cfc,
         enable_speculative,
+        llama_engine: Arc::new(Mutex::new(None)),
+        batch_handle: Arc::new(Mutex::new(None)),
     };
     let frontend_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend");
     let cors = CorsLayer::new()

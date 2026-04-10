@@ -55,6 +55,10 @@ pub struct AppState {
     /// Habilita speculative decoding (env: IARA_SPECULATIVE)
     #[allow(dead_code)]
     pub enable_speculative: bool,
+    /// llama.cpp engine — high-performance GGUF inference via FFI
+    pub llama_engine: Arc<Mutex<Option<crate::llama::LlamaEngine>>>,
+    /// Batch server handle for concurrent request processing
+    pub batch_handle: Arc<Mutex<Option<crate::llama::batch_server::BatchHandle>>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,13 +146,23 @@ pub async fn health_handler(
     let status  = if ready { "ok" } else if loading { "loading" } else { "idle" };
 
     let (model_name, model_vram_gb) = {
-        let guard = state.qwen_model.lock().await;
-        match guard.as_ref() {
-            Some(m) => (
-                format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size),
-                m.vram_bytes as f64 / 1e9,
-            ),
-            None => ("none".to_string(), 0.0),
+        // Check llama.cpp engine first
+        let llama_guard = state.llama_engine.lock().await;
+        if let Some(engine) = llama_guard.as_ref() {
+            let info = engine.model_info();
+            (
+                format!("llama.cpp-{}L-{}h", info.n_layers, info.n_embd),
+                info.model_size as f64 / 1e9,
+            )
+        } else {
+            let guard = state.qwen_model.lock().await;
+            match guard.as_ref() {
+                Some(m) => (
+                    format!("{}L-{}h", m.cfg.num_layers, m.cfg.hidden_size),
+                    m.vram_bytes as f64 / 1e9,
+                ),
+                None => ("none".to_string(), 0.0),
+            }
         }
     };
 
@@ -192,6 +206,7 @@ pub async fn unload_model_handler(
 
     // Drop the model — libera VRAM
     *state.qwen_model.lock().await = None;
+    *state.llama_engine.lock().await = None;
     state.model_ready.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let _ = state.frame_tx.send(serde_json::json!({
@@ -459,6 +474,7 @@ pub async fn load_model_handler(
 
     // Unload current model immediately
     *state.qwen_model.lock().await = None;
+    *state.llama_engine.lock().await = None;
 
     // Broadcast loading started
     let _ = state.frame_tx.send(serde_json::json!({
@@ -466,6 +482,89 @@ pub async fn load_model_handler(
         "message": format!("Carregando modelo '{}'...", req.name)
     }).to_string());
 
+    // ── GGUF + llama.cpp fast path ──────────────────────────────────────
+    if let Some(ref gguf_path) = gguf_file {
+        let llama_arc = state.llama_engine.clone();
+        let batch_arc = state.batch_handle.clone();
+        let model_ready = state.model_ready.clone();
+        let model_loading = state.model_loading.clone();
+        let frame_tx = state.frame_tx.clone();
+        let gguf_path = gguf_path.clone();
+        let model_name = req.name.clone();
+
+        tokio::spawn(async move {
+            let path_str = gguf_path.to_str().unwrap_or("").to_string();
+            log::info!("🚀 Loading GGUF via llama.cpp: {}", path_str);
+
+            // llama.cpp model loading is blocking — run in a blocking thread
+            let result = tokio::task::spawn_blocking(move || {
+                crate::llama::LlamaEngine::load(&path_str, 2048)
+            }).await;
+
+            match result {
+                Ok(Ok(mut engine)) => {
+                    let info = engine.model_info();
+                    log::info!("✅ llama.cpp: {} loaded ({}M params, {} layers, {}MB)",
+                        model_name, info.n_params / 1_000_000, info.n_layers,
+                        info.model_size / 1_000_000);
+
+                    // Try to load draft model for speculative decoding
+                    let draft_path = gguf_path.with_file_name(
+                        gguf_path.file_name().unwrap_or_default().to_string_lossy()
+                            .replace("1.5b", "0.5b")
+                            .replace("7b", "1.5b")
+                            .replace("8b", "1.5b")
+                    );
+                    if draft_path != gguf_path && draft_path.exists() {
+                        if let Some(dp) = draft_path.to_str() {
+                            match engine.load_draft(dp) {
+                                Ok(()) => log::info!("✅ Draft model loaded: {}", draft_path.display()),
+                                Err(e) => log::warn!("Draft model failed (non-fatal): {e}"),
+                            }
+                        }
+                    }
+
+                    *llama_arc.lock().await = Some(engine);
+
+                    // Start batch server for concurrent request handling
+                    let handle = crate::llama::batch_server::start_batch_server(llama_arc.clone());
+                    *batch_arc.lock().await = Some(handle);
+
+                    model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "model_loaded",
+                        "model": model_name,
+                        "backend": "llama.cpp",
+                        "params_m": info.n_params / 1_000_000,
+                    }).to_string());
+                }
+                Ok(Err(e)) => {
+                    log::error!("❌ llama.cpp load error: {}", e);
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO llama.cpp: {}", e)
+                    }).to_string());
+                }
+                Err(e) => {
+                    log::error!("❌ llama.cpp spawn error: {}", e);
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "model": req.name,
+                "status": "loading",
+                "backend": "llama.cpp"
+            })),
+        ).into_response();
+    }
+    // ── Legacy CausalLM path (safetensors / .iara) ──────────────────────
     // Spawn background load
     let model_arc     = state.qwen_model.clone();
     let model_ready   = state.model_ready.clone();
@@ -702,6 +801,51 @@ pub async fn generate_handler(
 
     let start = std::time::Instant::now();
 
+    // ── Fast path: llama.cpp via batch server (supports concurrent requests) ──
+    {
+        let batch_guard = state.batch_handle.lock().await;
+        if let Some(handle) = batch_guard.as_ref() {
+            let params = crate::llama::GenerateParams {
+                temperature: req.temperature,
+                top_k: req.top_k as i32,
+                top_p: req.top_p,
+                max_tokens: req.max_tokens,
+            };
+
+            // Drop the guard BEFORE awaiting — allows other requests to also submit
+            let handle_clone = handle.clone();
+            drop(batch_guard);
+
+            match handle_clone.submit(req.prompt.clone(), params).await {
+                Ok(result) => {
+                    let total_ms = start.elapsed().as_millis();
+                    log::info!("✅ llama.cpp: {} tokens in {}ms ({:.1} tok/s)",
+                        result.generated_tokens, result.eval_ms,
+                        result.generated_tokens as f64 / (result.eval_ms.max(1) as f64 / 1000.0));
+
+                    let response = GenerateResponse {
+                        model: req.model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        response: result.text,
+                        done: true,
+                        context: None,
+                        total_duration: total_ms,
+                        prompt_eval_count: result.prompt_tokens as u32,
+                        eval_count: result.generated_tokens as u32,
+                        eval_duration: result.eval_ms,
+                    };
+                    return (StatusCode::OK, Json(response)).into_response();
+                }
+                Err(e) => {
+                    log::error!("❌ llama.cpp error: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e }))).into_response();
+                }
+            }
+        }
+    }
+
+    // ── Legacy path: IARA CausalLM ──────────────────────────────────────
     match generate_internal(&state, &req).await {
         Ok(response) => {
             log::info!("✅ Geração: {:.2}ms", start.elapsed().as_secs_f32() * 1000.0);

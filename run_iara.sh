@@ -11,7 +11,9 @@ rm -f iara-engine/target/.package-cache
 # 2. Caminhos Oficiais ROCm 6.4.4
 export ROCM_PATH=/opt/rocm-7.2.1
 export ROCM_LLVM_PATH=$ROCM_PATH/llvm
-export LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_LLVM_PATH/lib:$LD_LIBRARY_PATH
+# llama.cpp vendored libs + ROCm
+SCRIPT_DIR_LD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH=$SCRIPT_DIR_LD/vendor/llama-cpp/lib:$ROCM_PATH/lib:$ROCM_LLVM_PATH/lib:$LD_LIBRARY_PATH
 
 # 3. Forçar Bindgen a usar o LLVM do ROCm
 export LIBCLANG_PATH=$ROCM_LLVM_PATH/lib

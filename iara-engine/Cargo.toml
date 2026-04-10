@@ -43,6 +43,9 @@ hip-ffi = { path = "../hip-ffi", optional = true }
 rocm-backend   = { path = "../rocm-backend", optional = true }
 opencl-backend = { path = "../opencl-backend", optional = true }
 
+# llama.cpp FFI — motor de inferência de alta performance
+llama-sys = { path = "../llama-sys" }
+
 # Operações matriciais CPU (fallback e pré-processamento)
 ndarray = { version = "0.16", features = ["rayon"] }
 

@@ -201,6 +201,7 @@ fn main() {
             "--offload-arch=gfx1030",
             "-O3",
             "-ffast-math",
+            "-mwavefrontsize64",   // Enable wave64 (default for gfx10xx is wave32)
             "--genco",
             "-o", w64_out.to_str().unwrap(),
             &w64_src,
