@@ -10,3 +10,4 @@ pub mod bi;
 pub mod lsh;
 pub mod ternary;
 pub mod router;
+pub mod route_cache;
