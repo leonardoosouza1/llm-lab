@@ -1,0 +1,27 @@
+[package]
+name = "iara-train"
+version = "0.1.0"
+edition = "2021"
+description = "IARA Training Engine — LoRA fine-tuning + knowledge distillation in pure Rust"
+
+[features]
+default = ["wgpu"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { version = "0.21.0-pre.3", features = ["autodiff", "train"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+byteorder = "1"
+memmap2 = "0.9"
+indicatif = "0.17"
+
+# For teacher inference via llama.cpp
+llama-sys = { path = "../llama-sys" }
+
+[dev-dependencies]
+burn = { version = "0.21.0-pre.3", features = ["ndarray"] }

@@ -841,6 +841,83 @@ extern "C" __global__ void dequant_gemv_q4k(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel: dequant_gemv_q4k_w32 — RDNA2-optimised Q4_K GEMV, 1 warp per row
+//
+// Same dequant logic as dequant_gemv_q4k but uses a single wave32 per output row.
+// Advantages over the 256-thread version for RDNA2 decode (M=1):
+//   - No LDS / cross-warp barrier — pure warp-level reduction (__shfl_down)
+//   - Higher CU occupancy (32 threads/block → 64 resident wavefronts per CU)
+//   - For N=1536 all blocks schedule simultaneously on 28 CUs (1536 ≤ 28*64=1792)
+//   - Each thread processes K/32 elements with good arithmetic intensity
+//
+// Grid : (N, M, 1)  — one block per output row per token
+// Block: (32, 1, 1) — exactly one wave32 per row
+// Shared: 0 bytes   — no shared memory needed
+// ---------------------------------------------------------------------------
+__launch_bounds__(32, 16)
+extern "C" __global__ void dequant_gemv_q4k_w32(
+    const unsigned char* __restrict__ data,
+    const float*         __restrict__ x,
+    float*               __restrict__ out,
+    int M, int N, int K,
+    float beta
+) {
+    const int row = blockIdx.x;
+    const int mi  = blockIdx.y;
+    const int tid = (int)threadIdx.x;   // 0..31
+
+    if (row >= N || mi >= M) return;
+
+    const int n_blocks_per_row = K / 256;
+    const int row_bytes = n_blocks_per_row * 144;
+    const unsigned char* __restrict__ row_data = data + (size_t)row * row_bytes;
+    const float* __restrict__ x_row = x + (size_t)mi * K;
+
+    const int total_qs_bytes = n_blocks_per_row * 128;
+
+    float acc = 0.0f;
+
+    for (int byte_idx = tid; byte_idx < total_qs_bytes; byte_idx += 32) {
+        const int blk         = byte_idx / 128;
+        const int byte_in_blk = byte_idx % 128;
+        const int group       = byte_in_blk >> 5;
+        const int l           = byte_in_blk & 31;
+
+        const unsigned char* __restrict__ block_ptr = row_data + blk * 144;
+
+        const float d    = fp16_to_f32(*(const unsigned short*)(block_ptr + 0));
+        const float dmin = fp16_to_f32(*(const unsigned short*)(block_ptr + 2));
+
+        const unsigned char* sc_ptr = block_ptr + 4;
+        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+        get_scale_min_k4(2 * group,     sc_ptr, &sc_lo, &m_lo);
+        get_scale_min_k4(2 * group + 1, sc_ptr, &sc_hi, &m_hi);
+
+        const unsigned char q_byte = block_ptr[16 + byte_in_blk];
+        const int q_lo = q_byte & 0x0F;
+        const int q_hi = q_byte >> 4;
+
+        const float w_lo = d * (float)sc_lo * (float)q_lo - dmin * (float)m_lo;
+        const float w_hi = d * (float)sc_hi * (float)q_hi - dmin * (float)m_hi;
+
+        const int k_lo = blk * 256 + group * 64 + l;
+        const int k_hi = k_lo + 32;
+
+        acc = __fmaf_rn(w_lo, x_row[k_lo], acc);
+        acc = __fmaf_rn(w_hi, x_row[k_hi], acc);
+    }
+
+    // Pure warp reduce — no LDS needed (single wave32)
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (tid == 0) {
+        const int out_idx = mi * N + row;
+        out[out_idx] = (beta != 0.0f) ? __fmaf_rn(beta, out[out_idx], acc) : acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel: dequant_gemv_q6k — Native GGML Q6_K GEMV
 //
 // Q6_K block layout (210 bytes per 256 values):
@@ -2061,6 +2138,95 @@ extern "C" __global__ void gemv_q4k_f32_multi(
     }
 }
 #undef GEMV_Q4K_F32_ROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_q4k_f32_w32 — Q4_K weights × F32 activations, 1 warp/row
+//
+// Decode-optimised variant of gemv_q4k_f32_multi:
+//   • 32 threads (1 wave32) per output row — no cross-warp LDS reduction
+//   • Zero shared memory → no LDS occupancy pressure
+//     (Down K=8960: old kernel = 35.8KB/block → 1 block/CU max;
+//      this kernel = 0 bytes → 55+ blocks/CU, all 1536 run in parallel)
+//   • x loaded directly from L2-cached global memory
+//
+// Same Q4K lane mapping as gemv_q4k_f32_multi:
+//   group = lane>>3 (0..3), lane_g = lane&7 (0..7)
+//   q4 int = 4 bytes at bp+16+group*32+lane_g*4
+//   k_lo = blk*256 + group*64 + lane_g*4   (lo nibbles)
+//   k_hi = k_lo + 32                        (hi nibbles)
+//
+// Grid: (N, M, 1)   Block: (32, 1, 1)   Shared: 0
+// ---------------------------------------------------------------------------
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_q4k_f32_w32(
+    const unsigned char* __restrict__ w_data,
+    const float*         __restrict__ x,
+    float*               __restrict__ out,
+    int M, int N, int K, float beta
+) {
+    const int row  = (int)blockIdx.x;
+    const int mi   = (int)blockIdx.y;
+    const int lane = (int)threadIdx.x;
+    if (row >= N || mi >= M) return;
+
+    const int nblk   = K / 256;
+    const int group  = lane >> 3;           // 0..3
+    const int lane_g = lane & 7;            // 0..7
+
+    const unsigned char* __restrict__ w_row = w_data + (size_t)row * nblk * 144;
+    const float*         __restrict__ x_row = x + (size_t)mi * K;
+
+    // Pre-compute constant lane offsets
+    const int k_lo_base = group * 64 + lane_g * 4;
+    const int k_hi_base = k_lo_base + 32;
+
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* __restrict__ bp = w_row + blk * 144;
+
+        // d / dmin: packed as 2×fp16 in 4 bytes
+        const unsigned int dm_raw = *(const unsigned int*)bp;
+        const float d    = fp16_to_f32((unsigned short)(dm_raw & 0xFFFF));
+        const float dmin = fp16_to_f32((unsigned short)(dm_raw >> 16));
+
+        // Super-block scales/mins for this lane's group (lo and hi sub-groups)
+        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
+        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
+
+        // 4 packed Q4 nibbles for this lane (4 lo + 4 hi weights)
+        const int q4 = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
+
+        const int k_lo = blk * 256 + k_lo_base;
+        const int k_hi = blk * 256 + k_hi_base;
+
+        float dot_lo = 0.0f, sum_lo = 0.0f;
+        float dot_hi = 0.0f, sum_hi = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float xi_lo = x_row[k_lo + i];
+            const float xi_hi = x_row[k_hi + i];
+            dot_lo = __fmaf_rn((float)((q4 >> (i * 8))     & 0xF), xi_lo, dot_lo);
+            dot_hi = __fmaf_rn((float)((q4 >> (i * 8 + 4)) & 0xF), xi_hi, dot_hi);
+            sum_lo += xi_lo;
+            sum_hi += xi_hi;
+        }
+
+        acc += d    * ((float)sc_lo * dot_lo + (float)sc_hi * dot_hi)
+             - dmin * ((float)m_lo  * sum_lo + (float)m_hi  * sum_hi);
+    }
+
+    // Pure warp reduce — no LDS needed (single wave32)
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (lane == 0) {
+        const int out_idx = mi * N + row;
+        out[out_idx] = (beta == 0.0f) ? acc : __fmaf_rn(beta, out[out_idx], acc);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Kernel: gemv_bf16_f32_multi — BF16 weights × F32 activations GEMV
@@ -3855,17 +4021,22 @@ extern "C" __global__ void flash_attention_decode(
         }
         __syncthreads();
 
-        // Online softmax update
+        // Online softmax update (FA2-correct)
         float m_new = fmaxf(m, tile_max);
         float exp_m_diff = __expf(m - m_new);
         float l_new = l * exp_m_diff;
 
-        // Update accumulator and running sum
+        // Rescale previous accumulator ONCE for new global max
+        if (tid < head_dim) {
+            acc *= exp_m_diff;
+        }
+
+        // Add contributions from all positions in this tile
         for (int t = 0; t < tile_size; t++) {
             float p = __expf(scores[t] - m_new);
             l_new += p;
             if (tid < head_dim) {
-                acc = acc * exp_m_diff + p * v_tile[t * head_dim + tid];
+                acc += p * v_tile[t * head_dim + tid];
             }
         }
 
@@ -3879,4 +4050,265 @@ extern "C" __global__ void flash_attention_decode(
         out[head * head_dim + tid] = acc / l;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_ternary_f32_w32 — Ternary-weight × F32 GEMV (1 warp per row)
+//
+// BitNet 1.58 inference: W ∈ {-1, 0, +1} packed as 2 bits per weight
+// (4 weights per byte). Encoding: -1=0b00, 0=0b01, +1=0b10.
+// Pack order within byte: w0=bits[1:0], w1=bits[3:2], w2=bits[5:4], w3=bits[7:6]
+//
+// Operation: y[row] = scale * Σ_k { w[row,k] * x[k] }
+//   w == +1 → acc += x[k]   (ADD only)
+//   w == -1 → acc -= x[k]   (SUB only)
+//   w ==  0 → skip          (zero FLOPs)
+//
+// Key optimizations for RDNA2 (GFX1032 / RX 6750 XT):
+//
+//  1. Zero shared memory — all N rows schedule in parallel.
+//     Q4K_F32_multi with K=1536 needed 6KB/block → ≤10 blocks/CU.
+//     This kernel = 0 bytes → 64+ blocks/CU, all 8960 rows run together.
+//
+//  2. Vectorized 4-byte loads (uint32 = 16 ternary weights per load).
+//     32 threads × 4 bytes = 128 bytes/step → coalesced 64-byte cache-line
+//     pairs. Memory bandwidth is the bottleneck: 2 bits/weight vs 4 bits/weight
+//     for Q4 means 2× less weight data to stream.
+//
+//  3. No multiply instructions. Ternary decode is a 2-bit compare → branch-free
+//     conditional add/subtract. On RDNA2 SIMD this replaces 2 FMAs per element
+//     with 1 VADD/VSUB (or VFMA with ±1 constant, same cost) + 2-bit mask ops.
+//     For K=1536 with ~36% sparsity: ~980 effective adds vs 1536 FMAs.
+//
+//  4. Pure wave32 warp reduction — no __syncthreads(), no LDS.
+//
+//  5. Shared memory optional variant (gemv_ternary_f32_smem) for multi-row
+//     batches (M > 1) where x reuse justifies the extra LDS traffic.
+//
+// Packing layout (same as bitnet.rs):
+//   packed_cols = ceil(K / 4)  bytes per weight row
+//   packed[row * packed_cols + k/4] → bits [(k%4)*2 +: 2]
+//
+// Grid : (N, M, 1) — one block (one wave32) per output element
+// Block: (32, 1, 1)
+// Shared: 0 bytes
+// ---------------------------------------------------------------------------
+
+/// Decode a single ternary code (2 bits) to {-1, 0, +1} as float.
+/// Executed inline per weight — branch-free on RDNA2 (VCMP + VFMA pattern).
+__device__ __forceinline__ void ternary_acc(unsigned int code2, float xi, float* acc) {
+    // code2 ∈ {0b00=-1, 0b01=0, 0b10=+1, 0b11=treat-as-0}
+    if (code2 == 0x2u) {
+        *acc += xi;
+    } else if (code2 == 0x0u) {
+        *acc -= xi;
+    }
+    // 0b01 and 0b11 → skip (zero weight)
+}
+
+__launch_bounds__(32, 32)
+extern "C" __global__ void gemv_ternary_f32_w32(
+    const unsigned char* __restrict__ packed,  // [N, ceil(K/4)] 2-bit ternary weights
+    const float*         __restrict__ x,       // [M, K] F32 activations
+    float*               __restrict__ out,     // [M, N] F32 output
+    int M,
+    int N,
+    int K,           // inner dimension (must be multiple of 4 for clean packing)
+    float scale,     // per-tensor dequant scale
+    float beta       // 0.0=overwrite, 1.0=accumulate
+) {
+    const int row  = (int)blockIdx.x;   // output row index [0..N)
+    const int mi   = (int)blockIdx.y;   // batch token index [0..M)
+    const int lane = (int)threadIdx.x;  // 0..31
+
+    if (row >= N || mi >= M) return;
+
+    // packed_cols = number of bytes per weight row = ceil(K/4)
+    const int packed_cols = (K + 3) >> 2;
+
+    const unsigned char* __restrict__ w_row = packed + (size_t)row * packed_cols;
+    const float*         __restrict__ x_row = x + (size_t)mi * K;
+
+    float acc = 0.0f;
+
+    // ── Main loop: vectorized uint32 loads = 16 ternary weights per load ────
+    // Each uint32 contains 4 packed bytes = 16 × 2-bit codes.
+    // 32 lanes × 4 bytes/lane = 128 bytes per step (2 coalesced cache lines).
+    const int n_u32 = packed_cols >> 2;  // number of 4-byte words in packed row
+    const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(w_row);
+
+    for (int i = lane; i < n_u32; i += 32) {
+        uint32_t word = p32[i];
+        int k_base = i * 16;   // first weight index for this uint32
+
+        // Unroll 4 bytes per uint32 word
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned int byte_val = (word >> (b * 8)) & 0xFF;
+            int k0 = k_base + b * 4;
+
+            // Guard: last byte may extend past K if K % 4 != 0
+            // For typical BitNet shapes (K=1536, divisible by 4), this never fires.
+            if (k0 >= K) break;
+
+            // Decode 4 ternary weights packed in this byte
+            // Bit positions: w0=[1:0], w1=[3:2], w2=[5:4], w3=[7:6]
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                if (k0 + s < K) {
+                    unsigned int code = (byte_val >> (s * 2)) & 0x3u;
+                    ternary_acc(code, x_row[k0 + s], &acc);
+                }
+            }
+        }
+    }
+
+    // ── Tail: byte-level loop for packed_cols not multiple of 4 ─────────────
+    const int tail_byte_start = n_u32 * 4;
+    for (int bp = tail_byte_start + lane; bp < packed_cols; bp += 32) {
+        unsigned int byte_val = (unsigned int)w_row[bp];
+        int k0 = bp * 4;
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            if (k0 + s < K) {
+                unsigned int code = (byte_val >> (s * 2)) & 0x3u;
+                ternary_acc(code, x_row[k0 + s], &acc);
+            }
+        }
+    }
+
+    // ── Warp reduction (wave32 on RDNA2 — no LDS needed) ────────────────────
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    // ── Write output ─────────────────────────────────────────────────────────
+    if (lane == 0) {
+        const int out_idx = mi * N + row;
+        const float result = acc * scale;
+        out[out_idx] = (beta == 0.0f) ? result : __fmaf_rn(beta, out[out_idx], result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_ternary_f32_smem — Ternary GEMV with shared-memory x cache
+//
+// Multi-row variant for M > 1 (prefill or batched decode). Uses one block
+// per output row with 256 threads (8 warps) and loads x into shared memory
+// so that all 8 warps reuse the same cached activations.
+//
+// When M=1 prefer gemv_ternary_f32_w32 (lower occupancy pressure).
+// When M>1 (e.g. prefill with 8+ tokens) this kernel amortises the x load
+// across the extra token dimension by staging x in LDS.
+//
+// Shared memory layout: K floats = K * 4 bytes
+//   For K=1536: 6144 bytes (well under 64KB RDNA2 limit)
+//   For K=8960: 35840 bytes (fits in 64KB; limits to ~1 block/CU but M>>1)
+//
+// Grid : (N, M, 1)
+// Block: (256, 1, 1) — 8 warps; all cooperate loading x, then each processes
+//                      its stripe of packed_cols
+// Shared: K * sizeof(float) bytes
+// ---------------------------------------------------------------------------
+#define TERNARY_BLOCK 256
+#define TERNARY_WARPS (TERNARY_BLOCK / 32)
+
+__launch_bounds__(TERNARY_BLOCK, 2)
+extern "C" __global__ void gemv_ternary_f32_smem(
+    const unsigned char* __restrict__ packed,  // [N, ceil(K/4)]
+    const float*         __restrict__ x,       // [M, K]
+    float*               __restrict__ out,     // [M, N]
+    int M,
+    int N,
+    int K,
+    float scale,
+    float beta
+) {
+    extern __shared__ float x_smem[];  // K floats
+
+    const int row  = (int)blockIdx.x;
+    const int mi   = (int)blockIdx.y;
+    const int tid  = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    if (row >= N || mi >= M) return;
+
+    // ── Cooperative load of x into shared memory ─────────────────────────────
+    const float* __restrict__ x_row = x + (size_t)mi * K;
+    for (int i = tid; i < K; i += TERNARY_BLOCK)
+        x_smem[i] = x_row[i];
+    __syncthreads();
+
+    // ── Each thread processes its stripe of packed bytes ─────────────────────
+    const int packed_cols = (K + 3) >> 2;
+    const unsigned char* __restrict__ w_row = packed + (size_t)row * packed_cols;
+
+    float acc = 0.0f;
+
+    // Vectorized uint32 path
+    const int n_u32 = packed_cols >> 2;
+    const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(w_row);
+
+    for (int i = tid; i < n_u32; i += TERNARY_BLOCK) {
+        uint32_t word = p32[i];
+        int k_base = i * 16;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned int byte_val = (word >> (b * 8)) & 0xFF;
+            int k0 = k_base + b * 4;
+            if (k0 >= K) break;
+
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                if (k0 + s < K) {
+                    unsigned int code = (byte_val >> (s * 2)) & 0x3u;
+                    ternary_acc(code, x_smem[k0 + s], &acc);
+                }
+            }
+        }
+    }
+
+    // Tail
+    const int tail_byte_start = n_u32 * 4;
+    for (int bp = tail_byte_start + tid; bp < packed_cols; bp += TERNARY_BLOCK) {
+        unsigned int byte_val = (unsigned int)w_row[bp];
+        int k0 = bp * 4;
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            if (k0 + s < K) {
+                unsigned int code = (byte_val >> (s * 2)) & 0x3u;
+                ternary_acc(code, x_smem[k0 + s], &acc);
+            }
+        }
+    }
+
+    // ── Warp-level reduction ─────────────────────────────────────────────────
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    // ── Cross-warp reduction via LDS (TERNARY_WARPS = 8 slots) ──────────────
+    // Reuse x_smem scratch space past K (K is loaded, no longer needed).
+    // We need TERNARY_WARPS floats = 8 × 4 = 32 bytes at x_smem[K..K+8).
+    // shared_bytes caller must allocate K*4 + TERNARY_WARPS*4 bytes.
+    float* sh_reduce = x_smem + K;  // 8 floats after x
+
+    if (lane == 0)
+        sh_reduce[warp] = acc;
+    __syncthreads();
+
+    // First warp finalises the reduction
+    if (warp == 0) {
+        float val = (lane < TERNARY_WARPS) ? sh_reduce[lane] : 0.0f;
+        for (int off = TERNARY_WARPS >> 1; off >= 1; off >>= 1)
+            val += __shfl_down(val, off);
+        if (lane == 0) {
+            const int out_idx = mi * N + row;
+            const float result = val * scale;
+            out[out_idx] = (beta == 0.0f) ? result : __fmaf_rn(beta, out[out_idx], result);
+        }
+    }
+}
+
+#undef TERNARY_BLOCK
+#undef TERNARY_WARPS
 

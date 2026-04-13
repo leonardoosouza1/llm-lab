@@ -73,6 +73,7 @@ pub struct GpuKernels {
     fn_topk_select: hipFunction_t,
     fn_fused_attention_decode: hipFunction_t,
     fn_dequant_gemv_q4k: hipFunction_t,
+    fn_dequant_gemv_q4k_w32: hipFunction_t,
     fn_dequant_gemv_q6k: hipFunction_t,
     fn_quantize_f32_q8_1: hipFunction_t,
     fn_gemv_q4k_q8: hipFunction_t,
@@ -86,6 +87,7 @@ pub struct GpuKernels {
     fn_fused_rope_kv_copy: hipFunction_t,
     fn_fused_gate_up_silu_q4k_multi: hipFunction_t,
     fn_gemv_q4k_f32_multi: hipFunction_t,
+    fn_gemv_q4k_f32_w32: hipFunction_t,
     fn_gemv_bf16_f32_multi: hipFunction_t,
     fn_fused_rms_qkv_q4k_f32: hipFunction_t,
     fn_fused_rms_gate_up_silu_q4k_f32: hipFunction_t,
@@ -103,6 +105,9 @@ pub struct GpuKernels {
     fn_fused_gate_up_silu_q4k_w64: hipFunction_t,
     fn_fused_qkv_q4k_w64: hipFunction_t,
     fn_gemv_q6k_q8_w64: hipFunction_t,
+    // Ternary GEMV kernels (BitNet 1.58)
+    fn_gemv_ternary_f32_w32: hipFunction_t,
+    fn_gemv_ternary_f32_smem: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -153,6 +158,7 @@ impl GpuKernels {
         let fn_topk_select = get_fn!("topk_select");
         let fn_fused_attention_decode = get_fn!("fused_attention_decode");
         let fn_dequant_gemv_q4k = get_fn!("dequant_gemv_q4k");
+        let fn_dequant_gemv_q4k_w32 = get_fn!("dequant_gemv_q4k_w32");
         let fn_dequant_gemv_q6k = get_fn!("dequant_gemv_q6k");
         let fn_quantize_f32_q8_1 = get_fn!("quantize_f32_q8_1");
         let fn_gemv_q4k_q8 = get_fn!("gemv_q4k_q8");
@@ -166,6 +172,7 @@ impl GpuKernels {
         let fn_fused_rope_kv_copy = get_fn!("fused_rope_kv_copy");
         let fn_fused_gate_up_silu_q4k_multi = get_fn!("fused_gate_up_silu_q4k_multi");
         let fn_gemv_q4k_f32_multi = get_fn!("gemv_q4k_f32_multi");
+        let fn_gemv_q4k_f32_w32 = get_fn!("gemv_q4k_f32_w32");
         let fn_gemv_bf16_f32_multi = get_fn!("gemv_bf16_f32_multi");
         let fn_fused_rms_qkv_q4k_f32 = get_fn!("fused_rms_qkv_q4k_f32");
         let fn_fused_rms_gate_up_silu_q4k_f32 = get_fn!("fused_rms_gate_up_silu_q4k_f32");
@@ -187,6 +194,10 @@ impl GpuKernels {
         let fn_fused_gate_up_silu_q4k_w64 = get_w64_fn!("fused_gate_up_silu_q4k_w64");
         let fn_fused_qkv_q4k_w64 = get_w64_fn!("fused_qkv_q4k_w64");
         let fn_gemv_q6k_q8_w64 = get_w64_fn!("gemv_q6k_q8_w64");
+
+        // Ternary GEMV kernels (BitNet 1.58 — resolved from main module)
+        let fn_gemv_ternary_f32_w32 = get_fn!("gemv_ternary_f32_w32");
+        let fn_gemv_ternary_f32_smem = get_fn!("gemv_ternary_f32_smem");
 
         Ok(Self {
             module,
@@ -217,6 +228,7 @@ impl GpuKernels {
             fn_topk_select,
             fn_fused_attention_decode,
             fn_dequant_gemv_q4k,
+            fn_dequant_gemv_q4k_w32,
             fn_dequant_gemv_q6k,
             fn_quantize_f32_q8_1,
             fn_gemv_q4k_q8,
@@ -230,6 +242,7 @@ impl GpuKernels {
             fn_fused_rope_kv_copy,
             fn_fused_gate_up_silu_q4k_multi,
             fn_gemv_q4k_f32_multi,
+            fn_gemv_q4k_f32_w32,
             fn_gemv_bf16_f32_multi,
             fn_fused_rms_qkv_q4k_f32,
             fn_fused_rms_gate_up_silu_q4k_f32,
@@ -244,6 +257,8 @@ impl GpuKernels {
             fn_fused_gate_up_silu_q4k_w64,
             fn_fused_qkv_q4k_w64,
             fn_gemv_q6k_q8_w64,
+            fn_gemv_ternary_f32_w32,
+            fn_gemv_ternary_f32_smem,
         })
     }
 
@@ -837,6 +852,54 @@ impl GpuKernels {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // RDNA2-optimised Q4_K GEMV — 1 warp (32 threads) per row, no LDS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// RDNA2-optimised Q4_K GEMV: 32-thread (1 wave) per row, no shared memory.
+    /// Better occupancy than the 256-thread variant for decode (M=1, N large).
+    ///
+    /// # Safety
+    /// All GPU pointers must be valid device allocations of the correct size.
+    pub unsafe fn dequant_gemv_q4k_w32(
+        &self,
+        data: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_data = data;
+        let mut p_x = x;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_dequant_gemv_q4k_w32,
+            grid,
+            block,
+            0,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Native GGML Q6_K GEMV — raw Q6_K blocks, dequant on-the-fly in F32
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1256,6 +1319,51 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q4k_f32_w32 — Q4_K × F32 decode-optimised GEMV (1 warp/row)
+    // Zero shared memory: no LDS pressure, all N rows run in parallel on RDNA2.
+    // Grid: (N, M, 1)   Block: (32, 1, 1)   Shared: 0
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_q4k_f32_w32(
+        &self,
+        w_data: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_data = w_data;
+        let mut p_x    = x;
+        let mut p_out  = out;
+        let mut p_m    = m;
+        let mut p_n    = n;
+        let mut p_k    = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q4k_f32_w32,
+            grid,
+            block,
+            0,
             self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
@@ -2687,5 +2795,146 @@ impl GpuKernels {
                 &mut p_beta as *mut f32 as *mut std::ffi::c_void,
             ],
         )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_ternary_f32_w32 — BitNet 1.58 ternary GEMV, decode-optimised
+    //
+    // Weights are 2-bit packed ternary {-1=0b00, 0=0b01, +1=0b10}.
+    // 4 weights per byte, row-major: packed[row * ceil(K/4) + col/4].
+    //
+    // Zero shared memory variant — ideal for decode (M=1):
+    //   All N rows schedule in parallel. For N=8960 on RDNA2 (40 CUs):
+    //   224 blocks/CU, saturating all SIMDs from launch.
+    //
+    // Grid : (N, M, 1)   Block: (32, 1, 1)   Shared: 0 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_ternary_f32_w32(
+        &self,
+        packed: *const u8,   // [N, ceil(K/4)] 2-bit ternary weights on GPU
+        x: *const f32,       // [M, K] F32 activations on GPU
+        out: *mut f32,       // [M, N] F32 output on GPU
+        m: i32,              // batch size (tokens); typically 1 for decode
+        n: i32,              // output dimension (weight rows)
+        k: i32,              // inner dimension (weight cols / activation size)
+        scale: f32,          // per-tensor dequant scale from TernaryWeight::scale
+        beta: f32,           // 0.0 = overwrite, 1.0 = accumulate into out
+    ) -> Result<(), HipError> {
+        let grid  = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_packed = packed;
+        let mut p_x      = x;
+        let mut p_out    = out;
+        let mut p_m      = m;
+        let mut p_n      = n;
+        let mut p_k      = k;
+        let mut p_scale  = scale;
+        let mut p_beta   = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_ternary_f32_w32,
+            grid,
+            block,
+            0, // no shared memory
+            self.stream,
+            &mut [
+                &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x      as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_scale  as *mut f32        as *mut std::ffi::c_void,
+                &mut p_beta   as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_ternary_f32_smem — BitNet 1.58 ternary GEMV with shared-mem x cache
+    //
+    // Multi-row variant for M > 1 (prefill). Loads x into LDS once per block
+    // and reuses it across all 8 warps. Reduces global memory traffic for x
+    // by 8× compared to w32 variant when M=1 but K is large.
+    //
+    // Caller must compute shared_bytes = (k + 8) * 4  (K floats + 8 warp slots)
+    //
+    // Grid : (N, M, 1)   Block: (256, 1, 1)   Shared: (K+8)*4 bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_ternary_f32_smem(
+        &self,
+        packed: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale: f32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid  = (n as u32, m.max(1) as u32, 1);
+        let block = (256u32, 1, 1);
+        // K floats for x + 8 floats for cross-warp reduction scratch
+        let shared_bytes = ((k + 8) * 4) as u32;
+
+        let mut p_packed = packed;
+        let mut p_x      = x;
+        let mut p_out    = out;
+        let mut p_m      = m;
+        let mut p_n      = n;
+        let mut p_k      = k;
+        let mut p_scale  = scale;
+        let mut p_beta   = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_ternary_f32_smem,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x      as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_scale  as *mut f32        as *mut std::ffi::c_void,
+                &mut p_beta   as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_ternary_f32 — dispatch helper: auto-selects w32 or smem variant
+    //
+    // Use this as the main entry point. Selects:
+    //   M == 1 or K <= 6144 → w32  (zero LDS, max occupancy)
+    //   M >  1 and K > 6144 → smem (amortise x load across 8 warps)
+    //
+    // Threshold of 6144 corresponds to K=1536 (6144 bytes < 10KB; w32 wins
+    // because L2 hit rate for x is high at small K). At K=8960 (35.8KB),
+    // smem becomes competitive for M≥4.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_ternary_f32(
+        &self,
+        packed: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale: f32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        if m <= 1 || k <= 6144 {
+            self.gemv_ternary_f32_w32(packed, x, out, m, n, k, scale, beta)
+        } else {
+            self.gemv_ternary_f32_smem(packed, x, out, m, n, k, scale, beta)
+        }
     }
 }

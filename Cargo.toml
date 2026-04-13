@@ -8,6 +8,7 @@ members = [
     "ck-backend",
     "metaverse-core",
     "llama-sys",
+    "iara-train",
 ]
 resolver = "2"
 

@@ -16,5 +16,6 @@ pub use params::{
     KvCacheQuantizedParams, FusedNormBiasRopeParams, KvCacheInt8AppendParams, KvCacheInt8ReadParams,
     KvCacheWhtAppendParams, KvCacheWhtReadParams,
     FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
+    GemvTernaryF32Params,
 };
 pub use backend::ComputeBackend;

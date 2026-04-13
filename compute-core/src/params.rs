@@ -573,3 +573,23 @@ pub struct FusedAttentionDecodeParams<'a> {
     pub n_kv_heads: usize,
     pub scale: f32,                 // 1/sqrt(head_dim)
 }
+
+/// Ternary (BitNet 1.58) × F32 GEMV — zero-multiply inference.
+///
+/// Weight format: 2-bit packed, 4 weights per byte, row-major.
+///   Encoding: -1 = 0b00, 0 = 0b01, +1 = 0b10
+///   packed[row * ceil(k/4) + col/4], bits [(col%4)*2 +: 2]
+///
+/// Operation: out[m,n] = scale * Σ_k { w[n,k] * x[m,k] }
+/// Dequantization is purely add/sub — no multiplies in the inner loop.
+pub struct GemvTernaryF32Params<'a> {
+    pub m: usize,              // batch / token count (typically 1 for decode)
+    pub n: usize,              // output dimension (number of weight rows)
+    pub k: usize,              // inner dimension (hidden size, weight columns)
+    pub packed: &'a AnyTensor, // [n, ceil(k/4)] 2-bit ternary weights on GPU
+    pub x: &'a AnyTensor,     // [m, k] F32 activations on GPU
+    pub x_offset: usize,      // element offset into x (for last-token select)
+    pub out: &'a AnyTensor,   // [m, n] F32 output on GPU
+    pub scale: f32,           // per-tensor dequant scale (TernaryWeight::scale)
+    pub beta: f32,            // 0.0 = overwrite, 1.0 = accumulate into out
+}

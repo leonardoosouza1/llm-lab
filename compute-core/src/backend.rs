@@ -99,6 +99,12 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_q4k_f32         (&self, _p: &GemvQ4KF32Params)       -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_q4k_f32".into()))
     }
+    /// BitNet 1.58 ternary GEMV: 2-bit packed {-1,0,+1} weights × F32 activations.
+    /// Pure add/subtract inner loop — zero multiply instructions.
+    /// Achieves ~2× memory bandwidth reduction vs Q4K (2 bits vs 4 bits per weight).
+    fn gemv_ternary_f32     (&self, _p: &GemvTernaryF32Params)   -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_ternary_f32".into()))
+    }
     /// BF16 weights × F32 activations GEMV for decode (M=1).
     /// Replaces hipBLAS SGEMM for lm_head — eliminates library overhead.
     fn gemv_bf16_f32        (&self, _p: &GemvBf16F32Params)      -> Result<(), BackendError> {

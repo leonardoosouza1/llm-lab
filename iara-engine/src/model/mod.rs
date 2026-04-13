@@ -3317,9 +3317,11 @@ impl CausalLM {
         let greedy_t0 = std::time::Instant::now();
         hip_ffi::safe::reset_launch_count();
 
-        // Token 0: warmup without graph capture
-        // Token 1+: capture the forward pass (excluding embed already done above)
-        let use_graph = count >= 1;
+        // HIP Graph status: "capture every token + hipGraphExecUpdate" approach is
+        // DISABLED — ROCm re-instantiates on every token because seq_len changes,
+        // adding ~6ms overhead vs 0.9ms direct dispatch. Net loss at 311 kernels/token.
+        // TODO: implement per-layer static graph capture (position-independent kernels only).
+        let use_graph = false;
         if use_graph {
             self.backend.begin_graph_capture();
         }

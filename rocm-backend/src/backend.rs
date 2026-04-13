@@ -12,6 +12,7 @@ use compute_core::{
         KvCacheWhtAppendParams, KvCacheWhtReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
         KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
+        GemvTernaryF32Params,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -476,18 +477,24 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k(&self, p: &GemvQ4KParams) -> Result<(), BackendError> {
         let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
-        unsafe {
-            self.kernels.dequant_gemv_q4k(
-                u8_ptr(p.data),
-                x_ptr,
-                f32_mut_ptr(p.out),
-                p.m as i32,
-                p.n as i32,
-                p.k as i32,
-                p.beta,
-            )
-        }
-        .map_err(|e| BackendError::Kernel(e.to_string()))
+        // RDNA2 decode optimisation: use 1-warp-per-row kernel for m≤4 (decode).
+        // Eliminates cross-warp LDS reduction; all 1536 blocks fit in 28 CUs simultaneously.
+        let result = if p.m <= 4 {
+            unsafe {
+                self.kernels.dequant_gemv_q4k_w32(
+                    u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
+        } else {
+            unsafe {
+                self.kernels.dequant_gemv_q4k(
+                    u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
+        };
+        result.map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn gemv_q6k(&self, p: &GemvQ6KParams) -> Result<(), BackendError> {
@@ -543,13 +550,25 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k_f32(&self, p: &GemvQ4KF32Params) -> Result<(), BackendError> {
         let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
-        unsafe {
-            self.kernels.gemv_q4k_f32_multi(
-                u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
-                p.m as i32, p.n as i32, p.k as i32, p.beta,
-            )
-        }
-        .map_err(|e| BackendError::Kernel(e.to_string()))
+        // RDNA2 decode optimisation: 1 warp/row, zero LDS.
+        // Eliminates shared-memory limit (36KB for K=8960) that caps occupancy to
+        // 1 block/CU with the old kernel. New: all N rows run in parallel.
+        let result = if p.m <= 4 {
+            unsafe {
+                self.kernels.gemv_q4k_f32_w32(
+                    u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
+        } else {
+            unsafe {
+                self.kernels.gemv_q4k_f32_multi(
+                    u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
+        };
+        result.map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn gemv_bf16_f32(&self, p: &GemvBf16F32Params) -> Result<(), BackendError> {
@@ -558,6 +577,21 @@ impl ComputeBackend for RocmBackend {
             self.kernels.gemv_bf16_f32_multi(
                 u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
                 p.n as i32, p.k as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_ternary_f32(&self, p: &GemvTernaryF32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        // Dispatch to the optimal variant:
+        //   decode (m=1) or small K (≤1536) → w32: zero LDS, 32 threads/row, max occupancy
+        //   prefill (m>1) and large K (>1536) → smem: x cached in LDS for 8-warp reuse
+        unsafe {
+            self.kernels.gemv_ternary_f32(
+                u8_ptr(p.packed), x_ptr, f32_mut_ptr(p.out),
+                p.m as i32, p.n as i32, p.k as i32,
+                p.scale, p.beta,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
@@ -906,7 +940,7 @@ impl ComputeBackend for RocmBackend {
         Ok(result[0])
     }
 
-    // ── Graph capture ──────────────────────────────────────────────────────────
+    // ── HIP Graph capture (trait override) ────────────────────────────────────
 
     fn begin_graph_capture(&self) -> bool {
         unsafe {
@@ -928,23 +962,15 @@ impl ComputeBackend for RocmBackend {
             return false;
         }
         unsafe {
-            // End capture → get graph
             let graph = match hip_ffi::hip_stream_end_capture(self.stream) {
                 Ok(g) => g,
-                Err(e) => {
-                    eprintln!("graph capture end failed: {}", e);
-                    return false;
-                }
+                Err(e) => { eprintln!("graph capture end failed: {}", e); return false; }
             };
-
             let mut exec_guard = self.graph_exec.lock().unwrap();
-
-            // Try to update existing exec, or instantiate new one
             let exec = if let Some(existing) = exec_guard.as_ref() {
                 match hip_ffi::hip_graph_exec_update(*existing, graph) {
-                    Ok(true) => *existing, // update succeeded
+                    Ok(true) => *existing,
                     _ => {
-                        // Topology changed → re-instantiate
                         let _ = hip_ffi::hip_graph_exec_destroy(*existing);
                         match hip_ffi::hip_graph_instantiate(graph) {
                             Ok(e) => e,
@@ -967,15 +993,9 @@ impl ComputeBackend for RocmBackend {
                     }
                 }
             };
-
             *exec_guard = Some(exec);
-
-            // Launch the graph
             let launch_ok = hip_ffi::hip_graph_launch(exec, self.stream).is_ok();
-
-            // Clean up captured graph (exec retains what it needs)
             let _ = hip_ffi::hip_graph_destroy(graph);
-
             launch_ok
         }
     }
