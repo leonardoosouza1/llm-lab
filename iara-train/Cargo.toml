@@ -25,3 +25,6 @@ llama-sys = { path = "../llama-sys" }
 
 [dev-dependencies]
 burn = { version = "0.21.0-pre.3", features = ["ndarray"] }
+wgpu = { version = "29", features = ["wgsl"] }
+pollster = "0.3"
+bytemuck = "1"
