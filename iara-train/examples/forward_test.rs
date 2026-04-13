@@ -48,7 +48,8 @@ fn main() {
     let last_logits_2d = last_logits.reshape([1, vocab]);
     let pred_token = last_logits_2d.argmax(1);
     let pred_data = pred_token.into_data();
-    let pred_vals = pred_data.as_slice::<i64>().unwrap();
+    // argmax returns i32 on WGPU
+    let pred_vals = pred_data.as_slice::<i32>().unwrap();
     println!("Predicted next token ID: {}", pred_vals[0]);
 
     if has_nan {

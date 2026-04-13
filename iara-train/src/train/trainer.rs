@@ -217,9 +217,9 @@ impl<B: AutodiffBackend> Trainer<B> {
                     loss::cross_entropy_loss(logits, batch.target_ids)
                 };
 
-                // Read loss: convert to data, read f32 slice
+                // Read loss: use inner (non-autodiff) backend to read the scalar
                 let loss_val = {
-                    let data = loss.clone().into_data();
+                    let data = loss.clone().inner().into_data();
                     data.as_slice::<f32>().map(|s| s[0] as f64).unwrap_or(-1.0)
                 };
 

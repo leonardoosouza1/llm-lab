@@ -54,14 +54,14 @@ impl<B: Backend> Qwen2Mlp<B> {
 /// Grouped-Query Attention with Rotary Position Embeddings.
 #[derive(Module, Debug)]
 pub struct Qwen2Attention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
-    rotary: RotaryEncoding<B>,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    pub q_proj: Linear<B>,
+    pub k_proj: Linear<B>,
+    pub v_proj: Linear<B>,
+    pub o_proj: Linear<B>,
+    pub rotary: RotaryEncoding<B>,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
 }
 
 impl<B: Backend> Qwen2Attention<B> {
@@ -99,11 +99,17 @@ impl<B: Backend> Qwen2Attention<B> {
         let scale = (self.head_dim as f64).sqrt();
         let attn_weights = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
 
-        // Causal mask: positions can only attend to earlier positions
-        let causal_mask =
-            Tensor::<B, 2, Bool>::triu_mask([seq_len, seq_len], 1, &device);
-        // triu_mask with offset=1 marks everything *above* the diagonal as true
-        // mask_fill sets those positions to -inf
+        // Causal mask: True where col > row (future positions — must not attend).
+        // We build it explicitly because triu_mask's diagonal parameter convention
+        // differs from PyTorch: offset=1 in burn includes the main diagonal.
+        let causal_mask: Tensor<B, 2, Bool> = {
+            use burn::tensor::Int;
+            let ids = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
+            let row_ids = ids.clone().reshape([seq_len, 1]).expand([seq_len, seq_len]);
+            let col_ids = ids.reshape([1, seq_len]).expand([seq_len, seq_len]);
+            // True where col > row (strictly future)
+            col_ids.greater(row_ids)
+        };
         let attn_weights = attn_weights.mask_fill(
             causal_mask.unsqueeze_dims::<4>(&[0, 1]),
             f32::NEG_INFINITY,
@@ -141,10 +147,10 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 /// A single transformer decoder layer.
 #[derive(Module, Debug)]
 pub struct Qwen2DecoderLayer<B: Backend> {
-    input_layernorm: RmsNorm<B>,
-    self_attn: Qwen2Attention<B>,
-    post_attention_layernorm: RmsNorm<B>,
-    mlp: Qwen2Mlp<B>,
+    pub input_layernorm: RmsNorm<B>,
+    pub self_attn: Qwen2Attention<B>,
+    pub post_attention_layernorm: RmsNorm<B>,
+    pub mlp: Qwen2Mlp<B>,
 }
 
 impl<B: Backend> Qwen2DecoderLayer<B> {
@@ -170,9 +176,9 @@ impl<B: Backend> Qwen2DecoderLayer<B> {
 /// Core Qwen2 model: embedding + N decoder layers + final RMSNorm.
 #[derive(Module, Debug)]
 pub struct Qwen2Model<B: Backend> {
-    embed_tokens: Embedding<B>,
-    layers: Vec<Qwen2DecoderLayer<B>>,
-    norm: RmsNorm<B>,
+    pub embed_tokens: Embedding<B>,
+    pub layers: Vec<Qwen2DecoderLayer<B>>,
+    pub norm: RmsNorm<B>,
 }
 
 impl<B: Backend> Qwen2Model<B> {
@@ -185,7 +191,10 @@ impl<B: Backend> Qwen2Model<B> {
     ) -> (Tensor<B, 3>, Option<Vec<Tensor<B, 3>>>) {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
         let mut all_hidden_states = if return_all_hidden_states {
-            Some(Vec::with_capacity(self.layers.len()))
+            let mut v = Vec::with_capacity(self.layers.len() + 1);
+            // Index 0 = embedding output (pre-layer-0), used for BI[0] computation
+            v.push(hidden_states.clone());
+            Some(v)
         } else {
             None
         };
@@ -209,8 +218,8 @@ impl<B: Backend> Qwen2Model<B> {
 /// Complete Qwen2.5 causal language model.
 #[derive(Module, Debug)]
 pub struct Qwen2ForCausalLM<B: Backend> {
-    model: Qwen2Model<B>,
-    lm_head: Linear<B>,
+    pub model: Qwen2Model<B>,
+    pub lm_head: Linear<B>,
 }
 
 impl<B: Backend> Qwen2ForCausalLM<B> {
@@ -291,20 +300,25 @@ impl Qwen2Config {
     fn init_attention<B: Backend>(&self, device: &B::Device) -> Qwen2Attention<B> {
         let kv_dim = self.num_key_value_heads * self.head_dim;
 
+        // Qwen2 attention: Q, K, V have biases; O does not.
         let q_proj = LinearConfig::new(self.hidden_size, self.num_attention_heads * self.head_dim)
-            .with_bias(false)
+            .with_bias(true)
             .init(device);
         let k_proj = LinearConfig::new(self.hidden_size, kv_dim)
-            .with_bias(false)
+            .with_bias(true)
             .init(device);
         let v_proj = LinearConfig::new(self.hidden_size, kv_dim)
-            .with_bias(false)
+            .with_bias(true)
             .init(device);
         let o_proj = LinearConfig::new(self.num_attention_heads * self.head_dim, self.hidden_size)
             .with_bias(false)
             .init(device);
 
-        let rotary = RotaryEncodingConfig::new(self.max_position_embeddings, self.head_dim)
+        // Cap the precomputed RoPE table at 4096 positions to avoid
+        // allocating 128MB+ per layer (131072 * 128 * 2 * 4B = 128MB each).
+        // For training with seq_len <= 4096 this is sufficient.
+        let rope_max_len = self.max_position_embeddings.min(4096);
+        let rotary = RotaryEncodingConfig::new(rope_max_len, self.head_dim)
             .with_theta(self.rope_theta as f32)
             .init(device);
 
@@ -410,7 +424,7 @@ impl Qwen2Config {
             model.model.layers[i].post_attention_layernorm.gamma =
                 load_1d(&format!("{p}.post_attention_layernorm.weight"));
 
-            // Attention
+            // Attention weights
             model.model.layers[i].self_attn.q_proj.weight =
                 load_2d(&format!("{p}.self_attn.q_proj.weight"));
             model.model.layers[i].self_attn.k_proj.weight =
@@ -419,6 +433,13 @@ impl Qwen2Config {
                 load_2d(&format!("{p}.self_attn.v_proj.weight"));
             model.model.layers[i].self_attn.o_proj.weight =
                 load_2d(&format!("{p}.self_attn.o_proj.weight"));
+            // Attention biases (Qwen2 has bias on Q, K, V projections)
+            model.model.layers[i].self_attn.q_proj.bias =
+                Some(load_1d(&format!("{p}.self_attn.q_proj.bias")));
+            model.model.layers[i].self_attn.k_proj.bias =
+                Some(load_1d(&format!("{p}.self_attn.k_proj.bias")));
+            model.model.layers[i].self_attn.v_proj.bias =
+                Some(load_1d(&format!("{p}.self_attn.v_proj.bias")));
 
             // MLP
             model.model.layers[i].mlp.gate_proj.weight =
