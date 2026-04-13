@@ -11,7 +11,7 @@
 //! Referência: semantic caching em LLM inference (GPTCache, 2023).
 
 use std::collections::HashMap;
-use crate::navigator::router::{RouteResult, SL_NAMES, N_SUPER_LAYERS};
+use crate::navigator::router::RouteResult;
 
 /// Configuração do cache de rotas
 #[derive(Debug, Clone)]
