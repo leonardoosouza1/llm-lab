@@ -13,7 +13,7 @@
 //! Run: cargo run -p iara-train --example iara_e2e_gpu --release
 
 use bytemuck;
-use iara_train::navigator::gpu_kernel::{self, TERNARY_MATMUL_SHADER};
+use iara_train::navigator::gpu_kernel::{self, TERNARY_MATMUL_SHADER, TERNARY_MATMUL_SHADER_SMALL};
 use iara_train::navigator::ternary::{quantize_ternary, pack_ternary_u32_col_major, ternary_matmul_sparse};
 use std::path::Path;
 use std::time::Instant;
@@ -101,7 +101,8 @@ fn parse_safetensors_header(mmap: &memmap2::Mmap) -> serde_json::Value {
 struct GpuInfra {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
+    pipeline_large: wgpu::ComputePipeline,  // WG=128 for out_dim >= 2048
+    pipeline_small: wgpu::ComputePipeline,  // WG=32 for out_dim < 2048
     bgl: wgpu::BindGroupLayout,
 }
 
@@ -119,8 +120,11 @@ impl GpuInfra {
             label: Some("iara-e2e"), ..Default::default()
         }).await.unwrap();
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None, source: wgpu::ShaderSource::Wgsl(TERNARY_MATMUL_SHADER.into()),
+        let shader_large = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("large"), source: wgpu::ShaderSource::Wgsl(TERNARY_MATMUL_SHADER.into()),
+        });
+        let shader_small = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("small"), source: wgpu::ShaderSource::Wgsl(TERNARY_MATMUL_SHADER_SMALL.into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -136,12 +140,16 @@ impl GpuInfra {
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
+        let pipeline_large = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("large"), layout: Some(&pl), module: &shader_large, entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
+        });
+        let pipeline_small = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("small"), layout: Some(&pl), module: &shader_small, entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
         });
 
-        Self { device, queue, pipeline, bgl }
+        Self { device, queue, pipeline_large, pipeline_small, bgl }
     }
 
     /// Upload a packed weight matrix and create a bind group for dispatch.
@@ -150,7 +158,7 @@ impl GpuInfra {
         -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer, u32)
     {
         let uniforms = gpu_kernel::build_uniforms(out_dim, in_dim, scale);
-        let n_wg = gpu_kernel::compute_n_workgroups(out_dim);
+        let (_, _, n_wg) = gpu_kernel::select_kernel(out_dim);
 
         let buf_p = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(packed_col), usage: wgpu::BufferUsages::STORAGE,
@@ -185,11 +193,20 @@ impl GpuInfra {
         (bg, buf_y, staging, n_wg)
     }
 
+    fn select_pipeline(&self, out_dim: usize) -> &wgpu::ComputePipeline {
+        if out_dim < gpu_kernel::SMALL_THRESHOLD {
+            &self.pipeline_small
+        } else {
+            &self.pipeline_large
+        }
+    }
+
     fn dispatch_and_read(&self, bg: &wgpu::BindGroup, buf_y: &wgpu::Buffer, staging: &wgpu::Buffer, out_dim: usize, n_wg: u32) -> Vec<f32> {
+        let pipeline = self.select_pipeline(out_dim);
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            p.set_pipeline(&self.pipeline);
+            p.set_pipeline(pipeline);
             p.set_bind_group(0, bg, &[]);
             p.dispatch_workgroups(n_wg, 1, 1);
         }
