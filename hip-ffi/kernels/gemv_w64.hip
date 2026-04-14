@@ -402,3 +402,115 @@ extern "C" __global__ void gemv_q6k_q8_w64(
         out[out_idx] = (beta != 0.0f) ? __fmaf_rn(beta, out[out_idx], acc) : acc;
     }
 }
+
+// ─── gemv_i8_f32_w64 ────────────────────────────────────────────────────────
+// W8A32 GEMV: INT8 weights (symmetric per-row) × F32 activations → F32 output.
+// Dequantizes on-the-fly: w_f32 = w_i8 * scale[row].
+// Halves memory bandwidth vs BF16 GEMV: 1 byte/weight instead of 2.
+// Theoretical on RX 6750 XT: 250 GB/s / 1 B/weight → 2× more tok/s vs BF16.
+// Activation bandwidth (F32) is small: K=1536 floats = 6KB per token → negligible.
+//
+// Grid : (ceil(N/4), 1, 1)   Block: (64, 4, 1)   Shared: K*4 bytes (F32 x cache)
+// Each of 64 lanes handles K/64 weights per row with stride-64 access.
+// Compiled with -mwavefrontsize64.
+
+#define GEMV_I8_W64_ROWS 4
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void gemv_i8_f32_w64(
+    const int8_t* __restrict__ w,       // [N, K] INT8 weights (row-major, per-row quant)
+    const float*  __restrict__ scales,  // [N] per-row F32 scale (w_f32 = w_i8 * scale)
+    const float*  __restrict__ x,       // [K] F32 activations
+    float*        __restrict__ out,     // [N] F32 output
+    int N, int K,
+    float beta                          // 0.0: overwrite out; 1.0: accumulate (residual)
+) {
+    const int row  = blockIdx.x * GEMV_I8_W64_ROWS + (int)threadIdx.y;
+    const int lane = (int)threadIdx.x;  // 0..63
+
+    // Load F32 input into shared memory (all 256 threads cooperate)
+    extern __shared__ float x_smem[];
+    {
+        const int tid = (int)threadIdx.y * 64 + lane;
+        for (int i = tid; i < K; i += 256) {
+            x_smem[i] = x[i];
+        }
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const float scale = scales[row];
+    const int8_t* __restrict__ w_row = w + (size_t)row * K;
+
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 64) {
+        // Dequantize weight on-the-fly
+        float w_f = (float)w_row[i] * scale;
+        acc += w_f * x_smem[i];
+    }
+
+    // Wave64 warp reduction (64 lanes)
+    for (int off = 32; off >= 1; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+
+    if (lane == 0) {
+        out[row] = (beta != 0.0f) ? __fmaf_rn(beta, out[row], acc) : acc;
+    }
+}
+#undef GEMV_I8_W64_ROWS
+
+// ─── gemv_bf16_f32_w64 ──────────────────────────────────────────────────────
+// Wave64 BF16 weights × F32 activations GEMV.
+// Optimized for large-N decode (lm_head: N=151936, K=1536):
+//   - 64 threads/row: each lane handles K/64 weights → 2x more parallelism per row
+//   - 4 rows per block (threadIdx.y): amortizes shared mem load of x across rows
+//   - K floats cached in shared mem: eliminates repeated global x[] reads
+// Grid : (ceil(N/4), 1, 1)   Block: (64, 4, 1)   Shared: K*4 bytes
+// Compiled with -mwavefrontsize64 (explicit wave64 for RDNA2).
+#define GEMV_BF16_W64_ROWS 4
+__launch_bounds__(256, 2)
+extern "C" __global__ void gemv_bf16_f32_w64(
+    const unsigned short* __restrict__ w,    // [N, K] BF16 weights (u16 storage)
+    const float*          __restrict__ x,    // [K]   F32 input activations
+    float*                __restrict__ out,  // [N]   F32 output
+    int N, int K
+) {
+    const int row  = blockIdx.x * GEMV_BF16_W64_ROWS + (int)threadIdx.y;
+    const int lane = (int)threadIdx.x;  // 0..63 within wave64
+
+    // Load F32 input into shared memory (all 256 threads cooperate)
+    extern __shared__ float x_smem[];
+    {
+        const int tid = (int)threadIdx.y * 64 + lane;
+        for (int i = tid; i < K; i += 256) {
+            x_smem[i] = x[i];
+        }
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const unsigned short* __restrict__ w_row = w + (size_t)row * K;
+
+    // Each of 64 lanes handles K/64 weights with stride-64 access
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 64) {
+        // Convert BF16 to F32: BF16 is stored as u16, shift left 16 bits
+        unsigned int bits = (unsigned int)w_row[i] << 16;
+        float wval;
+        __builtin_memcpy(&wval, &bits, sizeof(float));
+        acc += wval * x_smem[i];
+    }
+
+    // Warp reduction within wave64 (64 threads)
+    for (int off = 32; off >= 1; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+
+    if (lane == 0) {
+        out[row] = acc;
+    }
+}
+#undef GEMV_BF16_W64_ROWS

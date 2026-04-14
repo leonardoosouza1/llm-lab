@@ -105,6 +105,9 @@ pub struct GpuKernels {
     fn_fused_gate_up_silu_q4k_w64: hipFunction_t,
     fn_fused_qkv_q4k_w64: hipFunction_t,
     fn_gemv_q6k_q8_w64: hipFunction_t,
+    fn_gemv_bf16_f32_w64: hipFunction_t,
+    // W8A32 GEMV kernel (INT8 weights × F32 activations → F32, ~2× BW vs BF16)
+    fn_gemv_i8_f32_w64: hipFunction_t,
     // Ternary GEMV kernels (BitNet 1.58)
     fn_gemv_ternary_f32_w32: hipFunction_t,
     fn_gemv_ternary_f32_smem: hipFunction_t,
@@ -198,6 +201,8 @@ impl GpuKernels {
         let fn_fused_gate_up_silu_q4k_w64 = get_w64_fn!("fused_gate_up_silu_q4k_w64");
         let fn_fused_qkv_q4k_w64 = get_w64_fn!("fused_qkv_q4k_w64");
         let fn_gemv_q6k_q8_w64 = get_w64_fn!("gemv_q6k_q8_w64");
+        let fn_gemv_bf16_f32_w64 = get_w64_fn!("gemv_bf16_f32_w64");
+        let fn_gemv_i8_f32_w64 = get_w64_fn!("gemv_i8_f32_w64");
 
         // Ternary GEMV kernels (BitNet 1.58 — resolved from main module)
         let fn_gemv_ternary_f32_w32 = get_fn!("gemv_ternary_f32_w32");
@@ -266,6 +271,8 @@ impl GpuKernels {
             fn_fused_gate_up_silu_q4k_w64,
             fn_fused_qkv_q4k_w64,
             fn_gemv_q6k_q8_w64,
+            fn_gemv_bf16_f32_w64,
+            fn_gemv_i8_f32_w64,
             fn_gemv_ternary_f32_w32,
             fn_gemv_ternary_f32_smem,
             fn_gemv_ternary_f32_fast,
@@ -1425,6 +1432,93 @@ impl GpuKernels {
                 &mut p_out as *mut *mut f32   as *mut std::ffi::c_void,
                 &mut p_n   as *mut i32        as *mut std::ffi::c_void,
                 &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_bf16_f32_w64 — Wave64 BF16 weights × F32 activations GEMV
+    // Wave64 variant: 64 threads/row for 2x better memory BW on RDNA2.
+    // Best for large N (lm_head: N=151936, K=1536).
+    // Grid : (ceil(N/4), 1, 1)  Block: (64, 4, 1)
+    // Shared: K * sizeof(float) bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn gemv_bf16_f32_w64(
+        &self,
+        w: *const u16,   // [N, K] BF16 weights (u16 storage)
+        x: *const f32,   // [K] F32 activations
+        out: *mut f32,   // [N] F32 output
+        n: i32,
+        k: i32,
+    ) -> Result<(), HipError> {
+        let grid = (((n + 3) / 4) as u32, 1, 1);
+        let block = (64u32, 4, 1);
+        let shared_bytes = (k * 4) as u32;  // K floats in shared memory
+
+        let mut p_w   = w;
+        let mut p_x   = x;
+        let mut p_out = out;
+        let mut p_n   = n;
+        let mut p_k   = k;
+
+        hip_launch_kernel(
+            self.fn_gemv_bf16_f32_w64,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_w   as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_x   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_n   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_i8_f32_w64 — W8A32 GEMV: INT8 weights × F32 activations → F32
+    // Symmetric per-row quantization: w_f32 = w_i8 * scale[row].
+    // ~2× memory bandwidth reduction vs BF16 GEMV (1 byte/weight vs 2).
+    // Grid : (ceil(N/4), 1, 1)  Block: (64, 4, 1)  Shared: K*4 bytes (F32 x)
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn gemv_i8_f32_w64(
+        &self,
+        w: *const i8,       // [N, K] INT8 weights (row-major)
+        scales: *const f32, // [N] per-row F32 scales
+        x: *const f32,      // [K] F32 activations
+        out: *mut f32,      // [N] F32 output
+        n: i32,
+        k: i32,
+        beta: f32,          // 0.0 = overwrite; 1.0 = accumulate (residual)
+    ) -> Result<(), HipError> {
+        let grid = (((n + 3) / 4) as u32, 1, 1);
+        let block = (64u32, 4, 1);
+        let shared_bytes = (k * 4) as u32; // K F32 values in shared memory
+
+        let mut p_w      = w;
+        let mut p_scales = scales;
+        let mut p_x      = x;
+        let mut p_out    = out;
+        let mut p_n      = n;
+        let mut p_k      = k;
+        let mut p_beta   = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_i8_f32_w64,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_w      as *mut *const i8  as *mut std::ffi::c_void,
+                &mut p_scales as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_x      as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_n      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_beta   as *mut f32        as *mut std::ffi::c_void,
             ],
         )
     }
