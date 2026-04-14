@@ -134,6 +134,35 @@ pub fn ternary_matmul_routed(
     (y_fast, active)
 }
 
+/// Pack ternary values into u32 (16 elements per u32), row-major layout.
+/// packed[row * packed_cols + k_block]
+pub fn pack_ternary_u32_row_major(ternary: &[f32], out_dim: usize, in_dim: usize) -> Vec<u32> {
+    let packed_cols = in_dim / 16;
+    let mut out = vec![0u32; out_dim * packed_cols];
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            let c: u32 = match ternary[row * in_dim + col] as i32 { 1 => 1, -1 => 2, _ => 0 };
+            out[row * packed_cols + col / 16] |= c << ((col % 16) * 2);
+        }
+    }
+    out
+}
+
+/// Pack ternary values into u32 (16 elements per u32), column-major layout.
+/// packed[k_block * out_dim + row]
+/// Adjacent output rows are adjacent in memory → coalesced GPU reads.
+pub fn pack_ternary_u32_col_major(ternary: &[f32], out_dim: usize, in_dim: usize) -> Vec<u32> {
+    let packed_cols = in_dim / 16;
+    let mut out = vec![0u32; packed_cols * out_dim];
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            let c: u32 = match ternary[row * in_dim + col] as i32 { 1 => 1, -1 => 2, _ => 0 };
+            out[(col / 16) * out_dim + row] |= c << ((col % 16) * 2);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

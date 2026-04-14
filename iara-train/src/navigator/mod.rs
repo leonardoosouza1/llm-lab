@@ -12,3 +12,4 @@ pub mod ternary;
 pub mod router;
 pub mod route_cache;
 pub mod ttt;
+pub mod gpu_kernel;
