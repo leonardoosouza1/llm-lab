@@ -129,12 +129,7 @@ fn argmax(logits: &[f32]) -> u32 {
 
 #[inline]
 fn softmax_inplace(x: &mut [f32]) {
-    // Substitui NaN por -inf para não contaminar o resultado
-    for v in x.iter_mut() { if v.is_nan() { *v = f32::NEG_INFINITY; } }
-    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() { *v = (*v - max).exp(); sum += *v; }
-    if sum > 0.0 { for v in x.iter_mut() { *v /= sum; } }
+    compute_core::math::softmax_inplace(x);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

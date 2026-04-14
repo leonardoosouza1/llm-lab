@@ -2,6 +2,9 @@ pub mod error;
 pub mod tensor;
 pub mod params;
 pub mod backend;
+pub mod config;
+pub mod math;
+pub mod safetensors;
 
 pub use error::BackendError;
 pub use tensor::{AnyTensor, DType};

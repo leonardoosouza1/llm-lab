@@ -94,71 +94,26 @@ pub struct DeepTrace {
 }
 
 // ── Helper functions for computing metrics ────────────────────────────────
+// Delegated to compute_core::math for shared use across crates.
 
 /// Compute Shannon entropy of a probability distribution
 pub fn entropy(probs: &[f32]) -> f32 {
-    probs.iter()
-        .filter(|&p| *p > 1e-10)
-        .map(|p| -p * p.ln())
-        .sum()
+    compute_core::math::entropy(probs)
 }
 
 /// Get top-K elements from a slice, returning indices and values
 pub fn top_k(data: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut indexed: Vec<(usize, f32)> = data.iter().enumerate()
-        .map(|(i, &v)| (i, v))
-        .collect();
-
-    // Partial sort to find top K
-    let n = k.min(indexed.len());
-    if n > 0 {
-        indexed.select_nth_unstable_by(n - 1, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut result: Vec<_> = indexed[..n].to_vec();
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        result
-    } else {
-        vec![]
-    }
+    compute_core::math::top_k(data, k)
 }
 
 /// Compute softmax of logits (numerically stable)
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter()
-        .map(|&x| (x - max).exp())
-        .collect();
-    let sum: f32 = exps.iter().sum();
-    exps.iter().map(|e| e / sum.max(1e-10)).collect()
+    compute_core::math::softmax(logits)
 }
 
 /// Compute phase coherence (Kuramoto order parameter) from hidden state
-/// Interprets hidden state as complex pairs: h[0]+ih[1], h[2]+ih[3], ...
 pub fn phase_coherence(hidden: &[f32]) -> f32 {
-    if hidden.len() < 2 {
-        return 0.0;
-    }
-
-    let n = hidden.len() / 2;
-    let (mut sum_cos, mut sum_sin) = (0.0f32, 0.0f32);
-
-    for k in 0..n {
-        // Complex number: real = hidden[2k], imag = hidden[2k+1]
-        let x = hidden[2 * k];
-        let y = hidden[2 * k + 1];
-
-        // Normalize to unit circle
-        let norm = (x * x + y * y).sqrt().max(1e-8);
-        sum_cos += x / norm;
-        sum_sin += y / norm;
-    }
-
-    // Kuramoto order parameter: r = |mean(exp(i*theta))|
-    let mean_cos = sum_cos / n as f32;
-    let mean_sin = sum_sin / n as f32;
-    (mean_cos * mean_cos + mean_sin * mean_sin).sqrt()
+    compute_core::math::phase_coherence(hidden)
 }
 
 #[cfg(test)]

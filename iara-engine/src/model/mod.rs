@@ -53,37 +53,10 @@ pub type ModelResult<T> = std::result::Result<T, ModelError>;
 
 // ── Phase Coherence Computation ──────────────────────────────────────────────
 
-/// Computes phase coherence (Kuramoto order parameter) from hidden state.
-/// Interprets hidden state as complex pairs: h[0]+ih[1], h[2]+ih[3], ...
-/// Returns Kuramoto order parameter r = |mean(exp(i*theta))|,
-/// where theta = atan2(h[2k+1], h[2k]).
-///
-/// Returns value in [0.0, 1.0]:
-/// - 0.0 = completely chaotic, random phases
-/// - 1.0 = total synchronization, all phases aligned
+/// Delegates to compute_core::math::phase_coherence.
+/// Kuramoto order parameter: treats hidden pairs as complex numbers.
 pub fn phase_coherence(hidden: &[f32]) -> f32 {
-    if hidden.len() < 2 {
-        return 0.0;
-    }
-
-    let n = hidden.len() / 2;
-    let (mut sum_cos, mut sum_sin) = (0.0f32, 0.0f32);
-
-    for k in 0..n {
-        // Complex number: real = hidden[2k], imag = hidden[2k+1]
-        let x = hidden[2 * k];
-        let y = hidden[2 * k + 1];
-
-        // Normalize to unit circle
-        let norm = (x * x + y * y).sqrt().max(1e-8);
-        sum_cos += x / norm;
-        sum_sin += y / norm;
-    }
-
-    // Kuramoto order parameter: r = |mean(exp(i*theta))|
-    let mean_cos = sum_cos / n as f32;
-    let mean_sin = sum_sin / n as f32;
-    (mean_cos * mean_cos + mean_sin * mean_sin).sqrt()
+    compute_core::math::phase_coherence(hidden)
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -102,65 +75,28 @@ pub struct ModelCfg {
     pub max_seq_len: usize,
 }
 
-impl ModelCfg {
-    /// Lê parâmetros do config.json. Suporta qualquer modelo causal LM com campos padrão.
-    pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(config_path)?;
-        let v: serde_json::Value = serde_json::from_str(&content)?;
-
-        let arch = v["architectures"].as_array()
-            .and_then(|a| a.first())
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown");
-
-        // Verificação básica: deve ser um modelo causal LM (ou ter hidden_size)
-        if !arch.contains("CausalLM") && !arch.contains("ForCausalLM")
-            && !v["hidden_size"].is_number() && !v["text_config"]["hidden_size"].is_number()
-        {
-            return Err(format!(
-                "Arquitetura '{}' não parece ser um CausalLM. Verifique config.json.",
-                arch
-            ).into());
+impl From<compute_core::config::ModelConfig> for ModelCfg {
+    fn from(c: compute_core::config::ModelConfig) -> Self {
+        Self {
+            hidden_size: c.hidden_size,
+            num_layers: c.num_hidden_layers,
+            intermediate_size: c.intermediate_size,
+            vocab_size: c.vocab_size,
+            num_heads: c.num_attention_heads,
+            num_kv_heads: c.num_key_value_heads,
+            head_dim: c.head_dim,
+            rms_eps: c.rms_norm_eps as f32,
+            rope_theta: c.rope_theta as f32,
+            max_seq_len: c.max_position_embeddings,
         }
+    }
+}
 
-        let params = if v["hidden_size"].is_number() { &v }
-                     else if v["text_config"]["hidden_size"].is_number() { &v["text_config"] }
-                     else { return Err(format!("hidden_size ausente em {}", config_path.display()).into()); };
-
-        let uint = |key: &str| -> Result<usize, Box<dyn std::error::Error>> {
-            let val = &params[key];
-            val.as_u64().or_else(|| val.as_f64().map(|f| f as u64))
-               .map(|n| n as usize)
-               .ok_or_else(|| format!("'{}' ausente em config.json", key).into())
-        };
-
-        let hidden_size = uint("hidden_size")?;
-        let num_heads   = uint("num_attention_heads")?;
-        let head_dim = params["head_dim"].as_u64()
-            .or_else(|| params["head_dim"].as_f64().map(|f| f as u64))
-            .map(|n| n as usize)
-            .unwrap_or(hidden_size / num_heads);
-
-        Ok(Self {
-            hidden_size, num_heads, head_dim,
-            num_layers:        uint("num_hidden_layers")?,
-            intermediate_size: uint("intermediate_size")?,
-            vocab_size:        uint("vocab_size")?,
-            num_kv_heads:      uint("num_key_value_heads")?,
-            rms_eps:           params["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
-            rope_theta:        params["rope_theta"].as_f64().unwrap_or(1_000_000.0) as f32,
-            // Cap max_seq_len to prevent VRAM bloat.
-            // max_position_embeddings for Qwen2.5/3 is often 128K, which would need:
-            //   KV cache: layers × 2 × 128K × kv_dim × 4 bytes → 7+ GB for 1.5b model
-            //   scores:   n_heads × 128K × 128K × 4 bytes → 824 GB (impossible)
-            // A 1024-token context is practical for 12GB GPUs to fit 4B scale models directly.
-            max_seq_len: {
-                let raw = params["max_position_embeddings"].as_u64()
-                    .map(|n| n as usize)
-                    .unwrap_or(2048);
-                raw.min(1024)
-            },
-        })
+impl ModelCfg {
+    /// Parse config.json via compute_core::config::ModelConfig.
+    pub fn from_config_json(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mc = compute_core::config::ModelConfig::from_json(config_path)?;
+        Ok(Self::from(mc))
     }
 
     /// Constrói ModelCfg a partir dos metadados de um arquivo GGUF.
@@ -479,6 +415,131 @@ impl SparseMlpScratch {
     }
 }
 
+// ── Online Layer Router (adaptive BI-based skip) ────────────────────────────
+
+/// Dynamic layer skip via online Block Influence (BI) measurement.
+/// Measures cos_sim(input, output) per layer in real-time and skips layers
+/// where BI stays consistently low (the layer barely changes the hidden state).
+///
+/// Phase 1 (calibration, first `warmup_tokens` tokens): run ALL layers, measure BI
+/// Phase 2 (routing): skip layers where moving_avg(BI) < threshold
+/// Phase 3 (re-probe): every `reprobe_interval` tokens, re-measure a skipped layer
+pub struct OnlineLayerRouter {
+    /// Moving average of BI per layer [num_layers]
+    pub bi_ema: Vec<f32>,
+    /// GPU buffer to snapshot hidden state before a layer [hidden_size]
+    pub x_snapshot: AnyTensor,
+    /// GPU buffer for cosine similarity result [1]
+    pub cos_sim_buf: AnyTensor,
+    /// Number of tokens seen so far
+    pub tokens_seen: usize,
+    /// Warmup phase: run all layers, measure BI
+    pub warmup_tokens: usize,
+    /// BI threshold: layers below this are skipped
+    pub bi_threshold: f32,
+    /// EMA decay factor (0.9 = slow, 0.5 = fast adaptation)
+    pub ema_alpha: f32,
+    /// How often to re-probe a skipped layer (in tokens)
+    pub reprobe_interval: usize,
+    /// Number of layers
+    pub n_layers: usize,
+    /// Hidden size
+    pub hidden: usize,
+    /// Whether routing is enabled
+    pub enabled: bool,
+}
+
+impl OnlineLayerRouter {
+    pub fn new(
+        backend: &Arc<dyn ComputeBackend>,
+        n_layers: usize,
+        hidden: usize,
+    ) -> Self {
+        let warmup = std::env::var("IARA_ROUTER_WARMUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+        let threshold = std::env::var("IARA_ROUTER_THRESHOLD")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.15);
+        let alpha = std::env::var("IARA_ROUTER_ALPHA")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.7);
+        let reprobe = std::env::var("IARA_ROUTER_REPROBE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+        let enabled = std::env::var("IARA_ROUTER").map(|v| v == "1").unwrap_or(false);
+
+        Self {
+            bi_ema: vec![1.0; n_layers],  // start high (assume all layers are needed)
+            x_snapshot: backend.alloc_f32(&[hidden]),
+            cos_sim_buf: backend.alloc_f32(&[1]),
+            tokens_seen: 0,
+            warmup_tokens: warmup,
+            bi_threshold: threshold,
+            ema_alpha: alpha,
+            reprobe_interval: reprobe,
+            n_layers,
+            hidden,
+            enabled,
+        }
+    }
+
+    /// Should we skip this layer during decode?
+    /// Returns (skip, should_measure) — if should_measure is true, caller must
+    /// snapshot x before the layer and compute BI after.
+    pub fn should_skip(&self, layer_idx: usize) -> (bool, bool) {
+        if !self.enabled {
+            return (false, false);
+        }
+        // During warmup: never skip, always measure
+        if self.tokens_seen < self.warmup_tokens {
+            return (false, true);
+        }
+        // After warmup: skip if BI is low
+        let bi = self.bi_ema[layer_idx];
+        if bi < self.bi_threshold {
+            // Re-probe periodically to catch layers that become important
+            let should_reprobe = (self.tokens_seen % self.reprobe_interval) == 0;
+            if should_reprobe {
+                return (false, true);  // don't skip, but measure
+            }
+            return (true, false);  // skip
+        }
+        // Layer is important — run it, measure occasionally
+        let measure = self.tokens_seen < self.warmup_tokens + 10
+            || (self.tokens_seen % 20) == 0;
+        (false, measure)
+    }
+
+    /// Update BI for a layer after measuring cos_sim.
+    /// bi = 1 - cos_sim (0 = identity, 1 = orthogonal)
+    pub fn update_bi(&mut self, layer_idx: usize, cos_sim: f32) {
+        let bi = (1.0 - cos_sim).max(0.0);
+        let alpha = self.ema_alpha;
+        self.bi_ema[layer_idx] = alpha * self.bi_ema[layer_idx] + (1.0 - alpha) * bi;
+    }
+
+    /// Called once per token to advance the token counter.
+    pub fn advance_token(&mut self) {
+        self.tokens_seen += 1;
+        // Log after warmup completes
+        if self.tokens_seen == self.warmup_tokens && self.enabled {
+            let skipped: Vec<usize> = self.bi_ema.iter().enumerate()
+                .filter(|(_, &bi)| bi < self.bi_threshold)
+                .map(|(i, _)| i)
+                .collect();
+            let kept: Vec<usize> = self.bi_ema.iter().enumerate()
+                .filter(|(_, &bi)| bi >= self.bi_threshold)
+                .map(|(i, _)| i)
+                .collect();
+            log::info!(
+                "🧭 OnlineLayerRouter warmup done: {}/{} layers active, skip {:?}",
+                kept.len(), self.n_layers, skipped,
+            );
+            log::info!(
+                "   BI scores: {:?}",
+                self.bi_ema.iter().map(|b| format!("{:.3}", b)).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 // ── Variante de peso para suportar BF16 ou INT4 ───────────────────────────────
 
 /// Peso de uma camada: pode ser BF16 original (padrão) ou Q4 (quantizado INT4).
@@ -494,6 +555,10 @@ pub enum LayerWeight {
     /// GGML Q6_K: raw quantized blocks on GPU (210 bytes per 256 values).
     /// Stores (raw_data_tensor, n_rows, k_dim).
     Q6K { data: AnyTensor, n: usize, k: usize },
+    /// BitNet ternary {-1, 0, +1}: 2 bits/weight, 4 weights/byte.
+    /// Encoding: -1=0b00, 0=0b01, +1=0b10. HIP kernel: pure add/sub, zero multiplies.
+    /// Stores (packed_data, n_rows, k_dim, per_tensor_scale).
+    Ternary { data: AnyTensor, n: usize, k: usize, scale: f32 },
 }
 
 impl LayerWeight {
@@ -507,6 +572,7 @@ impl LayerWeight {
             }
             LayerWeight::Q4K { n, k, .. } => n * (k / 256) * 144,
             LayerWeight::Q6K { n, k, .. } => n * (k / 256) * 210,
+            LayerWeight::Ternary { n, k, .. } => n * ((k + 3) / 4), // 2 bits/weight
         }
     }
 }
@@ -573,6 +639,9 @@ pub struct CausalLM {
     /// When false (default), per-layer telemetry download_f32 calls are skipped entirely.
     /// Set to true only when the dashboard/debug UI needs live layer traces.
     pub telemetry_enabled: bool,
+    /// Online adaptive layer skip router (IARA_ROUTER=1).
+    /// Measures BI per layer in real-time and dynamically skips low-BI layers.
+    pub layer_router: OnlineLayerRouter,
 }
 
 impl CausalLM {
@@ -615,6 +684,7 @@ impl CausalLM {
                     LayerWeight::Q4(_) => "Q4",
                     LayerWeight::Q4K { .. } => "Q4K",
                     LayerWeight::Q6K { .. } => "Q6K",
+                    LayerWeight::Ternary { .. } => "Ternary",
                 };
                 log::warn!("project() first call: weight={}, m={}, n={}, k={}, q8_scratch={}, precomputed={}",
                     wtype, m, n, k, q8_scratch.is_some(), q8_precomputed);
@@ -734,6 +804,17 @@ impl CausalLM {
                         beta,
                     })?;
                 }
+            }
+            LayerWeight::Ternary { data, n: _, k: _, scale } => {
+                backend.gemv_ternary_f32(&compute_core::GemvTernaryF32Params {
+                    m, n, k,
+                    packed: data,
+                    x: input,
+                    x_offset: a_offset,
+                    out: output,
+                    scale: *scale,
+                    beta,
+                })?;
             }
         }
         Ok(())
@@ -1004,6 +1085,8 @@ impl CausalLM {
             (None, None)
         };
 
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
+
         Ok(Self {
             embed,
             layers,
@@ -1023,6 +1106,7 @@ impl CausalLM {
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
             telemetry_enabled: false,
+            layer_router,
         })
     }
 
@@ -1280,6 +1364,7 @@ impl CausalLM {
                 LayerWeight::Q4K { n, k, .. } => log::info!("  L0.wq Q4K native [{}×{}]", n, k),
                 LayerWeight::Q6K { n, k, .. } => log::info!("  L0.wq Q6K native [{}×{}]", n, k),
                 LayerWeight::Q4(_) => log::info!("  L0.wq Q4 (IARA quantized)"),
+                LayerWeight::Ternary { n, k, scale, .. } => log::info!("  L0.wq Ternary [{}×{}] scale={:.4}", n, k, scale),
             }
 
             // Check layer 0 input_norm (F32)
@@ -1309,6 +1394,7 @@ impl CausalLM {
         }
 
         let scratch = ForwardScratchpad::new(&cfg, &backend);
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
 
         log::info!("✅ Modelo GGUF [{}] carregado — VRAM: {:.2} GB (native Q4K/Q6K GEMV)", arch.family, vram_bytes as f64 / 1e9);
 
@@ -1331,6 +1417,7 @@ impl CausalLM {
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
             telemetry_enabled: false,
+            layer_router,
         })
     }
 
@@ -1669,6 +1756,8 @@ impl CausalLM {
             (None, None)
         };
 
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
+
         Ok(Self {
             embed,
             layers,
@@ -1688,6 +1777,302 @@ impl CausalLM {
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
             telemetry_enabled: false,
+            layer_router,
+        })
+    }
+
+    /// Carrega modelo com quantização ternária {-1, 0, +1} (BitNet 1.58).
+    /// Pesos quantizados para 2 bits/weight — 16× menor que BF16.
+    /// GEMV usa apenas add/sub, zero multiplicações.
+    /// Layers 7-20 skipped (BI≈0) para decode — 2× speedup.
+    pub fn load_ternary(
+        model_dir: &Path,
+        cfg: ModelCfg,
+        arch: ModelArchitecture,
+        backend: Arc<dyn ComputeBackend>,
+    ) -> ModelResult<Self> {
+        use crate::storage::bitnet::quantize_to_ternary;
+
+        log::info!(
+            "⏳ Carregando modelo [{}] com quantização TERNARY: {} camadas, hidden={}, vocab={}",
+            arch.family, cfg.num_layers, cfg.hidden_size, cfg.vocab_size
+        );
+
+        // ── Mmaps ────────────────────────────────────────────────────────────
+        let mut shards: HashMap<String, memmap2::Mmap> = HashMap::new();
+        let tensor_shard_map: Option<HashMap<String, String>>;
+
+        let index_path = model_dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+            let weight_map = index["weight_map"].as_object()
+                .ok_or_else(|| ModelError::Model("weight_map inválido".into()))?;
+            let mut tsm: HashMap<String, String> = HashMap::new();
+            for (k, v) in weight_map {
+                if let Some(s) = v.as_str() { tsm.insert(k.clone(), s.to_string()); }
+            }
+            for shard_name in tsm.values() {
+                if shards.contains_key(shard_name) { continue; }
+                let file = std::fs::File::open(model_dir.join(shard_name))?;
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                shards.insert(shard_name.clone(), mmap);
+            }
+            tensor_shard_map = Some(tsm);
+        } else {
+            let single = model_dir.join("model.safetensors");
+            if !single.exists() {
+                return Err(ModelError::Model("Nenhum safetensors encontrado".into()));
+            }
+            let file = std::fs::File::open(&single)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            log::info!("  → single-shard ({:.2} GB)", mmap.len() as f64 / 1e9);
+            shards.insert("model.safetensors".to_string(), mmap);
+            tensor_shard_map = None;
+        }
+
+        // ── Helpers ──────────────────────────────────────────────────────────
+        let find_mmap = |name: &str| -> Option<&memmap2::Mmap> {
+            match &tensor_shard_map {
+                Some(tsm) => tsm.get(name).and_then(|s| shards.get(s)),
+                None => shards.get("model.safetensors"),
+            }
+        };
+        let tensor_exists = |name: &str| -> bool {
+            match &tensor_shard_map {
+                Some(tsm) => tsm.contains_key(name),
+                None => shards.get("model.safetensors")
+                    .map(|m| shard_has_tensor(m, name))
+                    .unwrap_or(false),
+            }
+        };
+
+        let load_f32 = |name: &str| -> ModelResult<(Vec<f32>, Vec<usize>)> {
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            read_bf16_f32(mmap, name)
+        };
+
+        // Ternary quantize: BF16 → {-1,0,+1} packed 2-bit
+        let ternary_weight = |name: &str| -> ModelResult<LayerWeight> {
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            let (raw_bytes, shape) = shard_tensor_bytes(mmap, name)?;
+            let bits = unsafe {
+                std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2)
+            };
+            let tw = quantize_to_ternary(bits, [shape[0], shape[1]]);
+            let data = backend.upload_ternary(&tw.packed, &[tw.shape[0], (tw.shape[1] + 3) / 4]);
+            Ok(LayerWeight::Ternary {
+                data,
+                n: tw.shape[0],
+                k: tw.shape[1],
+                scale: tw.scale,
+            })
+        };
+
+        let gpu_bf16 = |name: &str| -> ModelResult<AnyTensor> {
+            let mmap = find_mmap(name)
+                .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+            let (raw_bytes, shape) = shard_tensor_bytes(mmap, name)?;
+            let bits = unsafe {
+                std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2)
+            };
+            Ok(backend.upload_bf16(bits, &shape))
+        };
+
+        let gpu_f32 = |data: &[f32]| -> AnyTensor {
+            backend.upload_f32(data, &[data.len()])
+        };
+
+        let tmap = &arch.tensor_map;
+
+        // ── Embedding (BF16 — too sensitive for ternary) ─────────────────────
+        log::info!("  → embed_tokens (BF16)");
+        let embed = gpu_bf16(&tmap.embed)?;
+
+        // ── Hybrid precision: BF16 for critical layers, Ternary for rest ────
+        //
+        // IARA_HYBRID=1           → enable hybrid mode
+        // IARA_BF16_LAYERS=0,1,2  → explicit list of BF16 layers
+        // IARA_HYBRID_BI=0.30     → auto: layers with BI >= threshold stay BF16
+        //
+        // Default BI scores from Qwen2.5-1.5B calibration:
+        //   L0=0.98, L1=0.78, L2=0.36, L3=0.23, L5=0.27, L6-25≈0.17, L26=0.22, L27=0.20
+        // With threshold 0.30: L0, L1, L2 stay BF16 (~180MB extra vs full ternary)
+
+        let hybrid_enabled = std::env::var("IARA_HYBRID")
+            .map(|v| v == "1").unwrap_or(false);
+
+        let bf16_layers: std::collections::HashSet<usize> = if hybrid_enabled {
+            if let Ok(list) = std::env::var("IARA_BF16_LAYERS") {
+                // Explicit: "0,1,2,27"
+                let set: std::collections::HashSet<usize> = list.split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                log::info!("🔬 Hybrid mode: BF16 layers (explicit) = {:?}", set);
+                set
+            } else {
+                // Auto from BI threshold (default 0.30)
+                let bi_thresh: f32 = std::env::var("IARA_HYBRID_BI")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(0.30);
+                // Calibrated BI scores for Qwen2.5-1.5B
+                let calibrated_bi: [f32; 28] = [
+                    0.98, 0.78, 0.36, 0.23, 0.19, 0.27, 0.18, 0.17,
+                    0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17,
+                    0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17,
+                    0.17, 0.17, 0.22, 0.20,
+                ];
+                let set: std::collections::HashSet<usize> = (0..cfg.num_layers)
+                    .filter(|&i| i < calibrated_bi.len() && calibrated_bi[i] >= bi_thresh)
+                    .collect();
+                log::info!("🔬 Hybrid mode: BF16 layers (BI >= {:.2}) = {:?}", bi_thresh, set);
+                set
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let max_seq = cfg.max_seq_len;
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        let mut total_sparsity = 0.0f64;
+        let mut total_weights = 0usize;
+        let mut bf16_count = 0usize;
+        let mut ternary_count = 0usize;
+
+        for i in 0..cfg.num_layers {
+            let use_bf16 = bf16_layers.contains(&i);
+            let tag = if use_bf16 { "BF16" } else { "Ternary" };
+            if i % 8 == 0 || use_bf16 {
+                log::info!("  → layer {}/{} ({})", i, cfg.num_layers, tag);
+            }
+            if use_bf16 { bf16_count += 1; } else { ternary_count += 1; }
+
+            let (in_w, _) = load_f32(&tmap.layer_tensor(i, &tmap.input_norm))?;
+            let (pa_w, _) = load_f32(&tmap.layer_tensor(i, &tmap.post_attn_norm))?;
+
+            let qbn = tmap.layer_tensor_opt(i, &tmap.attn_q_bias);
+            let kbn = tmap.layer_tensor_opt(i, &tmap.attn_k_bias);
+            let vbn = tmap.layer_tensor_opt(i, &tmap.attn_v_bias);
+            let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
+            let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
+
+            // Per-layer weight loader: BF16 for critical, Ternary for rest
+            let load_weight = |name: &str| -> ModelResult<LayerWeight> {
+                if use_bf16 {
+                    Ok(LayerWeight::Bf16(gpu_bf16(name)?))
+                } else {
+                    ternary_weight(name)
+                }
+            };
+
+            layers.push(TransformerLayer {
+                wq:    load_weight(&tmap.layer_tensor(i, &tmap.attn_q))?,
+                wk:    load_weight(&tmap.layer_tensor(i, &tmap.attn_k))?,
+                wv:    load_weight(&tmap.layer_tensor(i, &tmap.attn_v))?,
+                wo:    load_weight(&tmap.layer_tensor(i, &tmap.attn_o))?,
+                wgate: load_weight(&tmap.layer_tensor(i, &tmap.mlp_gate))?,
+                wup:   load_weight(&tmap.layer_tensor(i, &tmap.mlp_up))?,
+                wdown: load_weight(&tmap.layer_tensor(i, &tmap.mlp_down))?,
+                q_bias: match &qbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                k_bias: match &kbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                v_bias: match &vbn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                q_norm_w: match &qnn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                k_norm_w: match &knn {
+                    Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+                    _ => None,
+                },
+                input_norm_w: gpu_f32(&in_w),
+                post_attn_norm_w: gpu_f32(&pa_w),
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+            });
+        }
+
+        let (nw, _) = load_f32(&tmap.final_norm)?;
+        let norm_w = gpu_f32(&nw);
+        let norm_b = match &tmap.final_norm_bias {
+            Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
+            _ => None,
+        };
+
+        // lm_head: ternary por padrão (3ms→1ms), desativável via IARA_TERNARY_LM_HEAD=0
+        let ternary_lm_head = std::env::var("IARA_TERNARY_LM_HEAD")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+        let lm_head_name = if !arch.tie_word_embeddings && tensor_exists(&tmap.lm_head) {
+            tmap.lm_head.as_str()
+        } else {
+            log::info!("  → lm_head: usando embed_tokens (tied weights)");
+            tmap.embed.as_str()
+        };
+
+        let lm_head = if ternary_lm_head {
+            let w = ternary_weight(lm_head_name)?;
+            log::info!("  → lm_head: Ternary 2-bit [{}×{}] (IARA_TERNARY_LM_HEAD=1)", cfg.vocab_size, cfg.hidden_size);
+            w
+        } else {
+            log::info!("  → lm_head: BF16 [{}×{}] (IARA_TERNARY_LM_HEAD=0)", cfg.vocab_size, cfg.hidden_size);
+            LayerWeight::Bf16(gpu_bf16(lm_head_name)?)
+        };
+
+        let mut vram_bytes = embed.numel() * 2 + lm_head.vram_bytes();
+        for l in &layers {
+            vram_bytes += l.wq.vram_bytes() + l.wk.vram_bytes() + l.wv.vram_bytes()
+                + l.wo.vram_bytes() + l.wgate.vram_bytes()
+                + l.wup.vram_bytes() + l.wdown.vram_bytes();
+            vram_bytes += l.input_norm_w.numel() * 4 + l.post_attn_norm_w.numel() * 4;
+            vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
+        }
+
+        if hybrid_enabled {
+            log::info!(
+                "✅ Modelo [{}] carregado (Hybrid: {} BF16 + {} Ternary layers) — VRAM: {:.2} GB",
+                arch.family, bf16_count, ternary_count, vram_bytes as f64 / 1e9
+            );
+        } else {
+            log::info!(
+                "✅ Modelo [{}] carregado (Ternary 2-bit) — VRAM: {:.2} GB (16× redução vs BF16)",
+                arch.family, vram_bytes as f64 / 1e9
+            );
+        }
+
+        let scratch = ForwardScratchpad::new(&cfg, &backend);
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
+
+        Ok(Self {
+            embed,
+            layers,
+            norm_w,
+            norm_b,
+            lm_head,
+            cfg,
+            arch,
+            vram_bytes,
+            backend,
+            scratch,
+            cfc: None,
+            gravity: None,
+            quantized: true,
+            kuramoto_router: None,
+            sparse_scratch: None,
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
+            telemetry_enabled: false,
+            layer_router,
         })
     }
 
@@ -2032,6 +2417,8 @@ impl CausalLM {
             (None, None)
         };
 
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
+
         Ok(Self {
             embed,
             layers,
@@ -2051,6 +2438,7 @@ impl CausalLM {
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
             telemetry_enabled: false,
+            layer_router,
         })
     }
 
@@ -2160,6 +2548,82 @@ impl CausalLM {
         let do_profile = false;
         let forward_t0: Option<std::time::Instant> = None;
 
+        // ── BI-based layer skip for ternary decode ─────────────────────────
+        // Bitmask-based skip: each bit in `keep_mask` (u32) = 1 means KEEP that layer.
+        // Supports preset modes and custom keep-lists for non-contiguous skipping.
+        // Controlled by IARA_TERNARY_SKIP env var (default: enabled for ternary).
+        let ternary_skip_enabled = matches!(&self.layers[0].wq, LayerWeight::Ternary { .. })
+            && std::env::var("IARA_TERNARY_SKIP").unwrap_or_else(|_| "1".into()) != "0";
+
+        // Build keep_mask: bit i = 1 → execute layer i; bit i = 0 → skip layer i
+        let keep_mask: u32 = if let Ok(hex) = std::env::var("IARA_SKIP_MASK") {
+            // Raw hex bitmask of layers to SKIP (1=skip). Invert to get keep_mask.
+            let skip = u32::from_str_radix(hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .unwrap_or(0);
+            !skip
+        } else if let Ok(layers_str) = std::env::var("IARA_KEEP_LAYERS") {
+            // Comma-separated list of layer indices to keep, e.g. "0,1,2,3,14,27"
+            let mut mask = 0u32;
+            for s in layers_str.split(',') {
+                if let Ok(idx) = s.trim().parse::<u32>() {
+                    if idx < 32 { mask |= 1 << idx; }
+                }
+            }
+            mask
+        } else {
+            // Preset modes via IARA_SKIP_MODE (or fallback to IARA_SKIP_START/END)
+            let mode = std::env::var("IARA_SKIP_MODE").unwrap_or_default();
+            match mode.as_str() {
+                // aggressive: keep 0-3, 14, 25-27 → 8 layers executed, 20 skipped
+                "aggressive" => {
+                    (0b1111)                  // layers 0-3
+                    | (1u32 << 14)            // layer 14 (middle anchor)
+                    | (0b111 << 25)           // layers 25-27
+                }
+                // ultra: keep 0-2, 14, 27 → 5 layers executed, 23 skipped
+                "ultra" => {
+                    (0b111)                   // layers 0-2
+                    | (1u32 << 14)            // layer 14 (middle anchor)
+                    | (1u32 << 27)            // layer 27 (final)
+                }
+                // moderate: keep 0-6, 14, 21-27 → 14 layers executed (original behavior)
+                "moderate" => {
+                    (0b1111111)               // layers 0-6
+                    | (1u32 << 14)            // layer 14
+                    | (0b1111111 << 21)       // layers 21-27
+                }
+                // Default: fall back to IARA_SKIP_START/IARA_SKIP_END for compatibility
+                _ => {
+                    let skip_start = std::env::var("IARA_SKIP_START").ok()
+                        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(7);
+                    let skip_end = std::env::var("IARA_SKIP_END").ok()
+                        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(20);
+                    let mut mask = 0xFFFF_FFFFu32; // keep all
+                    for i in skip_start..=skip_end {
+                        if i < 32 { mask &= !(1 << i); }
+                    }
+                    mask
+                }
+            }
+        };
+
+        // Log skip configuration once (first decode token)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if ternary_skip_enabled && !LOGGED.swap(true, Ordering::Relaxed) {
+                let kept: u32 = keep_mask.count_ones();
+                let skipped = n_layers as u32 - kept.min(n_layers as u32);
+                let kept_list: Vec<usize> = (0..n_layers)
+                    .filter(|&i| keep_mask & (1 << i) != 0)
+                    .collect();
+                log::info!(
+                    "Ternary layer skip: executing {}/{} layers (skipping {}). Keep: {:?}",
+                    kept, n_layers, skipped, kept_list
+                );
+            }
+        }
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Check if we should early exit based on budget
             if layer_idx > final_layer {
@@ -2169,6 +2633,27 @@ impl CausalLM {
                 );
                 break;
             }
+
+            // ── Layer skip decision ──────────────────────────────────────────
+            // Priority: OnlineLayerRouter (dynamic) > static bitmask (IARA_SKIP_MODE)
+            let (router_skip, router_measure) = if n == 1 {
+                self.layer_router.should_skip(layer_idx)
+            } else {
+                (false, false)
+            };
+
+            if router_skip {
+                continue;  // dynamic skip: router says this layer has low BI
+            }
+            if !self.layer_router.enabled && ternary_skip_enabled && n == 1 && (keep_mask & (1u32 << layer_idx)) == 0 {
+                continue;  // static skip: bitmask says skip (fallback when router is off)
+            }
+
+            // Snapshot x BEFORE layer if router wants to measure BI
+            if router_measure {
+                self.backend.copy_f32_d2d(&self.scratch.x, &self.layer_router.x_snapshot, h).ok();
+            }
+
             let _prof_l0 = false;
             let _layer_t0: Option<std::time::Instant> = None;
 
@@ -3030,6 +3515,23 @@ impl CausalLM {
 
             prof_sync!("mlp_done");
             section_time!(PROF_MLP, _sec_t0);
+
+            // ── Online BI measurement: cos_sim(x_before, x_after) ──────────
+            if router_measure {
+                if let Ok(()) = self.backend.cosine_sim_1d(
+                    &self.layer_router.x_snapshot,
+                    &self.scratch.x,
+                    &self.layer_router.cos_sim_buf,
+                    h,
+                ) {
+                    // Download single float (cos_sim result)
+                    let sim = self.backend.download_f32(&self.layer_router.cos_sim_buf);
+                    if !sim.is_empty() {
+                        self.layer_router.update_bi(layer_idx, sim[0]);
+                    }
+                }
+            }
+
             // ── DEBUG: dump x after full layer ──
             if std::env::var("IARA_DEBUG_FWD").map(|v| v == "1").unwrap_or(false) {
                 let x_after = self.backend.download_f32(&self.scratch.x);
@@ -3209,6 +3711,11 @@ impl CausalLM {
             }
         }
 
+        // ── Advance layer router token counter ─────────────────────────────
+        if n == 1 {
+            self.layer_router.advance_token();
+        }
+
         // ── Final Normalization ──────────────────────────────────────────────
         let mut _sec_t0 = std::time::Instant::now();  // re-init for final section
         let _cpu_layers_done = _fwd_t0.elapsed();
@@ -3317,11 +3824,19 @@ impl CausalLM {
         let greedy_t0 = std::time::Instant::now();
         hip_ffi::safe::reset_launch_count();
 
-        // HIP Graph status: "capture every token + hipGraphExecUpdate" approach is
-        // DISABLED — ROCm re-instantiates on every token because seq_len changes,
-        // adding ~6ms overhead vs 0.9ms direct dispatch. Net loss at 311 kernels/token.
-        // TODO: implement per-layer static graph capture (position-independent kernels only).
-        let use_graph = false;
+        // HIP Graph capture for ternary decode:
+        // For ternary models with layer skip, the forward path is deterministic
+        // (same layers execute every token, same buffer pointers, only scalar
+        // args like seq_pos/seq_len change). hipGraphExecUpdate should handle
+        // scalar-only changes without re-instantiation.
+        //
+        // Enable with IARA_GRAPH=1. Requires: ternary weights + single-token decode.
+        // Previous full-model attempt failed due to conditional paths changing topology.
+        // Ternary + layer skip = fixed topology → graph update should succeed.
+        let use_graph = matches!(&self.layers[0].wq, LayerWeight::Ternary { .. })
+            && n == 1
+            && std::env::var("IARA_GRAPH").map(|v| v == "1").unwrap_or(false);
+
         if use_graph {
             self.backend.begin_graph_capture();
         }
@@ -3333,11 +3848,13 @@ impl CausalLM {
 
         // End capture + launch graph (no-op if use_graph=false)
         if use_graph {
+            let graph_t0 = std::time::Instant::now();
             let graph_ok = self.backend.end_graph_capture_and_launch();
+            let graph_us = graph_t0.elapsed().as_micros();
             if !graph_ok && !GRAPH_LOGGED.swap(true, Ordering::Relaxed) {
-                log::warn!("HIP Graph capture/launch failed, falling back to direct dispatch");
-            } else if graph_ok && !GRAPH_LOGGED.swap(true, Ordering::Relaxed) {
-                log::warn!("HIP Graph capture ACTIVE — kernel launches collapsed to 1 per token");
+                log::warn!("HIP Graph capture/launch FAILED for ternary decode — falling back to direct dispatch");
+            } else if graph_ok && count < 3 {
+                log::warn!("HIP Graph ternary decode: capture+update+launch took {}µs ({} kernel launches collapsed)", graph_us, launches_this_token);
             }
         }
 
