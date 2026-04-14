@@ -1,0 +1,41 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "iara-engine (ROCm — release)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run_iara.sh", "release"],
+      "port": 3000
+    },
+    {
+      "name": "iara-engine (native — telemetria completa)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run_iara.sh", "native"],
+      "port": 3000
+    },
+    {
+      "name": "iara-engine (ROCm — debug)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run_iara.sh", "debug"],
+      "port": 3000
+    },
+    {
+      "name": "iara-engine (OpenCL — iGPU release)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run_igpu.sh", "release"],
+      "port": 3000
+    },
+    {
+      "name": "stress-test (ROCm)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run_stress.sh"],
+      "port": 3000
+    },
+    {
+      "name": "dashboard frontend (porta 8001)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8001", "--directory", "frontend"],
+      "port": 8001
+    }
+  ]
+}

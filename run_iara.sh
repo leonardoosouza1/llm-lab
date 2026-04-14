@@ -42,6 +42,13 @@ case "$MODE" in
         MODELS_DIR="${2:-$SCRIPT_DIR/models}"
         RUST_LOG=info "$CARGO_BIN" run --release -p iara-engine --bin iara-engine --features rocm -- "$MODELS_DIR"
         ;;
+    native|native-release)
+        export IARA_NO_LLAMA=1
+        export IARA_SECTION_PROF=1
+        MODELS_DIR="${2:-$SCRIPT_DIR/models}"
+        echo "🔬 Backend nativo forçado (IARA_NO_LLAMA=1) — telemetria completa por camada"
+        RUST_LOG=info "$CARGO_BIN" run --release -p iara-engine --bin iara-engine --features rocm -- "$MODELS_DIR"
+        ;;
     q4|q4-release)
         export IARA_QUANTIZE=1
         MODELS_DIR="${2:-$SCRIPT_DIR/models}"
@@ -54,8 +61,9 @@ case "$MODE" in
         RUST_LOG=info "$CARGO_BIN" run -p iara-engine --bin iara-engine --features rocm -- "$MODELS_DIR"
         ;;
     *)
-        echo "Uso: $0 [release|debug|q4] [models_dir]"
-        echo "  release    — build otimizado, pesos BF16"
+        echo "Uso: $0 [release|debug|q4|native] [models_dir]"
+        echo "  release    — build otimizado, pesos BF16 (llama.cpp backend se disponível)"
+        echo "  native     — build otimizado, backend nativo forçado (IARA_NO_LLAMA=1), telemetria completa"
         echo "  q4         — build otimizado, pesos quantizados Q4 (4x menos VRAM)"
         echo "  debug      — build debug, pesos BF16"
         exit 1
