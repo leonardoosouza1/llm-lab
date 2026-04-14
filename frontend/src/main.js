@@ -15,6 +15,7 @@ import { bindNewLayoutEvents } from './dom/legacy_updates.js';
 import { renderLayerGrid } from './components/layer_grid.js';
 import { renderConsoleLogs, setConsoleAutoScroll } from './components/log_console.js';
 import { initForceGraph, updateForceGraph } from './charts/force_graph.js';
+import { initNeurovizTab } from './charts/neuroviz_tab.js';
 
 const { watch, createApp, nextTick } = Vue;
 
@@ -274,6 +275,10 @@ function switchTab(tab) {
   if (tab === 'sae') {
     renderSaePanel();
   }
+  if (tab === 'neuroviz') {
+    // Lazy init — Three.js must be loaded before we call initNeurovizTab
+    requestAnimationFrame(() => initNeurovizTab());
+  }
 }
 
 function renderQuantPanel() {
@@ -310,9 +315,11 @@ function renderQuantPanel() {
 }
 
 function renderNtcPanel() {
-  import('./charts/ntc_grid_chart.js').then(m => {
-    m.updateNtcCharts();
+  // New compression dashboard (lazy import)
+  import('./charts/ntc_compression.js').then(m => {
+    m.initNtcCompression();
   });
+  // Legacy metrics kept for backwards compat (ntc-recent-tokens etc. still exist as hidden elements)
   updateNtcMetrics();
 }
 
@@ -486,6 +493,9 @@ createApp({
       updateHeatmap();
       if (store.activeTab === 'layers') renderLayerGrid();
       if (store.activeTab === 'graph')  updateForceGraph(store.layerData);
+      if (store.activeTab === 'ntc') {
+        import('./charts/ntc_compression.js').then(m => m.updateNtcCompression());
+      }
     }, { deep: true });
 
     // TPS e ms/layer
@@ -760,9 +770,7 @@ createApp({
     // ── NTC state ──────────────────────────────────────────────────────────
     watch(() => [store.ntc.gridSize, store.ntc.history.length], () => {
       if (store.activeTab === 'ntc') {
-        import('./charts/ntc_grid_chart.js').then(m => {
-          m.updateNtcCharts();
-        });
+        import('./charts/ntc_compression.js').then(m => m.updateNtcCompression());
         updateNtcMetrics();
       }
     });

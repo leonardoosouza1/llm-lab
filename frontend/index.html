@@ -130,6 +130,17 @@
         <span class="tab-icon">🧠</span>
         <span class="tab-label">SAE</span>
       </button>
+      <button
+        class="tab-btn"
+        role="tab"
+        data-tab="neuroviz"
+        aria-selected="false"
+        aria-controls="panel-neuroviz"
+        id="tab-btn-neuroviz"
+      >
+        <span class="tab-icon">🔬</span>
+        <span class="tab-label">NeurViz</span>
+      </button>
     </nav>
 
     <div id="status-area" role="status" aria-live="polite" aria-label="Connection and system status">
@@ -940,7 +951,7 @@
     </section>
 
     <!-- ─────────────────────────────────────────────
-         TAB: NTC
+         TAB: NTC — MODEL COMPRESSION DASHBOARD
     ────────────────────────────────────────────── -->
     <section
       id="panel-ntc"
@@ -949,87 +960,274 @@
       aria-labelledby="tab-btn-ntc"
       tabindex="0"
     >
-      <div class="panel-grid-ntc">
+      <!-- Panel header / goal statement -->
+      <div class="glass-panel" style="margin-bottom:12px;padding:14px 20px;background:linear-gradient(135deg,rgba(99,102,241,.10),rgba(6,182,212,.08));border-radius:8px;" aria-label="Compression goal">
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+          <span style="font-size:18px" aria-hidden="true">🗜️</span>
+          <div>
+            <div style="font-size:13px;font-weight:700;color:#e8e8f0;font-family:'JetBrains Mono',monospace;letter-spacing:.03em;">Model Compression Dashboard</div>
+            <div style="font-size:11px;color:#6b7fa3;margin-top:3px;">Goal: 1 GB VRAM with quality equivalent to 6 GB model &mdash; quantization · pruning · distillation</div>
+          </div>
+          <div style="margin-left:auto;display:flex;gap:10px;align-items:center;">
+            <span id="ntc-current-model-chip" style="font-size:10px;padding:3px 10px;border-radius:4px;background:rgba(99,102,241,.15);color:#818cf8;font-family:'JetBrains Mono',monospace;font-weight:600;">Qwen2.5-1.5B BF16 · 3.0 GB</span>
+            <span id="ntc-status-chip" style="font-size:10px;padding:3px 10px;border-radius:4px;background:rgba(251,191,36,.10);color:#fbbf24;font-family:'JetBrains Mono',monospace;font-weight:600;">ready to compress</span>
+          </div>
+        </div>
+      </div>
 
-        <!-- Latent Grid Heatmap -->
-        <div class="glass-panel ntc-grid-box" aria-label="NTC latent space grid">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+
+        <!-- A — Compression Overview -->
+        <div class="glass-panel" aria-label="Compression size overview">
           <div class="panel-header">
             <h2 class="panel-title">
-              <span class="panel-title-icon" aria-hidden="true">📊</span>
-              Latent Grid (grid_size × latent_dim)
+              <span class="panel-title-icon" aria-hidden="true">📦</span>
+              Compression Overview
             </h2>
+            <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">Qwen2.5-1.5B</span>
           </div>
-          <div class="canvas-wrapper" style="height: 250px;">
-            <canvas
-              id="ntc-grid-heatmap"
-              width="800"
-              height="250"
-              aria-label="NTC latent grid heatmap"
-            ></canvas>
+          <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;" id="ntc-overview-list">
+
+            <!-- BF16 baseline -->
+            <div class="ntc-tier ntc-tier--current" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.3);" data-tier="bf16">
+              <span style="font-size:11px;color:#818cf8;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">BF16 (base)</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:100%;height:100%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#818cf8;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">3.0 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">100% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(99,102,241,.2);color:#818cf8;">CURRENT</span>
+            </div>
+
+            <!-- Q8 -->
+            <div class="ntc-tier" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);" data-tier="q8">
+              <span style="font-size:11px;color:#34d399;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">INT8 / Q8</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:50%;height:100%;background:linear-gradient(90deg,#10b981,#34d399);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#34d399;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">1.5 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">~99% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(16,185,129,.15);color:#34d399;">2× smaller</span>
+            </div>
+
+            <!-- Q4 — sweet spot -->
+            <div class="ntc-tier ntc-tier--sweet" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(6,182,212,.10);border:1px solid rgba(6,182,212,.35);" data-tier="q4">
+              <span style="font-size:11px;color:#06b6d4;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">INT4 / Q4</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:25%;height:100%;background:linear-gradient(90deg,#0891b2,#06b6d4);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#06b6d4;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">0.75 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">~96% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(6,182,212,.2);color:#06b6d4;font-weight:700;">SWEET SPOT</span>
+            </div>
+
+            <!-- GGUF Q4_K_M -->
+            <div class="ntc-tier" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(251,191,36,.06);border:1px solid rgba(251,191,36,.15);" data-tier="gguf">
+              <span style="font-size:11px;color:#fbbf24;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">GGUF Q4_K_M</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:22%;height:100%;background:linear-gradient(90deg,#d97706,#fbbf24);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#fbbf24;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">0.65 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">~95% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(251,191,36,.12);color:#fbbf24;">CPU+GPU</span>
+            </div>
+
+            <!-- Q2 -->
+            <div class="ntc-tier" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(249,115,22,.06);border:1px solid rgba(249,115,22,.15);" data-tier="q2">
+              <span style="font-size:11px;color:#f97316;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">INT2 / Q2</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:12%;height:100%;background:linear-gradient(90deg,#ea580c,#f97316);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#f97316;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">0.37 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">~85% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(249,115,22,.12);color:#f97316;">8× smaller</span>
+            </div>
+
+            <!-- Pruned 50% -->
+            <div class="ntc-tier" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);" data-tier="pruned50">
+              <span style="font-size:11px;color:#a855f7;font-family:'JetBrains Mono',monospace;width:80px;flex-shrink:0;">Pruned 50%</span>
+              <div style="flex:1;height:10px;background:#1a1a2e;border-radius:5px;overflow:hidden;">
+                <div style="width:12.5%;height:100%;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:5px;"></div>
+              </div>
+              <span style="font-size:11px;color:#a855f7;font-family:'JetBrains Mono',monospace;width:48px;text-align:right;flex-shrink:0;">0.375 GB</span>
+              <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;width:64px;flex-shrink:0;">~88% qual</span>
+              <span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(168,85,247,.12);color:#a855f7;">structured</span>
+            </div>
+
           </div>
         </div>
 
-        <!-- Reconstruction Loss Timeline -->
-        <div class="glass-panel ntc-loss-box" aria-label="NTC reconstruction loss over time">
+        <!-- B — Layer Importance Heatmap -->
+        <div class="glass-panel" aria-label="Layer importance heatmap for pruning decisions">
           <div class="panel-header">
             <h2 class="panel-title">
-              <span class="panel-title-icon" aria-hidden="true">📈</span>
-              Reconstruction Loss
+              <span class="panel-title-icon" aria-hidden="true">🌡️</span>
+              Layer Importance
             </h2>
+            <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">residual_norm variance</span>
           </div>
-          <div class="canvas-wrapper canvas-wrapper--wide" style="height: 200px;">
+          <div style="padding:8px 12px 4px;">
+            <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;margin-bottom:6px;">
+              Green = important (high activation variance) · Red = redundant (can prune/quantize aggressively)
+            </div>
             <canvas
-              id="ntc-loss-chart"
-              width="800"
-              height="200"
-              aria-label="Reconstruction loss line chart"
-            ></canvas>
-          </div>
-        </div>
-
-        <!-- VRAM Comparison -->
-        <div class="glass-panel ntc-vram-box" aria-label="VRAM usage comparison">
-          <div class="panel-header">
-            <h2 class="panel-title">
-              <span class="panel-title-icon" aria-hidden="true">💾</span>
-              VRAM Comparison
-            </h2>
-          </div>
-          <div class="canvas-wrapper" style="height: 200px;">
-            <canvas
-              id="ntc-vram-chart"
+              id="ntc-layer-importance-canvas"
               width="600"
-              height="200"
-              aria-label="VRAM usage comparison bar chart"
+              height="120"
+              style="width:100%;height:120px;"
+              aria-label="Layer importance heatmap derived from residual norm activations"
             ></canvas>
-          </div>
-        </div>
-
-        <!-- Token Compression Info -->
-        <div class="glass-panel ntc-tokens-box" aria-label="Token compression statistics">
-          <div class="panel-header">
-            <h2 class="panel-title">
-              <span class="panel-title-icon" aria-hidden="true">🔤</span>
-              Token Compression
-            </h2>
-          </div>
-          <div style="padding: 16px; display: flex; flex-direction: column; gap: 12px;">
-            <div>
-              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Recent Tokens (Exact)</span>
-              <div id="ntc-recent-tokens" style="margin-top: 8px; padding: 8px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #06b6d4;">—</div>
-            </div>
-            <div>
-              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Compressed (NTC)</span>
-              <div id="ntc-compressed-tokens" style="margin-top: 8px; padding: 8px; background: rgba(51, 65, 85, 0.4); border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #34d399;">—</div>
-            </div>
-            <div>
-              <span style="font-size: 10px; color: #6b7fa3; text-transform: uppercase; letter-spacing: 0.05em;">Compression Ratio</span>
-              <div id="ntc-compression-ratio" style="margin-top: 8px; padding: 12px; background: rgba(6, 182, 212, 0.1); border-left: 3px solid #06b6d4; border-radius: 4px; font-size: 14px; font-weight: bold; color: #06b6d4; font-family: 'JetBrains Mono', monospace;">—</div>
+            <div style="margin-top:10px;display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;" id="ntc-layer-importance-list">
+              <div style="color:#6b7fa3;font-size:11px;font-family:'JetBrains Mono',monospace;text-align:center;padding:8px;">
+                Waiting for layer activation data...
+              </div>
             </div>
           </div>
         </div>
 
       </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+
+        <!-- C — Compression Strategy Selector -->
+        <div class="glass-panel" aria-label="Compression strategy selector">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-title-icon" aria-hidden="true">⚙️</span>
+              Compression Strategy
+            </h2>
+          </div>
+          <div style="padding:12px 16px;display:flex;flex-direction:column;gap:14px;">
+
+            <!-- Strategy type buttons -->
+            <div>
+              <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">Method</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button id="ntc-btn-quantize" class="ntc-strategy-btn ntc-strategy-btn--active" type="button" onclick="window._ntcSelectStrategy('quantize')" style="font-size:11px;padding:6px 14px;border-radius:5px;border:1px solid rgba(6,182,212,.4);background:rgba(6,182,212,.15);color:#06b6d4;cursor:pointer;font-family:'JetBrains Mono',monospace;font-weight:600;transition:all .2s;">Quantize</button>
+                <button id="ntc-btn-prune-neurons" class="ntc-strategy-btn" type="button" onclick="window._ntcSelectStrategy('prune-neurons')" style="font-size:11px;padding:6px 14px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#6b7fa3;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:all .2s;">Prune Neurons</button>
+                <button id="ntc-btn-prune-layers" class="ntc-strategy-btn" type="button" onclick="window._ntcSelectStrategy('prune-layers')" style="font-size:11px;padding:6px 14px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#6b7fa3;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:all .2s;">Prune Layers</button>
+                <button id="ntc-btn-distill" class="ntc-strategy-btn" type="button" onclick="window._ntcSelectStrategy('distill')" style="font-size:11px;padding:6px 14px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#6b7fa3;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:all .2s;">Distill</button>
+              </div>
+            </div>
+
+            <!-- Quantize options (shown when Quantize selected) -->
+            <div id="ntc-opts-quantize">
+              <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">Quantization Level</div>
+              <select id="ntc-quant-level" style="background:#0d1224;border:1px solid rgba(255,255,255,.12);color:#e8e8f0;border-radius:5px;padding:7px 12px;font-size:12px;font-family:'JetBrains Mono',monospace;width:100%;">
+                <option value="q8">INT8 / Q8 — 1.5 GB · ~99% quality</option>
+                <option value="q4" selected>INT4 / Q4 — 0.75 GB · ~96% quality (recommended)</option>
+                <option value="gguf_q4km">GGUF Q4_K_M — 0.65 GB · ~95% quality (llama.cpp)</option>
+                <option value="q2">INT2 / Q2 — 0.37 GB · ~85% quality</option>
+              </select>
+              <div style="margin-top:8px;font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">
+                Q4 fits in 1 GB VRAM with ~96% of BF16 quality. GGUF Q4_K_M best for CPU+GPU hybrid.
+              </div>
+            </div>
+
+            <!-- Prune Neurons options (hidden by default) -->
+            <div id="ntc-opts-prune-neurons" style="display:none;">
+              <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">Keep top X% neurons by activation</div>
+              <input type="range" id="ntc-prune-neuron-pct" min="10" max="100" value="50" step="5"
+                style="width:100%;accent-color:#a855f7;"
+                oninput="document.getElementById('ntc-prune-neuron-val').textContent=this.value+'%'"
+                aria-label="Neuron keep percentage"
+              >
+              <div style="display:flex;justify-content:space-between;margin-top:4px;">
+                <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">10% (extreme)</span>
+                <span id="ntc-prune-neuron-val" style="font-size:12px;color:#a855f7;font-family:'JetBrains Mono',monospace;font-weight:700;">50%</span>
+                <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">100% (none)</span>
+              </div>
+              <div style="margin-top:8px;font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">
+                Removes least-active MLP neurons per layer using activation data from NeurViz.
+              </div>
+            </div>
+
+            <!-- Prune Layers options (hidden by default) -->
+            <div id="ntc-opts-prune-layers" style="display:none;">
+              <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">Skip redundant layers (low importance score)</div>
+              <div style="font-size:11px;color:#e8e8f0;font-family:'JetBrains Mono',monospace;padding:8px 12px;background:rgba(255,255,255,.04);border-radius:5px;border:1px solid rgba(255,255,255,.08);">
+                Layer selection based on importance heatmap above.<br>
+                <span style="color:#f97316;">Layers with score &lt; 0.2 are candidates for removal.</span>
+              </div>
+              <div style="margin-top:8px;" id="ntc-prunable-layers">
+                <span style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">Run a generation first to compute importance scores.</span>
+              </div>
+            </div>
+
+            <!-- Distill options (hidden by default) -->
+            <div id="ntc-opts-distill" style="display:none;">
+              <div style="font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">Student Model Size</div>
+              <select id="ntc-distill-size" style="background:#0d1224;border:1px solid rgba(255,255,255,.12);color:#e8e8f0;border-radius:5px;padding:7px 12px;font-size:12px;font-family:'JetBrains Mono',monospace;width:100%;">
+                <option value="0.5b">0.5B params — ~0.25 GB · ultra-compact</option>
+                <option value="1b" selected>1B params — ~0.5 GB · balanced</option>
+                <option value="1.5b">1.5B params — ~0.75 GB · same arch, different init</option>
+              </select>
+              <div style="margin-top:8px;font-size:10px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;">
+                Knowledge distillation: trains a smaller model to mimic this one's logits. Requires GPU training pipeline.
+              </div>
+            </div>
+
+            <!-- Compress button -->
+            <button id="ntc-compress-btn" type="button"
+              style="margin-top:4px;padding:10px 20px;border-radius:6px;border:1px solid rgba(6,182,212,.5);background:rgba(6,182,212,.15);color:#06b6d4;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;width:100%;"
+              onclick="window._ntcStartCompress()"
+              aria-label="Start compression"
+            >
+              Start Compression
+            </button>
+
+          </div>
+        </div>
+
+        <!-- D — Compression Progress + E — Quality vs Size chart -->
+        <div class="glass-panel" style="display:flex;flex-direction:column;gap:12px;" aria-label="Compression progress and quality chart">
+
+          <!-- D — Progress -->
+          <div>
+            <div class="panel-header" style="padding-bottom:8px;">
+              <h2 class="panel-title" style="font-size:13px;">
+                <span class="panel-title-icon" aria-hidden="true">📋</span>
+                Compression Log
+              </h2>
+              <span id="ntc-progress-pct" style="font-size:11px;color:#06b6d4;font-family:'JetBrains Mono',monospace;font-weight:700;">—</span>
+            </div>
+            <div style="height:8px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden;margin-bottom:8px;">
+              <div id="ntc-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#0891b2,#06b6d4);border-radius:4px;transition:width .4s;"></div>
+            </div>
+            <div id="ntc-log-output" style="height:110px;overflow-y:auto;background:rgba(0,0,0,.25);border-radius:5px;padding:8px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#6b7fa3;border:1px solid rgba(255,255,255,.05);" aria-live="polite" aria-label="Compression log">
+              <div style="color:#34d399;">[ready] Select a strategy and click Start Compression.</div>
+              <div>[info] Layer importance scores update automatically after each generation.</div>
+              <div>[info] Q4 INT4 is recommended for 1 GB VRAM target.</div>
+            </div>
+          </div>
+
+          <!-- E — Quality vs Size scatter chart -->
+          <div style="flex:1;">
+            <div style="font-size:11px;color:#6b7fa3;font-family:'JetBrains Mono',monospace;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em;">Quality vs Size Trade-off</div>
+            <canvas
+              id="ntc-quality-scatter"
+              width="560"
+              height="200"
+              style="width:100%;height:200px;"
+              aria-label="Scatter plot of model size vs estimated quality score"
+            ></canvas>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- Hidden legacy IDs for backwards compat with updateNtcMetrics() -->
+      <div style="display:none">
+        <span id="ntc-recent-tokens"></span>
+        <span id="ntc-compressed-tokens"></span>
+        <span id="ntc-compression-ratio"></span>
+        <!-- Legacy canvases kept alive but hidden (ntc_grid_chart.js may still try to use them) -->
+        <canvas id="ntc-grid-heatmap" width="1" height="1"></canvas>
+        <canvas id="ntc-loss-chart" width="1" height="1"></canvas>
+        <canvas id="ntc-vram-chart" width="1" height="1"></canvas>
+      </div>
+
     </section>
 
     <!-- ─────────────────────────────────────────────
@@ -1121,6 +1319,152 @@
       </div>
     </section>
 
+    <!-- ─────────────────────────────────────────────
+         TAB: NEUROVIZ — 3D Neural Activation Visualizer
+    ────────────────────────────────────────────── -->
+    <section
+      id="panel-neuroviz"
+      class="tab-panel hidden"
+      role="tabpanel"
+      aria-labelledby="tab-btn-neuroviz"
+      tabindex="0"
+      style="display:flex;flex-direction:column;height:100%;overflow:hidden;padding:0;"
+    >
+      <!-- Response display -->
+      <div style="
+        flex-shrink:0;padding:7px 16px;background:rgba(0,230,255,0.03);
+        border-bottom:1px solid rgba(0,230,255,0.07);font-family:'JetBrains Mono',monospace;
+        font-size:12px;display:flex;align-items:baseline;gap:10px;
+      ">
+        <span style="color:#1e3a34;font-size:9px;letter-spacing:1px;flex-shrink:0;text-transform:uppercase;">Resposta</span>
+        <span id="nv-response-text" style="color:#334155;flex:1;line-height:1.5;word-break:break-word;">—</span>
+      </div>
+
+      <!-- Top bar -->
+      <div id="nv-topbar" style="
+        display:flex;align-items:center;gap:10px;padding:10px 16px;flex-shrink:0;
+        background:rgba(10,28,26,0.8);border-bottom:1px solid rgba(0,230,255,0.12);flex-wrap:wrap;
+      ">
+        <span style="font-size:11px;color:#00e6ff;letter-spacing:2px;font-weight:600;">NEUROVIZ 3D</span>
+        <input id="nv-prompt-input" type="text" placeholder="Enter a prompt to visualize…" style="
+          flex:1;min-width:200px;background:#0d1a18;border:1px solid rgba(0,230,255,0.2);
+          color:#e0f7f5;padding:6px 12px;border-radius:4px;font-size:13px;
+          font-family:'JetBrains Mono',monospace;outline:none;
+        " />
+        <button id="nv-run-btn" style="
+          background:rgba(0,230,255,0.15);color:#00e6ff;border:1px solid rgba(0,230,255,0.35);
+          padding:7px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-family:inherit;
+          transition:background 0.2s;white-space:nowrap;
+        ">▶ Analyze</button>
+        <button id="nv-charpath-btn" style="
+          background:rgba(34,197,94,0.1);color:#22c55e;border:1px solid rgba(34,197,94,0.25);
+          padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-family:inherit;
+          transition:all 0.2s;white-space:nowrap;
+        ">⬡ Char Path</button>
+        <span id="nv-status" style="font-size:11px;color:#475569;min-width:160px;">ready</span>
+        <!-- Loading spinner -->
+        <div id="nv-loading" style="display:none;align-items:center;gap:8px;font-size:11px;color:#818cf8;">
+          <span style="display:inline-block;width:12px;height:12px;border:2px solid #818cf8;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;"></span>
+          Running forward pass…
+        </div>
+      </div>
+
+      <!-- Main content: token list | 3D canvas | attention panel -->
+      <div style="display:flex;flex:1;overflow:hidden;min-height:0;">
+
+        <!-- Token list -->
+        <div id="nv-token-list" style="
+          width:130px;flex-shrink:0;background:#060f0e;
+          border-right:1px solid rgba(0,230,255,0.08);overflow-y:auto;padding:6px 4px;
+        ">
+          <div class="nv-token-header" style="font-size:9px;color:#1e3a34;padding:4px 8px;letter-spacing:1px;">TOKENS</div>
+        </div>
+
+        <!-- Three.js canvas wrapper -->
+        <div id="nv-canvas-wrapper" style="flex:1;position:relative;overflow:hidden;">
+          <canvas id="nv-three-canvas" style="width:100%;height:100%;display:block;"></canvas>
+
+          <!-- Layer labels -->
+          <div id="nv-layer-labels" style="
+            position:absolute;left:8px;top:0;bottom:0;pointer-events:none;
+            display:flex;flex-direction:column-reverse;justify-content:space-around;padding:20px 0;
+          "></div>
+
+          <!-- Stats overlay -->
+          <div id="nv-stats-overlay" style="
+            display:none;position:absolute;top:12px;left:36px;
+            background:rgba(6,15,14,0.88);border:1px solid rgba(0,230,255,0.18);
+            border-radius:6px;padding:10px 14px;font-size:11px;
+            font-family:'JetBrains Mono',monospace;color:#64748b;min-width:160px;
+            pointer-events:none;
+          ">
+            <div style="font-size:9px;color:#0e4040;letter-spacing:1px;margin-bottom:6px;">LAYER STATS</div>
+            <div>Layer: <span id="nv-stat-layer" style="color:#00e6ff;">—</span></div>
+            <div>Act. rate: <span id="nv-stat-actrate" style="color:#22c55e;">—</span></div>
+            <div>Phase coh: <span id="nv-stat-phase" style="color:#818cf8;">—</span></div>
+            <div>Res. norm: <span id="nv-stat-resnorm" style="color:#f59e0b;">—</span></div>
+            <div>Attn entropy: <span id="nv-stat-entropy" style="color:#e879f9;">—</span></div>
+            <div>Max act: <span id="nv-stat-maxact" style="color:#fb7185;">—</span></div>
+          </div>
+
+          <!-- Color legend -->
+          <div style="
+            position:absolute;bottom:12px;right:12px;
+            background:rgba(6,15,14,0.88);border:1px solid rgba(0,230,255,0.12);
+            border-radius:6px;padding:8px 12px;pointer-events:none;
+            font-size:10px;color:#334155;min-width:130px;
+          ">
+            <div style="font-size:9px;color:#0e4040;letter-spacing:1px;margin-bottom:6px;">ACTIVATION SCALE</div>
+            <div style="width:110px;height:8px;border-radius:4px;
+              background:linear-gradient(to right,#0000ff,#8800aa,#ff4400,#ffff00);margin:4px 0;"></div>
+            <div style="display:flex;justify-content:space-between;font-size:9px;color:#1e3a34;">
+              <span>low</span><span>high</span>
+            </div>
+          </div>
+
+          <!-- Character path overlay -->
+          <div id="nv-charpath-overlay" style="
+            display:none;position:absolute;top:12px;right:180px;
+            background:rgba(6,15,14,0.92);border:1px solid rgba(34,197,94,0.3);
+            border-radius:8px;padding:14px 16px;font-size:11px;
+            font-family:'JetBrains Mono',monospace;color:#94a3b8;max-width:340px;
+            line-height:1.6;
+          ">
+            <div style="font-size:9px;color:#22c55e;letter-spacing:1px;margin-bottom:8px;">⬡ CHARACTER PATH — BPE NOTE</div>
+            <div id="nv-charpath-body"></div>
+            <div style="font-size:9px;color:#1e3a34;margin-top:10px;border-top:1px solid #0f2a20;padding-top:8px;">
+              BPE merges characters into subwords before the model sees them.<br>
+              The highlighted path shows which neurons fired most for this token.
+            </div>
+          </div>
+        </div>
+
+        <!-- Attention panel -->
+        <div id="nv-attn-panel" style="
+          width:200px;flex-shrink:0;background:#060f0e;
+          border-left:1px solid rgba(0,230,255,0.08);
+          padding:12px 8px;overflow-y:auto;font-family:'JetBrains Mono',monospace;
+        ">
+          <div style="font-size:9px;color:#0e4040;letter-spacing:1px;margin-bottom:8px;">ATTENTION</div>
+          <svg id="nv-attn-svg" width="170" height="300" style="overflow:visible;"></svg>
+          <div id="nv-attn-info" style="font-size:10px;color:#334155;margin-top:8px;"></div>
+        </div>
+      </div>
+
+      <!-- Bottom bar: neurons + logits -->
+      <div style="
+        flex-shrink:0;background:rgba(6,15,14,0.95);border-top:1px solid rgba(0,230,255,0.1);
+        padding:10px 14px;font-family:'JetBrains Mono',monospace;overflow-x:auto;
+      ">
+        <div style="font-size:9px;color:#0e4040;letter-spacing:1px;margin-bottom:6px;">
+          TOP NEURONS — <span id="nv-layer-info" style="color:#22c55e;">select a layer</span>
+        </div>
+        <div id="nv-neuron-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;"></div>
+        <div style="font-size:9px;color:#0e4040;letter-spacing:1px;margin-bottom:6px;">NEXT TOKEN PREDICTIONS</div>
+        <div id="nv-logit-chips" style="display:flex;flex-wrap:wrap;gap:4px;"></div>
+      </div>
+    </section>
+
   </main>
 
   <!-- ═══════════════════════════════════════════════════
@@ -1183,11 +1527,59 @@
 
 </div>
 
+<!-- NeurViz floating tooltip -->
+<div id="nv-tooltip"></div>
+
 <!-- CDN Libraries (loaded after CSS, before app.js) -->
 <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<!-- Three.js r128 (legacy build — OrbitControls lives under examples/js/) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script type="module" src="src/main.js"></script>
+
+<!-- NeurViz chip styles (kept inline to avoid a separate CSS round-trip) -->
+<style>
+.nv-token-item {
+  padding:5px 8px;margin:2px;border-radius:4px;cursor:pointer;
+  font-size:11px;transition:all .15s;border:1px solid transparent;
+  color:#334155;font-family:'JetBrains Mono',monospace;
+}
+.nv-token-item:hover { background:rgba(0,230,255,0.06);border-color:rgba(0,230,255,0.2); }
+.nv-token-item.active { background:rgba(0,230,255,0.12);border-color:rgba(0,230,255,0.4);color:#00e6ff; }
+.nv-token-pos { font-size:8px;color:#1e3a34; }
+
+.nv-neuron-chip {
+  display:inline-flex;align-items:center;gap:4px;padding:3px 8px;
+  background:rgba(0,230,255,0.08);border:1px solid rgba(0,230,255,0.2);
+  border-radius:4px;font-size:10px;color:#00e6ff;cursor:pointer;
+  font-family:'JetBrains Mono',monospace;transition:all .15s;
+}
+.nv-neuron-chip:hover { background:rgba(0,230,255,0.18); }
+.nv-neuron-chip.highlighted { background:rgba(0,255,136,0.15);border-color:rgba(0,255,136,0.5);color:#00ff88; }
+.nv-chip-val { color:#475569;font-size:9px; }
+
+.nv-logit-chip {
+  display:inline-flex;align-items:center;gap:4px;padding:3px 8px;
+  background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);
+  border-radius:4px;font-size:10px;color:#22c55e;
+  font-family:'JetBrains Mono',monospace;
+}
+.nv-logit-pct { color:#475569;font-size:9px; }
+
+#nv-tooltip {
+  display:none;position:fixed;z-index:9999;pointer-events:none;
+  background:rgba(6,15,14,0.96);border:1px solid rgba(0,230,255,0.3);
+  border-radius:6px;padding:8px 12px;font-size:11px;
+  font-family:'JetBrains Mono',monospace;color:#94a3b8;line-height:1.6;
+}
+#nv-run-btn:hover { background:rgba(0,230,255,0.25) !important; }
+#nv-run-btn:disabled { opacity:0.4;cursor:not-allowed; }
+#nv-charpath-btn.active { background:rgba(34,197,94,0.2) !important;border-color:rgba(34,197,94,0.5) !important; }
+.nv-token-generated { border-color:rgba(0,230,255,0.3) !important;color:#00e6ff !important; }
+.nv-token-generated::before { content:'▶ ';font-size:7px;opacity:0.5; }
+</style>
 
 
 
