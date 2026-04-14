@@ -1285,6 +1285,288 @@ pub async fn train_lnn_handler(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Neural Visualization Endpoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request for neural visualization — runs inference with full telemetry
+#[derive(Deserialize)]
+pub struct NeurovizRequest {
+    pub prompt: String,
+    /// Max tokens to generate (default 1 — just the first token)
+    #[serde(default = "default_viz_max_tokens")]
+    pub max_tokens: usize,
+    /// Sample every N layers (1 = all, 4 = every 4th, default 2)
+    #[serde(default = "default_viz_sample_every")]
+    pub sample_every: usize,
+}
+
+fn default_viz_max_tokens() -> usize { 1 }
+fn default_viz_sample_every() -> usize { 2 }
+
+/// Per-neuron data for one layer at one token step
+#[derive(Serialize, Clone)]
+pub struct LayerNeuronViz {
+    pub layer_idx: usize,
+    /// Top MLP neurons: (neuron_index, activation_magnitude)
+    pub mlp_top: Vec<(usize, f32)>,
+    /// MLP activation rate 0-100% (placeholder: 0.0 until deep telemetry kernels land)
+    pub mlp_activation_rate: f32,
+    /// Top attention positions: (position, weight) — placeholder
+    pub attn_top: Vec<(usize, f32)>,
+    /// Attention entropy (0=focused, high=diffuse) — placeholder
+    pub attn_entropy: f32,
+    /// Residual norm (how much info flows through)
+    pub residual_norm: f32,
+    /// How much this layer changed the residual stream (attention + mlp energy sum)
+    pub residual_delta: f32,
+    /// Phase coherence (0=chaotic, 1=synchronized) — placeholder
+    pub phase_coherence: f32,
+    /// Hot neurons in residual stream (top-10 indices)
+    pub hot_neurons: Vec<usize>,
+    pub max_activation: f32,
+}
+
+/// Per-token visualization data
+#[derive(Serialize, Clone)]
+pub struct TokenViz {
+    pub token_id: u32,
+    pub token_str: String,
+    pub position: usize,
+    pub layers: Vec<LayerNeuronViz>,
+    /// Final logit distribution top-20: (id, prob, str)
+    pub top_logits: Vec<(u32, f32, String)>,
+    pub confidence: f32,
+    pub logit_entropy: f32,
+}
+
+/// Full visualization response
+#[derive(Serialize)]
+pub struct NeurovizResponse {
+    pub prompt: String,
+    pub tokens: Vec<TokenViz>,
+    pub model_info: NeurovizModelInfo,
+    pub session_id: String,
+}
+
+#[derive(Serialize)]
+pub struct NeurovizModelInfo {
+    pub num_layers: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub vocab_size: usize,
+}
+
+/// POST /api/neuroviz — Run inference with full telemetry for visualization UI.
+pub async fn neuroviz_handler(
+    State(state): State<AppState>,
+    Json(req): Json<NeurovizRequest>,
+) -> impl IntoResponse {
+    use crate::inference::LayerTrace;
+
+    if !state.model_ready.load(std::sync::atomic::Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no model loaded"}))).into_response();
+    }
+
+    // Tokenize using the global tokenizer (loaded alongside the model)
+    let tokens = crate::tokenizer::tokenize(&req.prompt);
+    let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+
+    if prompt_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "empty prompt"}))).into_response();
+    }
+
+    // Pull model info + reset cache, then run forward pass
+    let (model_info, logits, layer_traces, last_token_id, max_tokens) = {
+        let mut guard = state.qwen_model.lock().await;
+        let model = match guard.as_mut() {
+            Some(m) => m,
+            None => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "no model loaded"}))).into_response(),
+        };
+
+        let model_info = NeurovizModelInfo {
+            num_layers:        model.cfg.num_layers,
+            hidden_size:       model.cfg.hidden_size,
+            intermediate_size: model.cfg.intermediate_size,
+            num_heads:         model.cfg.num_heads,
+            num_kv_heads:      model.cfg.num_kv_heads,
+            vocab_size:        model.cfg.vocab_size,
+        };
+        let vocab_size = model.cfg.vocab_size;
+        let max_tokens = req.max_tokens.min(64);
+
+        model.reset_cache();
+
+        // Prefill: run all tokens except the last in a single batched forward pass
+        if prompt_ids.len() > 1 {
+            if let Err(e) = model.forward(&prompt_ids[..prompt_ids.len() - 1], None) {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("prefill error: {e}")}))).into_response();
+            }
+        }
+
+        // Last prompt token — this gives us logits + layer traces
+        let last_id = *prompt_ids.last().unwrap();
+        let (logits, layer_traces) = match model.forward(&[last_id], None) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("forward error: {e}")}))).into_response(),
+        };
+
+        (model_info, logits, layer_traces, last_id, max_tokens)
+    };
+
+    let vocab_size = model_info.vocab_size;
+
+    // Build TokenViz for the last prompt token
+    let mut result_tokens: Vec<TokenViz> = Vec::new();
+    let last_token_str = crate::tokenizer::token_id_to_text(last_token_id);
+    result_tokens.push(build_neuroviz_token(
+        last_token_id,
+        &last_token_str,
+        prompt_ids.len() - 1,
+        &layer_traces,
+        &logits,
+        vocab_size,
+    ));
+
+    // Generate up to max_tokens additional tokens with telemetry
+    if max_tokens > 1 {
+        let mut decode_token = {
+            // Pick top-1 greedy token from logits
+            logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(last_token_id)
+        };
+
+        let eos_ids = {
+            let guard = state.qwen_model.lock().await;
+            guard.as_ref().map(|m| m.arch.eos_token_ids.clone()).unwrap_or_default()
+        };
+
+        for step in 1..max_tokens {
+            if eos_ids.contains(&decode_token) { break; }
+
+            let (step_logits, step_traces) = {
+                let mut guard = state.qwen_model.lock().await;
+                let model = match guard.as_mut() {
+                    Some(m) => m,
+                    None => break,
+                };
+                match model.forward(&[decode_token], None) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                }
+            };
+
+            let tok_str = crate::tokenizer::token_id_to_text(decode_token);
+            result_tokens.push(build_neuroviz_token(
+                decode_token,
+                &tok_str,
+                prompt_ids.len() + step - 1,
+                &step_traces,
+                &step_logits,
+                vocab_size,
+            ));
+
+            // Greedy next token
+            decode_token = step_logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+    }
+
+    let session_id = format!("viz_{}", chrono::Utc::now().timestamp_millis());
+
+    let response = NeurovizResponse {
+        prompt: req.prompt,
+        tokens: result_tokens,
+        model_info,
+        session_id,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Build a `TokenViz` from a completed forward pass.
+fn build_neuroviz_token(
+    token_id: u32,
+    token_str: &str,
+    position: usize,
+    layer_traces: &[crate::inference::LayerTrace],
+    logits: &[f32],
+    vocab_size: usize,
+) -> TokenViz {
+    // Build per-layer viz from LayerTrace
+    let layers: Vec<LayerNeuronViz> = layer_traces.iter().map(|lt| {
+        // Represent hot neurons as (index, max_activation) pairs
+        let mlp_top: Vec<(usize, f32)> = lt.hot_neurons.iter()
+            .map(|&i| (i, lt.max_activation))
+            .collect();
+
+        LayerNeuronViz {
+            layer_idx:           lt.layer_idx,
+            mlp_top,
+            mlp_activation_rate: 0.0,    // populated by deep telemetry kernels (future)
+            attn_top:            Vec::new(),
+            attn_entropy:        0.0,
+            residual_norm:       lt.residual_norm,
+            residual_delta:      lt.attention_energy + lt.mlp_energy,
+            phase_coherence:     0.0,
+            hot_neurons:         lt.hot_neurons.clone(),
+            max_activation:      lt.max_activation,
+        }
+    }).collect();
+
+    // Compute softmax over full vocab for top-20 logits
+    let n = vocab_size.min(logits.len());
+    let max_l = logits[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = logits[..n].iter().map(|&v| (v - max_l).exp()).collect();
+    let exp_sum: f32 = exp.iter().sum();
+
+    // Collect (index, prob) and partial-sort top-20
+    let mut idx_probs: Vec<(usize, f32)> = exp.iter().enumerate()
+        .map(|(i, &e)| (i, e / exp_sum))
+        .collect();
+    // select_nth_unstable_by to get top-20 in O(n) time
+    let top_n = 20.min(idx_probs.len());
+    if top_n > 0 {
+        idx_probs.select_nth_unstable_by(top_n - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx_probs[..top_n].sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    let top_logits: Vec<(u32, f32, String)> = idx_probs[..top_n].iter().map(|(i, p)| {
+        let s = crate::tokenizer::token_id_to_text(*i as u32);
+        (*i as u32, *p, s)
+    }).collect();
+
+    let confidence = top_logits.first().map(|(_, p, _)| *p).unwrap_or(0.0);
+    let logit_entropy = -top_logits.iter()
+        .map(|(_, p, _)| if *p > 1e-10 { p * p.ln() } else { 0.0 })
+        .sum::<f32>();
+
+    TokenViz {
+        token_id,
+        token_str: token_str.to_string(),
+        position,
+        layers,
+        top_logits,
+        confidence,
+        logit_entropy,
+    }
+}
+
 /// GET /api/lnn/status — Status do sistema LNN (ESN + CfC + Gravity + Training).
 pub async fn lnn_status_handler(
     State(state): State<AppState>,

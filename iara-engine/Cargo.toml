@@ -34,6 +34,9 @@ rayon = "1.10"
 # Abstração de compute — trait ComputeBackend (ROCm, OpenCL, CPU)
 compute-core = { path = "../compute-core" }
 
+# Telemetry: neuron observation, tensor snapshots, flow events
+iara-observe = { path = "../iara-observe" }
+
 # GPU nativa — HIP FFI direto (sem candle, sem rocm-rs e seu kernel sorting quebrado)
 # Mantido como opcional: usado pelo rocm-backend via feature "rocm"
 hip-ffi = { path = "../hip-ffi", optional = true }

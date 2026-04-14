@@ -3646,6 +3646,83 @@ impl CausalLM {
 
             layer_traces.push(trace.clone());
 
+            // ── iara-observe: real neuron snapshot (sampled, decode-only) ─────
+            // Gate: same cadence as LayerTrace (every 8 layers + last).
+            // Downloads gate activations (SiLU(gate)*up) from GPU → CPU.
+            // ZERO-COST when iara_observe::GLOBAL_COLLECTOR is disabled.
+            if should_sample {
+                use iara_observe::{GLOBAL_COLLECTOR, NeuronSnapshot, FlowEvent, FlowEventType};
+
+                // Download gate tensor (contains SiLU(gate)*up post-activation)
+                let gate_data = self.backend.download_f32(&self.scratch.gate);
+                let n_neurons = gate_data.len().min(it);
+
+                // Sort by absolute activation to find top-32 most active MLP neurons
+                let mut indexed: Vec<(usize, f32)> = gate_data[..n_neurons]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v.abs()))
+                    .collect();
+                indexed.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let alive = indexed.iter().filter(|(_, v)| *v > 1e-6).count();
+                let dead_count = (n_neurons - alive) as u32;
+                let mlp_activation_rate = if n_neurons > 0 {
+                    alive as f32 / n_neurons as f32 * 100.0
+                } else {
+                    0.0
+                };
+                let mlp_gate_sparsity = if n_neurons > 0 {
+                    1.0 - alive as f32 / n_neurons as f32
+                } else {
+                    0.0
+                };
+                let top_mlp = indexed[..32.min(indexed.len())].to_vec();
+
+                // Use pos_start (KV position before this layer's token) as step proxy.
+                // It equals the number of tokens processed so far.
+                let step_proxy = layer.kv_k.current_len as u64;
+
+                // Build NeuronSnapshot — residual_norm_post from the trace we just built
+                let residual_norm_post = trace.residual_norm;
+
+                // Phase coherence from the same x_data already downloaded for trace.
+                // Re-download only if needed; since should_sample is true, x_data
+                // was downloaded above. We compute coherence from scratch.x again to
+                // avoid lifetime issues with the borrow above.
+                let x2 = self.backend.download_f32(&self.scratch.x);
+                let start_idx = (n - 1) * h;
+                let token_slice = if start_idx + h <= x2.len() {
+                    &x2[start_idx..start_idx + h]
+                } else {
+                    &x2[..h.min(x2.len())]
+                };
+                let coherence = iara_observe::phase_coherence_from(
+                    &token_slice[..h.min(token_slice.len())],
+                );
+
+                let mut snap = NeuronSnapshot::new(layer_idx, step_proxy);
+                snap.mlp_top_neurons = top_mlp;
+                snap.mlp_activation_rate = mlp_activation_rate;
+                snap.mlp_dead_neuron_count = dead_count;
+                snap.mlp_gate_sparsity = mlp_gate_sparsity;
+                snap.residual_norm_post = residual_norm_post;
+                snap.phase_coherence = coherence;
+
+                GLOBAL_COLLECTOR.record_neuron(snap);
+
+                // Flow event: layer completed
+                GLOBAL_COLLECTOR.record_flow(FlowEvent::now(
+                    FlowEventType::LayerCompleted {
+                        layer_idx,
+                        elapsed_us: trace.time_us as u64,
+                    },
+                    step_proxy,
+                ));
+            }
+
             // ── Send stimulus to orchestrator (experimental) ──────────────────
             #[cfg(feature = "experimental")]
             {
