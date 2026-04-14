@@ -239,6 +239,21 @@ pub struct GemvBf16F32Params<'a> {
     pub out: &'a AnyTensor,   // [n] F32 output
 }
 
+/// W8A32 GEMV — INT8 weights × F32 activations → F32 output.
+/// Weights are quantized symmetrically per-row: w_f32 = w_i8 * scale[row].
+/// Halves memory bandwidth vs BF16 GEMV (1 byte/weight vs 2 bytes).
+/// Theoretical speedup on RX 6750 XT: ~2× decode tok/s vs BF16 (weight BW bound).
+pub struct GemvW8A16Params<'a> {
+    pub n: usize,              // output dim (rows of W)
+    pub k: usize,              // input dim (cols of W)
+    pub w: &'a AnyTensor,     // [n, k] INT8 weights (row-major, stored as u8 on device)
+    pub scales: &'a AnyTensor, // [n] F32 per-row scales
+    pub x: &'a AnyTensor,     // [k] F32 activations
+    pub x_offset: usize,       // element offset into x (F32 elements)
+    pub out: &'a AnyTensor,   // [n] F32 output
+    pub beta: f32,             // 0.0 = overwrite; 1.0 = accumulate (residual add)
+}
+
 /// Fused RMSNorm + Q/K/V Q4K projection in one kernel.
 /// Eliminates Q8 intermediate tensor: saves 1 launch per attention layer.
 pub struct FusedRmsQkvQ4KF32Params<'a> {

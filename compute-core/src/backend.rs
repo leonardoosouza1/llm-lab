@@ -110,6 +110,12 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_bf16_f32        (&self, _p: &GemvBf16F32Params)      -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_bf16_f32".into()))
     }
+    /// W8A16 GEMV — INT8 weights × BF16 activations → F32 output (decode only).
+    /// Symmetric per-row quantization: w_f32 = w_i8 * scale[row].
+    /// ~2× memory bandwidth reduction vs BF16 → ~2× decode tok/s theoretically.
+    fn gemv_w8a16           (&self, _p: &GemvW8A16Params)        -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_w8a16".into()))
+    }
     /// Fused RMSNorm + Q/K/V Q4K projection — eliminates Q8 intermediate.
     /// Saves 1 kernel per attention layer (rms_norm_quantize + fused_qkv → single launch).
     fn fused_rms_qkv_q4k_f32(&self, _p: &FusedRmsQkvQ4KF32Params) -> Result<(), BackendError> {

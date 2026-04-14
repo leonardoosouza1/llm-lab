@@ -12,7 +12,7 @@ use compute_core::{
         KvCacheWhtAppendParams, KvCacheWhtReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
         KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
-        GemvTernaryF32Params,
+        GemvTernaryF32Params, GemvW8A16Params,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -65,6 +65,12 @@ fn u8_ptr(t: &AnyTensor) -> *const u8 {
     t.downcast_ref::<DeviceBuffer<u8>>()
         .expect("RocmBackend: expected Q4/u8 DeviceBuffer")
         .as_ptr()
+}
+
+/// Extract a read-only i8 device pointer from an `AnyTensor` (stored as u8 buffer).
+/// Used for W8A16 INT8 weights: data is uploaded as u8 bytes, cast to i8 for the kernel.
+fn i8_ptr(t: &AnyTensor) -> *const i8 {
+    u8_ptr(t) as *const i8
 }
 
 /// Extract a read-only i32 device pointer from an `AnyTensor`.
@@ -140,8 +146,8 @@ impl RocmBackend {
         let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
 
-        let use_wave64 = std::env::var("IARA_WAVE64").map(|v| v == "1").unwrap_or(false);
-        let use_flash_attn = std::env::var("IARA_FLASH_ATTN").map(|v| v == "1").unwrap_or(false);
+        let use_wave64 = std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
+        let use_flash_attn = std::env::var("IARA_FLASH_ATTN").map(|v| v != "0").unwrap_or(true);
         eprintln!("ROCm backend: using dedicated HIP stream + graph capture support{}{}",
             if use_wave64 { " + Wave64 GEMV" } else { "" },
             if use_flash_attn { " + Flash Attention 2" } else { "" });
@@ -579,10 +585,38 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_bf16_f32(&self, p: &GemvBf16F32Params) -> Result<(), BackendError> {
         let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        log::debug!("gemv_bf16_f32: wave64={}, n={}, k={}", self.use_wave64, p.n, p.k);
+        let result = if self.use_wave64 {
+            unsafe {
+                self.kernels.gemv_bf16_f32_w64(
+                    u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
+                    p.n as i32, p.k as i32,
+                )
+            }
+        } else {
+            unsafe {
+                self.kernels.gemv_bf16_f32_multi(
+                    u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
+                    p.n as i32, p.k as i32,
+                )
+            }
+        };
+        result.map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_w8a16(&self, p: &GemvW8A16Params) -> Result<(), BackendError> {
+        // W8A32 GEMV: INT8 weights × F32 activations → F32 (wave64 decode path)
+        // Supports beta=0 (overwrite) and beta=1 (residual accumulate).
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
         unsafe {
-            self.kernels.gemv_bf16_f32_multi(
-                u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
-                p.n as i32, p.k as i32,
+            self.kernels.gemv_i8_f32_w64(
+                i8_ptr(p.w),
+                f32_ptr(p.scales),
+                x_ptr,
+                f32_mut_ptr(p.out),
+                p.n as i32,
+                p.k as i32,
+                p.beta,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
