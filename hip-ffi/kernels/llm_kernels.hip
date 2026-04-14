@@ -4312,3 +4312,189 @@ extern "C" __global__ void gemv_ternary_f32_smem(
 #undef TERNARY_BLOCK
 #undef TERNARY_WARPS
 
+// ---------------------------------------------------------------------------
+// Kernel: gemv_ternary_f32_fast — Multi-row persistent ternary GEMV
+//
+// Optimized for decode (M=1) where the w32 kernel suffers from:
+//   1. x vector (6KB for K=1536) read N=8960 times (52MB redundant traffic)
+//   2. Only 32 threads/block → poor occupancy for small K
+//   3. 8960 tiny blocks = dispatch overhead dominates
+//
+// This kernel fixes all three:
+//   - Loads x into shared memory ONCE per block (8 warps cooperate)
+//   - 8 warps per block, each warp handles one row
+//   - Grid-stride loop: each block processes many rows
+//   - Grid = min(N/8, 40*8) ≈ 320 blocks → 8 blocks/CU on 40 CUs
+//
+// For K=1536: x = 6KB shared, weight row = 384 bytes global
+//   x traffic: 320 × 6KB = 1.9MB (vs 52MB in w32) = 27× reduction
+//   Weight traffic: unchanged 3.4MB (memory-bound on packed data)
+//
+// Grid : (n_blocks, M, 1) where n_blocks = min(ceil(N/8), 320)
+// Block: (256, 1, 1) = 8 warps
+// Shared: K * sizeof(float) + 8 * sizeof(float)
+// ---------------------------------------------------------------------------
+#define FAST_BLOCK 256
+#define FAST_WARPS 8
+#define FAST_ROWS_PER_BLOCK 8
+
+__launch_bounds__(FAST_BLOCK, 4)
+extern "C" __global__ void gemv_ternary_f32_fast(
+    const unsigned char* __restrict__ packed,  // [N, ceil(K/4)]
+    const float*         __restrict__ x,       // [M, K]
+    float*               __restrict__ out,     // [M, N]
+    int M,
+    int N,
+    int K,
+    float scale,
+    float beta
+) {
+    extern __shared__ float sx[];  // K floats + FAST_WARPS floats for reduction
+
+    const int tid  = (int)threadIdx.x;
+    const int mi   = (int)blockIdx.y;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    if (mi >= M) return;
+
+    // ── Load x into shared memory (all 256 threads cooperate) ───────────
+    const float* __restrict__ x_row = x + (size_t)mi * K;
+    for (int i = tid; i < K; i += FAST_BLOCK)
+        sx[i] = x_row[i];
+    __syncthreads();
+
+    const int packed_cols = (K + 3) >> 2;
+    const int n_u32 = packed_cols >> 2;
+
+    // ── Grid-stride loop: each iteration processes FAST_ROWS_PER_BLOCK rows ──
+    const int start_row = (int)blockIdx.x * FAST_ROWS_PER_BLOCK;
+    const int grid_stride = (int)gridDim.x * FAST_ROWS_PER_BLOCK;
+
+    for (int base_row = start_row; base_row < N; base_row += grid_stride) {
+        int row = base_row + warp;
+        if (row >= N) continue;
+
+        const uint32_t* __restrict__ p32 =
+            reinterpret_cast<const uint32_t*>(packed + (size_t)row * packed_cols);
+
+        float acc = 0.0f;
+
+        // Main vectorized loop: each lane reads 1 uint32 = 16 ternary weights
+        for (int i = lane; i < n_u32; i += 32) {
+            uint32_t word = p32[i];
+            int k_base = i * 16;
+
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                unsigned int bv = (word >> (b * 8)) & 0xFF;
+                int k0 = k_base + b * 4;
+                if (k0 >= K) break;
+
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    if (k0 + s < K) {
+                        unsigned int code = (bv >> (s * 2)) & 0x3u;
+                        // Inline ternary_acc for compiler optimization
+                        if (code == 0x2u)      acc += sx[k0 + s];
+                        else if (code == 0x0u)  acc -= sx[k0 + s];
+                    }
+                }
+            }
+        }
+
+        // Tail bytes (if packed_cols not multiple of 4)
+        const int tail_start = n_u32 * 4;
+        for (int bp = tail_start + lane; bp < packed_cols; bp += 32) {
+            unsigned int bv = (unsigned int)(packed + (size_t)row * packed_cols)[bp];
+            int k0 = bp * 4;
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                if (k0 + s < K) {
+                    unsigned int code = (bv >> (s * 2)) & 0x3u;
+                    if (code == 0x2u)      acc += sx[k0 + s];
+                    else if (code == 0x0u)  acc -= sx[k0 + s];
+                }
+            }
+        }
+
+        // Wave32 reduction (no LDS needed within warp)
+        for (int off = 16; off >= 1; off >>= 1)
+            acc += __shfl_down(acc, off);
+
+        // Write result (lane 0 of each warp)
+        if (lane == 0) {
+            const int out_idx = mi * N + row;
+            const float result = acc * scale;
+            out[out_idx] = (beta == 0.0f) ? result : __fmaf_rn(beta, out[out_idx], result);
+        }
+    }
+}
+
+#undef FAST_BLOCK
+#undef FAST_WARPS
+#undef FAST_ROWS_PER_BLOCK
+
+// ---------------------------------------------------------------------------
+// Kernel: cosine_sim_1d — Cosine similarity between two F32 vectors
+//
+// Computes: cos_sim = dot(a, b) / (||a|| * ||b|| + eps)
+// Used for online Block Influence (BI) measurement during decode:
+//   BI[layer] = 1 - cos_sim(x_before_layer, x_after_layer)
+//
+// For decode (n=1), vectors are [hidden_size] = 1536 floats.
+// Single warp (32 threads) with warp-shuffle reduction — no LDS needed.
+//
+// Grid : (1, 1, 1)
+// Block: (32, 1, 1)
+// ---------------------------------------------------------------------------
+__launch_bounds__(32, 32)
+extern "C" __global__ void cosine_sim_1d(
+    const float* __restrict__ a,     // [dim] F32
+    const float* __restrict__ b,     // [dim] F32
+    float*       __restrict__ out,   // [1] F32 — cosine similarity result
+    int dim
+) {
+    const int lane = (int)threadIdx.x;  // 0..31
+
+    float dot_ab = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+
+    for (int i = lane; i < dim; i += 32) {
+        float va = a[i];
+        float vb = b[i];
+        dot_ab += va * vb;
+        norm_a += va * va;
+        norm_b += vb * vb;
+    }
+
+    // Warp reduction (wave32 RDNA2)
+    for (int off = 16; off >= 1; off >>= 1) {
+        dot_ab += __shfl_down(dot_ab, off);
+        norm_a += __shfl_down(norm_a, off);
+        norm_b += __shfl_down(norm_b, off);
+    }
+
+    if (lane == 0) {
+        float denom = sqrtf(norm_a) * sqrtf(norm_b) + 1e-8f;
+        out[0] = dot_ab / denom;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: copy_f32 — Simple D2D memcpy for F32 tensors
+//
+// Used to snapshot hidden state before a layer for BI measurement.
+// Grid : (ceil(n / 256), 1, 1)
+// Block: (256, 1, 1)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void copy_f32(
+    const float* __restrict__ src,
+    float*       __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * 256 + (int)threadIdx.x;
+    if (idx < n) dst[idx] = src[idx];
+}
+

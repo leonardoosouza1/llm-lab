@@ -108,6 +108,10 @@ pub struct GpuKernels {
     // Ternary GEMV kernels (BitNet 1.58)
     fn_gemv_ternary_f32_w32: hipFunction_t,
     fn_gemv_ternary_f32_smem: hipFunction_t,
+    fn_gemv_ternary_f32_fast: hipFunction_t,
+    // Online BI measurement kernels (adaptive layer skip)
+    fn_cosine_sim_1d: hipFunction_t,
+    fn_copy_f32: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -198,6 +202,11 @@ impl GpuKernels {
         // Ternary GEMV kernels (BitNet 1.58 — resolved from main module)
         let fn_gemv_ternary_f32_w32 = get_fn!("gemv_ternary_f32_w32");
         let fn_gemv_ternary_f32_smem = get_fn!("gemv_ternary_f32_smem");
+        let fn_gemv_ternary_f32_fast = get_fn!("gemv_ternary_f32_fast");
+
+        // Online BI measurement kernels
+        let fn_cosine_sim_1d = get_fn!("cosine_sim_1d");
+        let fn_copy_f32 = get_fn!("copy_f32");
 
         Ok(Self {
             module,
@@ -259,6 +268,9 @@ impl GpuKernels {
             fn_gemv_q6k_q8_w64,
             fn_gemv_ternary_f32_w32,
             fn_gemv_ternary_f32_smem,
+            fn_gemv_ternary_f32_fast,
+            fn_cosine_sim_1d,
+            fn_copy_f32,
         })
     }
 
@@ -2919,6 +2931,63 @@ impl GpuKernels {
     // because L2 hit rate for x is high at small K). At K=8960 (35.8KB),
     // smem becomes competitive for M≥4.
     // ─────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_ternary_f32_fast — Multi-row persistent kernel with shared x
+    //
+    // 256 threads (8 warps), each warp handles one row.
+    // Grid-stride loop over all N rows.
+    // x loaded once per block into shared memory → 27× less x traffic.
+    //
+    // Grid : (n_blocks, M, 1) where n_blocks = min(ceil(N/8), 320)
+    // Block: (256, 1, 1)
+    // Shared: (K + 8) * sizeof(float) bytes
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemv_ternary_f32_fast(
+        &self,
+        packed: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale: f32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let rows_per_block = 8u32;
+        let n_blocks = (((n as u32) + rows_per_block - 1) / rows_per_block).min(320);
+        let grid  = (n_blocks, m.max(1) as u32, 1);
+        let block = (256u32, 1, 1);
+        let shared_bytes = ((k + 8) * 4) as u32;
+
+        let mut p_packed = packed;
+        let mut p_x      = x;
+        let mut p_out    = out;
+        let mut p_m      = m;
+        let mut p_n      = n;
+        let mut p_k      = k;
+        let mut p_scale  = scale;
+        let mut p_beta   = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_ternary_f32_fast,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_packed as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x      as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k      as *mut i32        as *mut std::ffi::c_void,
+                &mut p_scale  as *mut f32        as *mut std::ffi::c_void,
+                &mut p_beta   as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_ternary_f32(
         &self,
@@ -2932,9 +3001,71 @@ impl GpuKernels {
         beta: f32,
     ) -> Result<(), HipError> {
         if m <= 1 || k <= 6144 {
+            // Decode or small K: w32 wins (zero LDS, max occupancy, L2 caches x)
             self.gemv_ternary_f32_w32(packed, x, out, m, n, k, scale, beta)
+        } else if m <= 4 {
+            // Small prefill: fast kernel with shared x amortizes well
+            self.gemv_ternary_f32_fast(packed, x, out, m, n, k, scale, beta)
         } else {
+            // Large prefill: smem variant
             self.gemv_ternary_f32_smem(packed, x, out, m, n, k, scale, beta)
         }
+    }
+
+    // ── cosine_sim_1d — Online BI measurement ──────────────────────────────
+
+    /// Compute cosine similarity between two F32 vectors of length `dim`.
+    /// Result written to `out[0]`. Single warp kernel.
+    pub unsafe fn cosine_sim_1d(
+        &self,
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        dim: i32,
+    ) -> Result<(), HipError> {
+        let mut p_a = a;
+        let mut p_b = b;
+        let mut p_out = out;
+        let mut p_dim = dim;
+
+        hip_launch_kernel(
+            self.fn_cosine_sim_1d,
+            (1, 1, 1),
+            (32, 1, 1),
+            0,
+            self.stream,
+            &mut [
+                &mut p_a as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_b as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_dim as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Copy `n` floats from `src` to `dst` on device.
+    pub unsafe fn copy_f32(
+        &self,
+        src: *const f32,
+        dst: *mut f32,
+        n: i32,
+    ) -> Result<(), HipError> {
+        let grid_x = ((n as u32) + 255) / 256;
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_n = n;
+
+        hip_launch_kernel(
+            self.fn_copy_f32,
+            (grid_x, 1, 1),
+            (256, 1, 1),
+            0,
+            self.stream,
+            &mut [
+                &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
     }
 }

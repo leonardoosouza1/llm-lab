@@ -243,6 +243,19 @@ pub trait ComputeBackend: Send + Sync + 'static {
         Err(BackendError::NotImplemented("gpu_argmax".into()))
     }
 
+    // ── Online BI measurement (adaptive layer skip) ───────────────────────────
+
+    /// Compute cosine similarity between two F32 vectors (1D, length = dim).
+    /// Writes result to `out[0]`. Used for Block Influence measurement.
+    fn cosine_sim_1d(&self, _a: &AnyTensor, _b: &AnyTensor, _out: &AnyTensor, _dim: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("cosine_sim_1d".into()))
+    }
+
+    /// Copy F32 tensor data on device (D2D). Used to snapshot hidden state before layer.
+    fn copy_f32_d2d(&self, _src: &AnyTensor, _dst: &AnyTensor, _n: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("copy_f32_d2d".into()))
+    }
+
     // ── Graph capture (HIP graphs / CUDA graphs) ──────────────────────────────
 
     /// Begin capturing kernel launches into a graph (instead of executing them).

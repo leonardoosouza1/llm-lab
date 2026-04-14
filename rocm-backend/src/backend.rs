@@ -203,6 +203,12 @@ impl ComputeBackend for RocmBackend {
         AnyTensor::new(Arc::new(buf), shape.to_vec(), DType::Q4)
     }
 
+    fn upload_ternary(&self, packed: &[u8], shape: &[usize]) -> AnyTensor {
+        // Upload ternary packed data (4 weights per byte, 2 bits each) as raw u8 on device.
+        let buf = DeviceBufferU8::from_slice(packed).unwrap();
+        AnyTensor::new(Arc::new(buf), shape.to_vec(), DType::Q4) // reuse Q4 tag for u8 storage
+    }
+
     fn upload_i32(&self, data: &[i32], shape: &[usize]) -> AnyTensor {
         let buf = DeviceBuffer::<i32>::from_slice(data).unwrap();
         // Reuse F32 dtype tag — the kernel treats it as i32 via raw pointer
@@ -940,6 +946,31 @@ impl ComputeBackend for RocmBackend {
         Ok(result[0])
     }
 
+    // ── Online BI measurement (adaptive layer skip) ────────────────────────────
+
+    fn cosine_sim_1d(&self, a: &AnyTensor, b: &AnyTensor, out: &AnyTensor, dim: usize) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.cosine_sim_1d(
+                f32_ptr(a),
+                f32_ptr(b),
+                f32_mut_ptr(out),
+                dim as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn copy_f32_d2d(&self, src: &AnyTensor, dst: &AnyTensor, n: usize) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.copy_f32(
+                f32_ptr(src),
+                f32_mut_ptr(dst),
+                n as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     // ── HIP Graph capture (trait override) ────────────────────────────────────
 
     fn begin_graph_capture(&self) -> bool {
@@ -962,18 +993,33 @@ impl ComputeBackend for RocmBackend {
             return false;
         }
         unsafe {
+            let t0 = std::time::Instant::now();
             let graph = match hip_ffi::hip_stream_end_capture(self.stream) {
                 Ok(g) => g,
                 Err(e) => { eprintln!("graph capture end failed: {}", e); return false; }
             };
+            let capture_us = t0.elapsed().as_micros();
             let mut exec_guard = self.graph_exec.lock().unwrap();
-            let exec = if let Some(existing) = exec_guard.as_ref() {
+            let (exec, method) = if let Some(existing) = exec_guard.as_ref() {
                 match hip_ffi::hip_graph_exec_update(*existing, graph) {
-                    Ok(true) => *existing,
-                    _ => {
+                    Ok(true) => (*existing, "update"),
+                    Ok(false) => {
                         let _ = hip_ffi::hip_graph_exec_destroy(*existing);
                         match hip_ffi::hip_graph_instantiate(graph) {
-                            Ok(e) => e,
+                            Ok(e) => (e, "re-instantiate(update-rejected)"),
+                            Err(err) => {
+                                eprintln!("graph instantiate failed: {}", err);
+                                let _ = hip_ffi::hip_graph_destroy(graph);
+                                *exec_guard = None;
+                                return false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("graph exec update error: {}", e);
+                        let _ = hip_ffi::hip_graph_exec_destroy(*existing);
+                        match hip_ffi::hip_graph_instantiate(graph) {
+                            Ok(e) => (e, "re-instantiate(update-error)"),
                             Err(err) => {
                                 eprintln!("graph instantiate failed: {}", err);
                                 let _ = hip_ffi::hip_graph_destroy(graph);
@@ -985,7 +1031,7 @@ impl ComputeBackend for RocmBackend {
                 }
             } else {
                 match hip_ffi::hip_graph_instantiate(graph) {
-                    Ok(e) => e,
+                    Ok(e) => (e, "first-instantiate"),
                     Err(err) => {
                         eprintln!("graph instantiate failed: {}", err);
                         let _ = hip_ffi::hip_graph_destroy(graph);
@@ -993,9 +1039,32 @@ impl ComputeBackend for RocmBackend {
                     }
                 }
             };
+            let prep_us = t0.elapsed().as_micros();
             *exec_guard = Some(exec);
             let launch_ok = hip_ffi::hip_graph_launch(exec, self.stream).is_ok();
+            let total_us = t0.elapsed().as_micros();
             let _ = hip_ffi::hip_graph_destroy(graph);
+
+            // Log graph overhead periodically
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static GRAPH_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+            static GRAPH_UPDATE_OK: AtomicU64 = AtomicU64::new(0);
+            static GRAPH_REINSTANTIATE: AtomicU64 = AtomicU64::new(0);
+            static GRAPH_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+            let gc = GRAPH_CALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            GRAPH_TOTAL_US.fetch_add(total_us as u64, Ordering::Relaxed);
+            if method == "update" {
+                GRAPH_UPDATE_OK.fetch_add(1, Ordering::Relaxed);
+            } else if method.starts_with("re-instantiate") {
+                GRAPH_REINSTANTIATE.fetch_add(1, Ordering::Relaxed);
+            }
+            if gc <= 3 || gc % 50 == 0 {
+                let avg = GRAPH_TOTAL_US.load(Ordering::Relaxed) as f64 / gc as f64;
+                let updates = GRAPH_UPDATE_OK.load(Ordering::Relaxed);
+                let reins = GRAPH_REINSTANTIATE.load(Ordering::Relaxed);
+                eprintln!("GRAPH [#{gc}] {method}: capture={capture_us}µs prep={prep_us}µs launch={total_us}µs | avg={avg:.0}µs | updates={updates} reins={reins}");
+            }
+
             launch_ok
         }
     }
