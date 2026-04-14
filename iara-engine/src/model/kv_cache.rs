@@ -24,10 +24,10 @@ impl KvCacheMode {
     pub fn detect() -> Self {
         if std::env::var("IARA_KV_WHT").map(|v| v == "1").unwrap_or(false) {
             Self::Wht
-        } else if std::env::var("IARA_KV_INT8").is_ok() {
-            Self::Int8
-        } else {
+        } else if std::env::var("IARA_KV_INT8").map(|v| v == "0").unwrap_or(false) {
             Self::F32
+        } else {
+            Self::Int8
         }
     }
 }

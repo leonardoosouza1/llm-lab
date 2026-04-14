@@ -26,6 +26,7 @@ use compute_core::{
     GemmBf16Params, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
     AddBiasParams, GemvQ4Params, GemvQ4KParams, GemvQ6KParams, FusedAttentionDecodeParams,
+    GemvW8A16Params,
 };
 use half::bf16;
 use std::collections::HashMap;
@@ -559,6 +560,10 @@ pub enum LayerWeight {
     /// Encoding: -1=0b00, 0=0b01, +1=0b10. HIP kernel: pure add/sub, zero multiplies.
     /// Stores (packed_data, n_rows, k_dim, per_tensor_scale).
     Ternary { data: AnyTensor, n: usize, k: usize, scale: f32 },
+    /// W8A32 quantization: INT8 weights (symmetric per-row) × F32 activations.
+    /// Halves weight memory bandwidth vs BF16: 1 byte/weight → ~2× decode speed.
+    /// Quantized from BF16 at load time via quantize_w8_to_gpu().
+    W8 { data: AnyTensor, scales: AnyTensor, n: usize, k: usize },
 }
 
 impl LayerWeight {
@@ -573,6 +578,7 @@ impl LayerWeight {
             LayerWeight::Q4K { n, k, .. } => n * (k / 256) * 144,
             LayerWeight::Q6K { n, k, .. } => n * (k / 256) * 210,
             LayerWeight::Ternary { n, k, .. } => n * ((k + 3) / 4), // 2 bits/weight
+            LayerWeight::W8 { n, k, .. } => n * k + n * 4,          // 1 byte/weight + 4 bytes scale/row
         }
     }
 }
@@ -647,7 +653,41 @@ pub struct CausalLM {
 impl CausalLM {
     /// Helper: faz projeção com pesos BF16 ou Q4 quantizados.
     /// Despacha para backend.gemm_bf16_f32 ou backend.gemv_q4 conforme necessário.
-    /// Se q8_scratch é Some, usa dp4a path (quantize x → Q8_1, then integer GEMV).
+    /// Quantize a BF16 weight matrix to INT8 symmetric per-row on the CPU,
+    /// then upload both the INT8 weights and per-row F32 scales to the GPU.
+    ///
+    /// Formula: scale[r] = max_abs(row[r]) / 127.0
+    ///          q[r][c]  = round(w[r][c] / scale[r]).clamp(-127, 127)
+    ///
+    /// Returns a `LayerWeight::W8` ready for decode.
+    pub fn quantize_w8_to_gpu(
+        backend: &Arc<dyn ComputeBackend>,
+        w_bf16: &[half::bf16],
+        rows: usize,
+        cols: usize,
+    ) -> LayerWeight {
+        let mut q = vec![0u8; rows * cols]; // stored as u8, interpreted as i8 by kernel
+        let mut scales = vec![0f32; rows];
+        for r in 0..rows {
+            let row = &w_bf16[r * cols..(r + 1) * cols];
+            let max_abs = row.iter()
+                .map(|x| x.to_f32().abs())
+                .fold(0f32, f32::max);
+            let scale = if max_abs > 0.0 { max_abs / 127.0f32 } else { 1.0f32 };
+            scales[r] = scale;
+            let inv_scale = 1.0f32 / scale;
+            for (c, &v) in row.iter().enumerate() {
+                let quantized = (v.to_f32() * inv_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8 as u8;
+                q[r * cols + c] = quantized;
+            }
+        }
+        let data_tensor = backend.upload_raw(&q, &[rows * cols]);
+        let scales_tensor = backend.upload_f32(&scales, &[rows]);
+        LayerWeight::W8 { data: data_tensor, scales: scales_tensor, n: rows, k: cols }
+    }
+
     /// Quantize input activations to Q8_1 format for dp4a GEMV.
     /// Call once before a batch of project_q8() calls that share the same input.
     fn quantize_input_q8(
@@ -685,6 +725,7 @@ impl CausalLM {
                     LayerWeight::Q4K { .. } => "Q4K",
                     LayerWeight::Q6K { .. } => "Q6K",
                     LayerWeight::Ternary { .. } => "Ternary",
+                    LayerWeight::W8 { .. } => "W8",
                 };
                 log::warn!("project() first call: weight={}, m={}, n={}, k={}, q8_scratch={}, precomputed={}",
                     wtype, m, n, k, q8_scratch.is_some(), q8_precomputed);
@@ -766,9 +807,16 @@ impl CausalLM {
                         m, n, k, data, x_q8: q8, out: output, beta,
                     })?;
                 } else {
-                    static Q4K_SLOW_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !Q4K_SLOW_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        log::warn!("Q4K path: SLOW dequant_gemv (m={}, n={}, k={}, q8_scratch={}, m==1={})", m, n, k, q8_scratch.is_some(), m == 1);
+                    // SLOW path: used during prefill (m>1, no batched Q4K GEMM) or when
+                    // q8_scratch is unavailable (IARA_GGUF_NATIVE=0).
+                    // Only warn on decode (m==1) with missing q8_scratch — genuine fallback.
+                    if m == 1 && q8_scratch.is_none() {
+                        static Q4K_SLOW_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !Q4K_SLOW_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("Q4K path: SLOW dequant_gemv during decode (m=1, q8_scratch=None). \
+                                Set IARA_GGUF_NATIVE=1 (default) to enable fast Wave64 Q8 dp4a path. \
+                                (n={}, k={})", n, k);
+                        }
                     }
                     backend.gemv_q4k(&GemvQ4KParams {
                         m,
@@ -813,6 +861,33 @@ impl CausalLM {
                     x_offset: a_offset,
                     out: output,
                     scale: *scale,
+                    beta,
+                })?;
+            }
+            LayerWeight::W8 { data, scales, n: _, k: _ } => {
+                // W8A32 GEMV: INT8 weights × F32 activations → F32.
+                // Supports decode (m=1) with any beta (0=overwrite, 1=residual accumulate).
+                // For prefill (m>1): W8 batched GEMM not yet implemented — return error.
+                if m != 1 {
+                    static W8_PREFILL_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !W8_PREFILL_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!("W8 prefill (m={}) not supported — W8 models require short prompts (m=1 decode only)", m);
+                    }
+                    return Err(ModelError::Model(format!(
+                        "W8 weight does not support prefill GEMM (m={}) — use BF16 or Q4K models for long prompts", m
+                    )));
+                }
+                static W8_GEMV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !W8_GEMV_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("W8 GEMV: INT8 weights × F32 activations (m={}, n={}, k={}, beta={}) — ~2× BW vs BF16", m, n, k, beta);
+                }
+                backend.gemv_w8a16(&GemvW8A16Params {
+                    n, k,
+                    w: data,
+                    scales,
+                    x: input,
+                    x_offset: a_offset,
+                    out: output,
                     beta,
                 })?;
             }
@@ -964,6 +1039,40 @@ impl CausalLM {
             backend.upload_f32(data, &[data.len()])
         };
 
+        // ── W8 quantization mode ─────────────────────────────────────────────
+        // IARA_W8=1: quantize BF16 weights to INT8 symmetric per-row during load.
+        // Halves weight memory bandwidth → ~2× decode tok/s vs BF16.
+        // Only for BF16 safetensors models; GGUF Q4K/Q6K models already quantized.
+        let use_w8 = std::env::var("IARA_W8").map(|v| v == "1").unwrap_or(false);
+        if use_w8 {
+            log::warn!("W8 quantization enabled (IARA_W8=1): BF16 weights → INT8 per-row on load");
+        }
+
+        // Helper: load tensor as BF16 and return as LayerWeight (W8 or BF16 depending on mode)
+        let load_layer_weight = |name: &str, rows: usize, cols: usize| -> ModelResult<LayerWeight> {
+            if use_w8 {
+                // Load BF16 tensor and quantize to INT8 on CPU, then upload both to GPU
+                let mmap = find_mmap(name)
+                    .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+                let (raw_bytes, _shape) = shard_tensor_bytes(mmap, name)?;
+                let w_bits = unsafe {
+                    std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2)
+                };
+                // Convert u16 BF16 bits → half::bf16 slice
+                let w_bf16: Vec<bf16> = w_bits.iter().map(|&b| bf16::from_bits(b)).collect();
+                Ok(CausalLM::quantize_w8_to_gpu(&backend, &w_bf16, rows, cols))
+            } else {
+                // Standard BF16 upload
+                let mmap = find_mmap(name)
+                    .ok_or_else(|| ModelError::Model(format!("'{}' não encontrado", name)))?;
+                let (raw_bytes, shape) = shard_tensor_bytes(mmap, name)?;
+                let bits = unsafe {
+                    std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2)
+                };
+                Ok(LayerWeight::Bf16(backend.upload_bf16(bits, &shape)))
+            }
+        };
+
         // ── Nomes de tensores (via architecture descriptor) ─────────────────
         let tmap = &arch.tensor_map;
 
@@ -974,6 +1083,12 @@ impl CausalLM {
         // ── Camadas ──────────────────────────────────────────────────────────
         let kv_dim  = cfg.num_kv_heads * cfg.head_dim;
         let max_seq = cfg.max_seq_len;
+
+        // Weight shapes for W8 quantization
+        let h = cfg.hidden_size;
+        let q_dim   = cfg.num_heads * cfg.head_dim;
+        let kv_dim_w = kv_dim; // num_kv_heads * head_dim
+        let inter   = cfg.intermediate_size;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -990,13 +1105,13 @@ impl CausalLM {
             let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
 
             layers.push(TransformerLayer {
-                wq:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_q))?),
-                wk:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_k))?),
-                wv:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_v))?),
-                wo:    LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.attn_o))?),
-                wgate: LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_gate))?),
-                wup:   LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_up))?),
-                wdown: LayerWeight::Bf16(gpu(&tmap.layer_tensor(i, &tmap.mlp_down))?),
+                wq:    load_layer_weight(&tmap.layer_tensor(i, &tmap.attn_q),    q_dim,    h)?,
+                wk:    load_layer_weight(&tmap.layer_tensor(i, &tmap.attn_k),    kv_dim_w, h)?,
+                wv:    load_layer_weight(&tmap.layer_tensor(i, &tmap.attn_v),    kv_dim_w, h)?,
+                wo:    load_layer_weight(&tmap.layer_tensor(i, &tmap.attn_o),    h,        q_dim)?,
+                wgate: load_layer_weight(&tmap.layer_tensor(i, &tmap.mlp_gate),  inter,    h)?,
+                wup:   load_layer_weight(&tmap.layer_tensor(i, &tmap.mlp_up),    inter,    h)?,
+                wdown: load_layer_weight(&tmap.layer_tensor(i, &tmap.mlp_down),  h,        inter)?,
                 q_bias: match &qbn {
                     Some(name) if tensor_exists(name) => Some(gpu_f32(&load_f32(name)?.0)),
                     _ => None,
@@ -1365,6 +1480,7 @@ impl CausalLM {
                 LayerWeight::Q6K { n, k, .. } => log::info!("  L0.wq Q6K native [{}×{}]", n, k),
                 LayerWeight::Q4(_) => log::info!("  L0.wq Q4 (IARA quantized)"),
                 LayerWeight::Ternary { n, k, scale, .. } => log::info!("  L0.wq Ternary [{}×{}] scale={:.4}", n, k, scale),
+                LayerWeight::W8 { n, k, .. } => log::info!("  L0.wq W8 INT8 [{}×{}]", n, k),
             }
 
             // Check layer 0 input_norm (F32)
@@ -2471,6 +2587,7 @@ impl CausalLM {
 
     fn forward_inner(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>, skip_logits_download: bool, skip_embed: bool) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
         let _fwd_t0 = std::time::Instant::now();
+        #[cfg(feature = "rocm")]
         hip_ffi::safe::reset_launch_count();
         let n    = token_ids.len();
         let h    = self.cfg.hidden_size;
@@ -2543,7 +2660,7 @@ impl CausalLM {
         static PROF_FINAL: AtomicU64 = AtomicU64::new(0);  // final norm + lm_head
         static PROF_DONE: AtomicBool = AtomicBool::new(false);
         let tok_num = PROF_TOKEN.fetch_add(1, AO::Relaxed);
-        let do_section_prof = false; // DISABLED — use GREEDY timing for benchmarks
+        let do_section_prof = std::env::var("IARA_SECTION_PROF").map(|v| v == "1").unwrap_or(false);
         // Also keep old profile for backwards compat
         let do_profile = false;
         let forward_t0: Option<std::time::Instant> = None;
@@ -3590,7 +3707,10 @@ impl CausalLM {
             // download_f32 é um sync implícito que para o pipeline GPU.
             // Telemetry is ZERO-COST when disabled (default). Enable via
             // model.telemetry_enabled = true when the dashboard needs live traces.
-            let should_sample = self.telemetry_enabled && n <= 1 && (layer_idx % 8 == 0 || layer_idx == n_layers - 1);
+            // When telemetry_enabled, sample EVERY layer (not just every 12th).
+            // The % 12 sampling was for low-overhead background collection;
+            // neuroviz explicitly enables telemetry and needs all layers.
+            let should_sample = self.telemetry_enabled && n <= 1;
 
             let trace = if should_sample {
                 let x_data = self.backend.download_f32(&self.scratch.x);
@@ -3623,6 +3743,22 @@ impl CausalLM {
                     .map(|(i, _)| i)
                     .collect();
 
+                // Phase coherence: Kuramoto order parameter from hidden state pairs
+                let phase_coherence = iara_observe::phase_coherence_from(
+                    &token_data[..h.min(token_data.len())],
+                );
+
+                // MLP activation rate: fraction of gate neurons with |act| > threshold
+                // Download gate scratch (SiLU(gate)*up) for this layer
+                let gate_data = self.backend.download_f32(&self.scratch.gate);
+                let n_neurons = gate_data.len().min(it);
+                let mlp_activation_rate = if n_neurons > 0 {
+                    let alive = gate_data[..n_neurons].iter().filter(|&&v| v.abs() > 1e-6).count();
+                    alive as f32 / n_neurons as f32 * 100.0
+                } else {
+                    0.0
+                };
+
                 LayerTrace {
                     layer_idx,
                     attention_energy: residual_norm * 0.6,
@@ -3631,6 +3767,8 @@ impl CausalLM {
                     max_activation,
                     hot_neurons: hot,
                     time_us: 0,
+                    phase_coherence,
+                    mlp_activation_rate,
                 }
             } else {
                 LayerTrace {
@@ -3641,18 +3779,21 @@ impl CausalLM {
                     max_activation: 0.0,
                     hot_neurons: vec![],
                     time_us: 0,
+                    phase_coherence: 0.0,
+                    mlp_activation_rate: 0.0,
                 }
             };
 
             layer_traces.push(trace.clone());
 
             // ── iara-observe: real neuron snapshot (sampled, decode-only) ─────
-            // Gate: same cadence as LayerTrace (every 8 layers + last).
+            // Gate: same cadence as LayerTrace (every 12 layers + last).
             // Downloads gate activations (SiLU(gate)*up) from GPU → CPU.
             // ZERO-COST when iara_observe::GLOBAL_COLLECTOR is disabled.
             if should_sample {
                 use iara_observe::{GLOBAL_COLLECTOR, NeuronSnapshot, FlowEvent, FlowEventType};
 
+                if GLOBAL_COLLECTOR.is_enabled() {
                 // Download gate tensor (contains SiLU(gate)*up post-activation)
                 let gate_data = self.backend.download_f32(&self.scratch.gate);
                 let n_neurons = gate_data.len().min(it);
@@ -3721,6 +3862,7 @@ impl CausalLM {
                     },
                     step_proxy,
                 ));
+                } // end if GLOBAL_COLLECTOR.is_enabled()
             }
 
             // ── Send stimulus to orchestrator (experimental) ──────────────────
@@ -3823,11 +3965,11 @@ impl CausalLM {
             let _elapsed = _sec_t0.elapsed().as_micros() as u64;
             PROF_FINAL.fetch_add(_elapsed, AO::Relaxed);
         }
-        // Report section profiling after 3 profiled tokens
+        // Report section profiling after 14 tokens (tok_num 0-13)
         if tok_num == 13 && !PROF_DONE.swap(true, AO::Relaxed) {
-            let div = 10.0;  // 10 profiled decode tokens
+            let div = 14.0;  // 14 accumulated decode tokens (tok_num 0..=13)
             let n_layers = self.layers.len() as f64;
-            log::warn!("=== SECTION PROFILE (avg of 3 tokens, {}µs per section per token) ===", "all layers summed");
+            log::warn!("=== SECTION PROFILE (avg of 14 tokens, all layers summed, µs per token) ===");
             log::warn!("  NORM+Q8:   {:>7.0}µs  ({:.0}µs/layer)", PROF_NORM.load(AO::Relaxed) as f64 / div, PROF_NORM.load(AO::Relaxed) as f64 / div / n_layers);
             log::warn!("  QKV proj:  {:>7.0}µs  ({:.0}µs/layer)", PROF_QKV.load(AO::Relaxed) as f64 / div, PROF_QKV.load(AO::Relaxed) as f64 / div / n_layers);
             log::warn!("  ROPE+KV:   {:>7.0}µs  ({:.0}µs/layer)", PROF_ROPE_KV.load(AO::Relaxed) as f64 / div, PROF_ROPE_KV.load(AO::Relaxed) as f64 / div / n_layers);
@@ -3865,7 +4007,10 @@ impl CausalLM {
             let count = TOKEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             ACCUM_US.fetch_add(total_us, Ordering::Relaxed);
             CPU_DISPATCH_US.fetch_add(dispatch_us, Ordering::Relaxed);
+            #[cfg(feature = "rocm")]
             let launches = hip_ffi::safe::get_launch_count();
+            #[cfg(not(feature = "rocm"))]
+            let launches = 0u64;
             if count % 50 == 0 {
                 let avg_total = ACCUM_US.load(Ordering::Relaxed) as f64 / count as f64;
                 let avg_dispatch = CPU_DISPATCH_US.load(Ordering::Relaxed) as f64 / count as f64;
@@ -3899,6 +4044,7 @@ impl CausalLM {
         })?;
 
         let greedy_t0 = std::time::Instant::now();
+        #[cfg(feature = "rocm")]
         hip_ffi::safe::reset_launch_count();
 
         // HIP Graph capture for ternary decode:
@@ -3921,7 +4067,10 @@ impl CausalLM {
         // Forward pass WITHOUT embed (already done above)
         let _ = self.forward_inner(token_ids, None, true, true)?;
         let dispatch_us = greedy_t0.elapsed().as_micros();
+        #[cfg(feature = "rocm")]
         let launches_this_token = hip_ffi::safe::get_launch_count();
+        #[cfg(not(feature = "rocm"))]
+        let launches_this_token = 0u64;
 
         // End capture + launch graph (no-op if use_graph=false)
         if use_graph {
