@@ -30,6 +30,10 @@ pub struct LayerTrace {
     pub hot_neurons: Vec<usize>,
     /// Microsegundos estimados nesta camada (forward total / num_layers)
     pub time_us: u128,
+    /// Kuramoto phase coherence R ∈ [0,1] computed from hidden state
+    pub phase_coherence: f32,
+    /// Fraction of MLP neurons with |activation| > threshold (0.0-100.0)
+    pub mlp_activation_rate: f32,
 }
 
 /// Resultado completo de um step de geração com telemetria.

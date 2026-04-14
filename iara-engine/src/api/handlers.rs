@@ -95,6 +95,7 @@ pub struct GenerateResponse {
     pub prompt_eval_count: u32,
     pub eval_count: u32,
     pub eval_duration: u128,
+    pub tokens_per_second: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -837,6 +838,9 @@ pub async fn generate_handler(
                         result.generated_tokens, result.eval_ms,
                         result.generated_tokens as f64 / (result.eval_ms.max(1) as f64 / 1000.0));
 
+                    let tok_per_sec = if result.eval_ms > 0 {
+                        result.generated_tokens as f64 * 1000.0 / result.eval_ms as f64
+                    } else { 0.0 };
                     let response = GenerateResponse {
                         model: req.model.clone(),
                         created_at: chrono::Utc::now().to_rfc3339(),
@@ -847,6 +851,7 @@ pub async fn generate_handler(
                         prompt_eval_count: result.prompt_tokens as u32,
                         eval_count: result.generated_tokens as u32,
                         eval_duration: result.eval_ms,
+                        tokens_per_second: tok_per_sec,
                     };
                     return (StatusCode::OK, Json(response)).into_response();
                 }
@@ -1054,6 +1059,9 @@ async fn generate_internal(
     *state.last_trace.lock().await = Some(brain_trace);
 
     let total_duration = start_time.elapsed();
+    let tok_per_sec = if decode_ms > 0 {
+        eval_count as f64 * 1000.0 / decode_ms as f64
+    } else { 0.0 };
     Ok(GenerateResponse {
         model: req.model.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1064,6 +1072,7 @@ async fn generate_internal(
         prompt_eval_count,
         eval_count,
         eval_duration: decode_ms,
+        tokens_per_second: tok_per_sec,
     })
 }
 
@@ -1301,7 +1310,7 @@ pub struct NeurovizRequest {
     pub sample_every: usize,
 }
 
-fn default_viz_max_tokens() -> usize { 1 }
+fn default_viz_max_tokens() -> usize { 30 }
 fn default_viz_sample_every() -> usize { 2 }
 
 /// Per-neuron data for one layer at one token step
@@ -1344,6 +1353,8 @@ pub struct TokenViz {
 #[derive(Serialize)]
 pub struct NeurovizResponse {
     pub prompt: String,
+    /// The full generated text (all generated tokens concatenated)
+    pub generated_text: String,
     pub tokens: Vec<TokenViz>,
     pub model_info: NeurovizModelInfo,
     pub session_id: String,
@@ -1380,118 +1391,257 @@ pub async fn neuroviz_handler(
             Json(serde_json::json!({"error": "empty prompt"}))).into_response();
     }
 
-    // Pull model info + reset cache, then run forward pass
-    let (model_info, logits, layer_traces, last_token_id, max_tokens) = {
+    // ── Try native qwen_model path first ─────────────────────────────────────
+    {
         let mut guard = state.qwen_model.lock().await;
-        let model = match guard.as_mut() {
-            Some(m) => m,
-            None => return (StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "no model loaded"}))).into_response(),
-        };
+        if let Some(model) = guard.as_mut() {
+            let model_info = NeurovizModelInfo {
+                num_layers:        model.cfg.num_layers,
+                hidden_size:       model.cfg.hidden_size,
+                intermediate_size: model.cfg.intermediate_size,
+                num_heads:         model.cfg.num_heads,
+                num_kv_heads:      model.cfg.num_kv_heads,
+                vocab_size:        model.cfg.vocab_size,
+            };
+            let vocab_size = model.cfg.vocab_size;
+            let max_tokens = req.max_tokens.min(64);
 
-        let model_info = NeurovizModelInfo {
-            num_layers:        model.cfg.num_layers,
-            hidden_size:       model.cfg.hidden_size,
-            intermediate_size: model.cfg.intermediate_size,
-            num_heads:         model.cfg.num_heads,
-            num_kv_heads:      model.cfg.num_kv_heads,
-            vocab_size:        model.cfg.vocab_size,
-        };
-        let vocab_size = model.cfg.vocab_size;
-        let max_tokens = req.max_tokens.min(64);
+            model.reset_cache();
 
-        model.reset_cache();
+            // Bug 2 fix: enable telemetry so layer traces are populated (not all zeros)
+            model.telemetry_enabled = true;
 
-        // Prefill: run all tokens except the last in a single batched forward pass
-        if prompt_ids.len() > 1 {
-            if let Err(e) = model.forward(&prompt_ids[..prompt_ids.len() - 1], None) {
-                return (StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("prefill error: {e}")}))).into_response();
+            // Prefill: run all tokens except the last in a single batched forward pass
+            if prompt_ids.len() > 1 {
+                if let Err(e) = model.forward(&prompt_ids[..prompt_ids.len() - 1], None) {
+                    model.telemetry_enabled = false;
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("prefill error: {e}")}))).into_response();
+                }
             }
-        }
 
-        // Last prompt token — this gives us logits + layer traces
-        let last_id = *prompt_ids.last().unwrap();
-        let (logits, layer_traces) = match model.forward(&[last_id], None) {
-            Ok(v) => v,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("forward error: {e}")}))).into_response(),
-        };
-
-        (model_info, logits, layer_traces, last_id, max_tokens)
-    };
-
-    let vocab_size = model_info.vocab_size;
-
-    // Build TokenViz for the last prompt token
-    let mut result_tokens: Vec<TokenViz> = Vec::new();
-    let last_token_str = crate::tokenizer::token_id_to_text(last_token_id);
-    result_tokens.push(build_neuroviz_token(
-        last_token_id,
-        &last_token_str,
-        prompt_ids.len() - 1,
-        &layer_traces,
-        &logits,
-        vocab_size,
-    ));
-
-    // Generate up to max_tokens additional tokens with telemetry
-    if max_tokens > 1 {
-        let mut decode_token = {
-            // Pick top-1 greedy token from logits
-            logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(last_token_id)
-        };
-
-        let eos_ids = {
-            let guard = state.qwen_model.lock().await;
-            guard.as_ref().map(|m| m.arch.eos_token_ids.clone()).unwrap_or_default()
-        };
-
-        for step in 1..max_tokens {
-            if eos_ids.contains(&decode_token) { break; }
-
-            let (step_logits, step_traces) = {
-                let mut guard = state.qwen_model.lock().await;
-                let model = match guard.as_mut() {
-                    Some(m) => m,
-                    None => break,
-                };
-                match model.forward(&[decode_token], None) {
-                    Ok(v) => v,
-                    Err(_) => break,
+            // Last prompt token — this gives us logits + layer traces
+            let last_id = *prompt_ids.last().unwrap();
+            let (logits, layer_traces) = match model.forward(&[last_id], None) {
+                Ok(v) => v,
+                Err(e) => {
+                    model.telemetry_enabled = false;
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("forward error: {e}")}))).into_response();
                 }
             };
 
-            let tok_str = crate::tokenizer::token_id_to_text(decode_token);
+            // Restore telemetry state to default (off) to avoid perf impact in generate
+            model.telemetry_enabled = false;
+
+            // Build TokenViz entries — add all prompt tokens first (simplified, no layer data)
+            let mut result_tokens: Vec<TokenViz> = Vec::new();
+            let mut generated_text = String::new();
+
+            // Prompt tokens (all except last): simplified entries with no layer traces
+            for (pos, &pid) in prompt_ids[..prompt_ids.len()-1].iter().enumerate() {
+                let tok_str = crate::tokenizer::token_id_to_text(pid);
+                result_tokens.push(TokenViz {
+                    token_id: pid,
+                    token_str: tok_str,
+                    position: pos,
+                    layers: vec![],  // no telemetry for prefill tokens (perf)
+                    top_logits: vec![],
+                    confidence: 0.0,
+                    logit_entropy: 0.0,
+                });
+            }
+
+            // Last prompt token: full layer traces + logits
+            let last_token_str = crate::tokenizer::token_id_to_text(last_id);
             result_tokens.push(build_neuroviz_token(
-                decode_token,
-                &tok_str,
-                prompt_ids.len() + step - 1,
-                &step_traces,
-                &step_logits,
+                last_id,
+                &last_token_str,
+                prompt_ids.len() - 1,
+                &layer_traces,
+                &logits,
                 vocab_size,
             ));
 
-            // Greedy next token
-            decode_token = step_logits.iter().enumerate()
+            // Greedy decode: first generated token
+            let mut decode_token = logits.iter().enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+                .unwrap_or(last_id);
+
+            let eos_ids = model.arch.eos_token_ids.clone();
+
+            // Generate up to max_tokens tokens with full telemetry
+            for step in 0..max_tokens {
+                if eos_ids.contains(&decode_token) { break; }
+
+                model.telemetry_enabled = true;
+                let step_result = model.forward(&[decode_token], None);
+                model.telemetry_enabled = false;
+
+                let (step_logits, step_traces) = match step_result {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                let tok_str = crate::tokenizer::token_id_to_text(decode_token);
+                generated_text.push_str(&tok_str);
+                result_tokens.push(build_neuroviz_token(
+                    decode_token,
+                    &tok_str,
+                    prompt_ids.len() + step,
+                    &step_traces,
+                    &step_logits,
+                    vocab_size,
+                ));
+
+                decode_token = step_logits.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0);
+            }
+
+            let session_id = format!("viz_{}", chrono::Utc::now().timestamp_millis());
+            let response = NeurovizResponse {
+                prompt: req.prompt,
+                generated_text,
+                tokens: result_tokens,
+                model_info,
+                session_id,
+            };
+            return (StatusCode::OK, Json(response)).into_response();
         }
+        // guard dropped here — qwen_model is None, fall through to llama.cpp path
     }
 
-    let session_id = format!("viz_{}", chrono::Utc::now().timestamp_millis());
+    // ── llama.cpp fallback path ───────────────────────────────────────────────
+    // When llama.cpp is loaded, qwen_model is None.  We run a short generate
+    // with the llama engine and then read state.last_trace to get layer data.
+    // The llama engine does not expose per-layer telemetry directly, so we
+    // synthesise a minimal NeurovizResponse from the generate result.
+    {
+        let llama_guard = state.llama_engine.lock().await;
+        if llama_guard.is_none() {
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "no model loaded (neither native nor llama.cpp)"}))).into_response();
+        }
+        drop(llama_guard);
+    }
 
+    let viz_max_tokens = req.max_tokens.min(64).max(1);
+
+    // Query model info and run generation (greedy, deterministic for neuroviz)
+    let (model_info, gen_result) = {
+        let mut llama_guard = state.llama_engine.lock().await;
+        let engine = match llama_guard.as_mut() {
+            Some(e) => e,
+            None => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "llama engine not available"}))).into_response(),
+        };
+        let info = engine.model_info();
+        let model_info = NeurovizModelInfo {
+            num_layers:        info.n_layers as usize,
+            hidden_size:       info.n_embd as usize,
+            // llama.cpp doesn't expose intermediate_size; approximate as 8/3 × hidden
+            intermediate_size: (info.n_embd as usize * 8 / 3).next_power_of_two(),
+            num_heads:         0,
+            num_kv_heads:      0,
+            vocab_size:        info.vocab_size as usize,
+        };
+        let params = crate::llama::GenerateParams {
+            temperature: 0.0, // greedy for deterministic neuroviz
+            top_k: 1,
+            top_p: 1.0,
+            max_tokens: viz_max_tokens,
+        };
+        (model_info, engine.generate(&req.prompt, &params))
+    };
+
+    let gen_text = match gen_result {
+        Ok(r) => r.text,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("llama generate error: {e}")}))).into_response(),
+    };
+
+    // Read last_trace if available (written by generate_internal for native path);
+    // for llama.cpp there is no trace, so build a synthetic single-token response.
+    let trace_opt = state.last_trace.lock().await.clone();
+    let num_layers = model_info.num_layers;
+
+    // Build a synthetic TokenViz: no real layer data from llama.cpp FFI
+    // (llama.cpp does not expose per-layer activations via its C API)
+    let synthetic_layers: Vec<LayerNeuronViz> = if let Some(ref trace) = trace_opt {
+        // Reuse any existing BrainTrace layer data from a previous native run
+        trace.steps.iter().flat_map(|s| s.layer_traces.iter()).take(num_layers).map(|lt| {
+            LayerNeuronViz {
+                layer_idx:           lt.layer_idx,
+                mlp_top:             lt.hot_neurons.iter().map(|&i| (i, lt.max_activation)).collect(),
+                mlp_activation_rate: 0.0,
+                attn_top:            Vec::new(),
+                attn_entropy:        0.0,
+                residual_norm:       lt.residual_norm,
+                residual_delta:      lt.attention_energy + lt.mlp_energy,
+                phase_coherence:     0.0,
+                hot_neurons:         lt.hot_neurons.clone(),
+                max_activation:      lt.max_activation,
+            }
+        }).collect()
+    } else {
+        // No trace available — return empty layer stubs so the UI can render
+        (0..num_layers).map(|i| LayerNeuronViz {
+            layer_idx: i,
+            mlp_top: vec![],
+            mlp_activation_rate: 0.0,
+            attn_top: vec![],
+            attn_entropy: 0.0,
+            residual_norm: 0.0,
+            residual_delta: 0.0,
+            phase_coherence: 0.0,
+            hot_neurons: vec![],
+            max_activation: 0.0,
+        }).collect()
+    };
+
+    // Build token list: prompt tokens (simplified) + one generated entry with layer data
+    let mut viz_tokens: Vec<TokenViz> = Vec::new();
+
+    // All prompt tokens (simplified, no layer data — llama.cpp doesn't expose per-token traces)
+    for (pos, &pid) in prompt_ids.iter().enumerate() {
+        let tok_str = crate::tokenizer::token_id_to_text(pid);
+        viz_tokens.push(TokenViz {
+            token_id: pid,
+            token_str: tok_str,
+            position: pos,
+            layers: vec![],
+            top_logits: vec![],
+            confidence: 0.0,
+            logit_entropy: 0.0,
+        });
+    }
+
+    // Generated text as word-level entries (llama.cpp returns full text, split by spaces for UX)
+    let gen_words: Vec<&str> = gen_text.split_whitespace().collect();
+    for (i, word) in gen_words.iter().enumerate() {
+        let layers_for_tok = if i == 0 { synthetic_layers.clone() } else { vec![] };
+        viz_tokens.push(TokenViz {
+            token_id: 0,
+            token_str: format!(" {}", word),
+            position: prompt_ids.len() + i,
+            layers: layers_for_tok,
+            top_logits: vec![],
+            confidence: 0.0,
+            logit_entropy: 0.0,
+        });
+    }
+
+    let session_id = format!("viz_llama_{}", chrono::Utc::now().timestamp_millis());
     let response = NeurovizResponse {
         prompt: req.prompt,
-        tokens: result_tokens,
+        generated_text: gen_text,
+        tokens: viz_tokens,
         model_info,
         session_id,
     };
-
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -1514,12 +1664,12 @@ fn build_neuroviz_token(
         LayerNeuronViz {
             layer_idx:           lt.layer_idx,
             mlp_top,
-            mlp_activation_rate: 0.0,    // populated by deep telemetry kernels (future)
+            mlp_activation_rate: lt.mlp_activation_rate,
             attn_top:            Vec::new(),
             attn_entropy:        0.0,
             residual_norm:       lt.residual_norm,
             residual_delta:      lt.attention_energy + lt.mlp_energy,
-            phase_coherence:     0.0,
+            phase_coherence:     lt.phase_coherence,
             hot_neurons:         lt.hot_neurons.clone(),
             max_activation:      lt.max_activation,
         }
