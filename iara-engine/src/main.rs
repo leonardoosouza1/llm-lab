@@ -238,6 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2b. Opções de carregamento de modelo (variáveis de ambiente)
+    let ternary_on_load = std::env::var("IARA_TERNARY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let quantize_on_load = std::env::var("IARA_QUANTIZE")
         .map(|v| v == "1" || v == "q4" || v == "true")
         .unwrap_or(false);
@@ -248,6 +251,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
+    if ternary_on_load {
+        log::info!("⚡ Quantização TERNARY 2-bit habilitada (IARA_TERNARY=1) — 16× menor que BF16");
+    }
     if quantize_on_load {
         log::info!("🔧 Quantização Q4 habilitada ao carregar modelos (IARA_QUANTIZE=1)");
     }
@@ -310,6 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_sys_info: shared_sys_info.clone(),
         acp_store:     Arc::new(acp_store),
         quantize_on_load,
+        ternary_on_load,
         enable_cfc,
         enable_speculative,
         llama_engine: Arc::new(Mutex::new(None)),

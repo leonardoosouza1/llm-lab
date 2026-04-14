@@ -50,6 +50,8 @@ pub struct AppState {
     pub acp_store:     Arc<crate::acp::state::AcpRunStore>,
     /// Habilita quantização Q4 ao carregar modelos (env: IARA_QUANTIZE)
     pub quantize_on_load: bool,
+    /// Habilita quantização ternária BitNet 2-bit (env: IARA_TERNARY)
+    pub ternary_on_load: bool,
     /// Habilita Cascade Feedback Control (CfC) para modularização de camadas
     pub enable_cfc: bool,
     /// Habilita speculative decoding (env: IARA_SPECULATIVE)
@@ -485,7 +487,7 @@ pub async fn load_model_handler(
 
     // ── GGUF + llama.cpp fast path ──────────────────────────────────────
     // IARA_NO_LLAMA=1 forces native IARA backend even for GGUF files (for benchmarking)
-    let use_llama_cpp = std::env::var("IARA_NO_LLAMA").map(|v| v != "1").unwrap_or(true);
+    let use_llama_cpp = !state.ternary_on_load && std::env::var("IARA_NO_LLAMA").map(|v| v != "1").unwrap_or(true);
     if use_llama_cpp { if let Some(ref gguf_path) = gguf_file {
         let llama_arc = state.llama_engine.clone();
         let batch_arc = state.batch_handle.clone();
@@ -576,6 +578,7 @@ pub async fn load_model_handler(
     let model_name    = req.name.clone();
     let backend       = state.backend.clone();
     let quantize_on_load = state.quantize_on_load;
+    let ternary_on_load = state.ternary_on_load;
     let enable_cfc    = state.enable_cfc;
     let resolved_iara_file = iara_file.clone();
     let resolved_gguf_file = gguf_file.clone();
@@ -622,7 +625,8 @@ pub async fn load_model_handler(
         log::info!("⏳ Carregando pesos de '{}'...", model_name);
 
         // Check format priority: GGUF > .iara > safetensors
-        let load_result = if let Some(ref gguf_path) = resolved_gguf_file {
+        // (but ternary mode forces safetensors path — needs raw BF16 weights for quantization)
+        let load_result = if !ternary_on_load { if let Some(ref gguf_path) = resolved_gguf_file {
             log::info!("📦 Detectado arquivo GGUF: {}", gguf_path.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
@@ -680,7 +684,7 @@ pub async fn load_model_handler(
             drop(gguf);
 
             CausalLM::load_gguf(gguf_path, cfg, arch, backend)
-        } else if let Some(ref iara_path) = resolved_iara_file {
+        } else { unreachable!() } } else if let Some(ref iara_path) = resolved_iara_file {
             log::info!("📦 Detectado arquivo .iara v2: {}", iara_path.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
@@ -746,7 +750,14 @@ pub async fn load_model_handler(
             };
 
             // Tenta carregar com quantização se habilitado
-            if quantize_on_load {
+            if ternary_on_load {
+                log::info!("⚡ Carregando com quantização TERNARY 2-bit (IARA_TERNARY=1)");
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "status",
+                    "message": format!("Carregando '{}' com quantização Ternary 2-bit...", model_name)
+                }).to_string());
+                CausalLM::load_ternary(&model_path, cfg, arch.clone(), backend)
+            } else if quantize_on_load {
                 log::info!("🔧 Carregando com quantização Q4 (IARA_QUANTIZE=1)");
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
@@ -768,7 +779,7 @@ pub async fn load_model_handler(
                     let g = model_arc.lock().await;
                     g.as_ref().map(|m| m.backend.name().to_string()).unwrap_or_default()
                 };
-                let quant_str = if resolved_gguf_file.is_some() { "gguf-q4km→bf16" } else if quantize_on_load { "q4" } else { "bf16" };
+                let quant_str = if resolved_gguf_file.is_some() { "gguf-q4km→bf16" } else if ternary_on_load { "ternary-2bit" } else if quantize_on_load { "q4" } else { "bf16" };
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "model_loaded",
                     "name": model_name,

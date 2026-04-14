@@ -2,30 +2,26 @@
 //!
 //! Supports two input formats:
 //! - Pre-tokenized binary files: flat sequence of little-endian u32 token IDs
-//! - Plain text files: one document per line, converted to byte-pair indices
+//! - Plain text files: one document per line, converted to byte indices
 //!
 //! Each dataset item is a sliding window of `seq_len + 1` tokens, yielding
 //! `input_ids = tokens[..seq_len]` and `target_ids = tokens[1..seq_len+1]`.
 
-use burn::data::dataloader::batcher::Batcher;
-use burn::data::dataset::Dataset;
-use burn::prelude::*;
-use burn::tensor::{Int, Tensor, TensorData};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// Dataset item: a single training window (just token indices, no tensors yet)
+// Dataset item: a single training window
 // ---------------------------------------------------------------------------
 
-/// A single training sample — a window of token IDs before batching.
+/// A single training sample -- a window of token IDs.
 #[derive(Clone, Debug)]
 pub struct TokenWindow {
     /// Input token IDs: `tokens[i .. i + seq_len]`
-    pub input_ids: Vec<i64>,
+    pub input_ids: Vec<u32>,
     /// Target token IDs: `tokens[i+1 .. i + seq_len + 1]`
-    pub target_ids: Vec<i64>,
+    pub target_ids: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +64,7 @@ impl TextDataset {
 
         assert!(
             n_tokens > seq_len,
-            "token file has {n_tokens} tokens but seq_len is {seq_len} — need at least seq_len+1"
+            "token file has {n_tokens} tokens but seq_len is {seq_len} -- need at least seq_len+1"
         );
 
         log::info!(
@@ -123,10 +119,9 @@ impl TextDataset {
     pub fn num_samples(&self) -> usize {
         self.tokens.len().saturating_sub(self.seq_len)
     }
-}
 
-impl Dataset<TokenWindow> for TextDataset {
-    fn get(&self, index: usize) -> Option<TokenWindow> {
+    /// Get a single training window by index.
+    pub fn get(&self, index: usize) -> Option<TokenWindow> {
         if index >= self.num_samples() {
             return None;
         }
@@ -135,8 +130,8 @@ impl Dataset<TokenWindow> for TextDataset {
         let end = start + self.seq_len + 1; // +1 because target is shifted by 1
 
         let window = &self.tokens[start..end];
-        let input_ids: Vec<i64> = window[..self.seq_len].iter().map(|&t| t as i64).collect();
-        let target_ids: Vec<i64> = window[1..].iter().map(|&t| t as i64).collect();
+        let input_ids: Vec<u32> = window[..self.seq_len].to_vec();
+        let target_ids: Vec<u32> = window[1..].to_vec();
 
         Some(TokenWindow {
             input_ids,
@@ -144,64 +139,14 @@ impl Dataset<TokenWindow> for TextDataset {
         })
     }
 
-    fn len(&self) -> usize {
-        self.num_samples()
+    /// Return the sequence length.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
     }
-}
 
-// ---------------------------------------------------------------------------
-// TrainingBatch — the tensor-ified batch that the model consumes
-// ---------------------------------------------------------------------------
-
-/// A collated batch of training samples, ready for the model.
-#[derive(Clone, Debug)]
-pub struct TrainingBatch<B: Backend> {
-    /// Input token IDs — shape `[batch_size, seq_len]`
-    pub input_ids: Tensor<B, 2, Int>,
-    /// Target token IDs — shape `[batch_size, seq_len]`
-    pub target_ids: Tensor<B, 2, Int>,
-}
-
-// ---------------------------------------------------------------------------
-// TrainingBatcher — converts Vec<TokenWindow> into TrainingBatch<B>
-// ---------------------------------------------------------------------------
-
-/// Batcher that stacks individual [`TokenWindow`] items into a
-/// [`TrainingBatch`] on the given device.
-#[derive(Clone, Debug)]
-pub struct TrainingBatcher;
-
-impl TrainingBatcher {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl<B: Backend> Batcher<B, TokenWindow, TrainingBatch<B>> for TrainingBatcher {
-    fn batch(&self, items: Vec<TokenWindow>, device: &B::Device) -> TrainingBatch<B> {
-        let batch_size = items.len();
-        let seq_len = items[0].input_ids.len();
-
-        // Flatten all input_ids into one vec, then reshape to [batch, seq_len]
-        let input_flat: Vec<i64> = items.iter().flat_map(|w| w.input_ids.iter().copied()).collect();
-        let target_flat: Vec<i64> = items.iter().flat_map(|w| w.target_ids.iter().copied()).collect();
-
-        let input_ids = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(input_flat, [batch_size * seq_len]),
-            device,
-        )
-        .reshape([batch_size, seq_len]);
-
-        let target_ids = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(target_flat, [batch_size * seq_len]),
-            device,
-        )
-        .reshape([batch_size, seq_len]);
-
-        TrainingBatch {
-            input_ids,
-            target_ids,
-        }
+    /// Return reference to the raw token stream.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
     }
 }
 
@@ -212,9 +157,6 @@ impl<B: Backend> Batcher<B, TokenWindow, TrainingBatch<B>> for TrainingBatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type TestBackend = NdArray<f32>;
 
     #[test]
     fn test_dataset_from_tokens() {
@@ -222,7 +164,7 @@ mod tests {
         let ds = TextDataset::from_tokens(tokens, 4);
 
         // 20 tokens, seq_len=4 => 20-4 = 16 windows
-        assert_eq!(ds.len(), 16);
+        assert_eq!(ds.num_samples(), 16);
 
         let item = ds.get(0).unwrap();
         assert_eq!(item.input_ids, vec![0, 1, 2, 3]);
@@ -233,25 +175,5 @@ mod tests {
         assert_eq!(item.target_ids, vec![16, 17, 18, 19]);
 
         assert!(ds.get(16).is_none());
-    }
-
-    #[test]
-    fn test_batcher() {
-        let tokens: Vec<u32> = (0..10).collect();
-        let ds = TextDataset::from_tokens(tokens, 4);
-        let device = <TestBackend as Backend>::Device::default();
-
-        let items = vec![ds.get(0).unwrap(), ds.get(1).unwrap()];
-        let batcher = TrainingBatcher::new();
-        let batch: TrainingBatch<TestBackend> = batcher.batch(items, &device);
-
-        assert_eq!(batch.input_ids.dims(), [2, 4]);
-        assert_eq!(batch.target_ids.dims(), [2, 4]);
-
-        // First sample: input [0,1,2,3], target [1,2,3,4]
-        let input_data = batch.input_ids.to_data();
-        let input_vals = input_data.as_slice::<i64>().unwrap();
-        assert_eq!(&input_vals[0..4], &[0, 1, 2, 3]);
-        assert_eq!(&input_vals[4..8], &[1, 2, 3, 4]);
     }
 }

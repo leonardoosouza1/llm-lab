@@ -7,9 +7,8 @@ description = "Motor de Ressonância IARA — Liquid Neural Network Physics Engi
 [features]
 default      = []
 experimental = []   # Compila módulos exploratórios (physics, liquid_network, etc.)
-stdp         = []
-circadian    = []
-actuator     = []
+stdp         = []   # Gates STDP learning in liquid_network
+circadian    = []   # Gates circadian rhythm in liquid_network/homeostasis
 rocm         = ["dep:hip-ffi", "dep:rocm-backend"]
 opencl       = ["dep:opencl-backend"]
 

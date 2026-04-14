@@ -34,9 +34,9 @@ pub struct Qwen2Output<B: Backend> {
 /// SwiGLU MLP block: `down_proj(silu(gate_proj(x)) * up_proj(x))`
 #[derive(Module, Debug)]
 pub struct Qwen2Mlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+    pub gate_proj: Linear<B>,
+    pub up_proj: Linear<B>,
+    pub down_proj: Linear<B>,
 }
 
 impl<B: Backend> Qwen2Mlp<B> {
