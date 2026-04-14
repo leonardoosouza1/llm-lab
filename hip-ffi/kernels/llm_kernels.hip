@@ -4498,3 +4498,164 @@ extern "C" __global__ void copy_f32(
     if (idx < n) dst[idx] = src[idx];
 }
 
+// ---------------------------------------------------------------------------
+// Kernel: fused_rms_qkv_q4k_q6k_f32
+//
+// Fused RMSNorm + QKV projection where:
+//   wq = Q4_K, wk = Q4_K, wv = Q6_K  (Qwen2.5-1.5B GGUF layout)
+//
+// Collapses 5 kernel launches (norm+q8 + fused_qkv fallback 3x + 2 biases)
+// into 1 launch. Each warp computes one output row.
+//
+// Grid : (ceil_div(Nq + Nk + Nv, 8), 1, 1)
+// Block: (32, 8, 1) — 8 warps × 32 threads (wave32)
+// Shared: K * sizeof(float) bytes  (normalized input, broadcast to all warps)
+// ---------------------------------------------------------------------------
+#define FUSED_RMS_QKV_Q6K_ROWS 8
+
+__launch_bounds__(256, 2)
+extern "C" __global__ void fused_rms_qkv_q4k_q6k_f32(
+    const float*          __restrict__ x,        // [K] F32 hidden state
+    const float*          __restrict__ norm_w,   // [K] F32 RMSNorm weights
+    const unsigned char*  __restrict__ wq_data,  // Q4_K Q weights
+    const unsigned char*  __restrict__ wk_data,  // Q4_K K weights
+    const unsigned char*  __restrict__ wv_data,  // Q6_K V weights
+    float*                __restrict__ out_q,    // [Nq] Q output
+    float*                __restrict__ out_k,    // [Nk] K output
+    float*                __restrict__ out_v,    // [Nv] V output
+    const float*          __restrict__ bias_q,   // nullable
+    const float*          __restrict__ bias_k,   // nullable
+    const float*          __restrict__ bias_v,   // nullable
+    int Nq, int Nk, int Nv, int K, float eps
+) {
+    extern __shared__ float xn_q6k[];  // [K] normalized x
+
+    const int tid     = (int)threadIdx.y * 32 + (int)threadIdx.x;
+    const int lane    = (int)threadIdx.x;
+    const int warp_id = (int)threadIdx.y;
+
+    // ── Phase 1: RMSNorm ──────────────────────────────────────────────────
+    float sq = 0.0f;
+    for (int i = tid; i < K; i += 256) { float v = x[i]; xn_q6k[i] = v; sq += v * v; }
+    __syncthreads();
+    for (int off = 16; off >= 1; off >>= 1) sq += __shfl_down(sq, off);
+    __shared__ float wsq[8];
+    if (lane == 0) wsq[warp_id] = sq;
+    __syncthreads();
+    if (warp_id == 0 && lane < 8) {
+        float v = wsq[lane];
+        for (int off = 4; off >= 1; off >>= 1) v += __shfl_down(v, off);
+        if (lane == 0) wsq[0] = v;
+    }
+    __syncthreads();
+    const float rms_scale = rsqrtf(wsq[0] / (float)K + eps);
+    for (int i = tid; i < K; i += 256) xn_q6k[i] *= rms_scale * norm_w[i];
+    __syncthreads();
+
+    // ── Phase 2: Dispatch one output row per warp ─────────────────────────
+    const int total_N = Nq + Nk + Nv;
+    const int vrow = blockIdx.x * FUSED_RMS_QKV_Q6K_ROWS + warp_id;
+    if (vrow >= total_N) return;
+
+    const int nblk = K / 256;
+
+    if (vrow < Nq + Nk) {
+        // ── Q4_K path (same as fused_rms_qkv_q4k_f32) ────────────────────
+        const unsigned char* row_w;
+        float* out_ptr;
+        const float* bias_ptr;
+        int local_row;
+
+        if (vrow < Nq) {
+            local_row = vrow;
+            row_w = wq_data + (size_t)local_row * nblk * 144;
+            out_ptr = out_q; bias_ptr = bias_q;
+        } else {
+            local_row = vrow - Nq;
+            row_w = wk_data + (size_t)local_row * nblk * 144;
+            out_ptr = out_k; bias_ptr = bias_k;
+        }
+
+        const int group  = lane >> 3;
+        const int lane_g = lane & 7;
+        float acc = 0.0f;
+
+        for (int blk = 0; blk < nblk; blk++) {
+            const unsigned char* bp = row_w + blk * 144;
+            const unsigned int dm_raw = *(const unsigned int*)bp;
+            const float d    = fp16_to_f32((unsigned short)(dm_raw & 0xFFFF));
+            const float dmin = fp16_to_f32((unsigned short)(dm_raw >> 16));
+            unsigned char sc_lo, m_lo, sc_hi, m_hi;
+            unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
+            unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
+            const int q4 = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
+            const int k_lo = blk * 256 + group * 64 + lane_g * 4;
+            const int k_hi = k_lo + 32;
+            float dot_lo=0, sum_lo=0, dot_hi=0, sum_hi=0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float xi_lo = xn_q6k[k_lo + i], xi_hi = xn_q6k[k_hi + i];
+                dot_lo += (float)((q4 >> (i*8))    & 0xF) * xi_lo;
+                sum_lo += xi_lo;
+                dot_hi += (float)((q4 >> (i*8 + 4)) & 0xF) * xi_hi;
+                sum_hi += xi_hi;
+            }
+            acc += d * ((float)sc_lo * dot_lo + (float)sc_hi * dot_hi)
+                 - dmin * ((float)m_lo * sum_lo + (float)m_hi * sum_hi);
+        }
+        for (int off = 16; off >= 1; off >>= 1) acc += __shfl_down(acc, off);
+        if (lane == 0) {
+            if (bias_ptr) acc += bias_ptr[local_row];
+            out_ptr[local_row] = acc;
+        }
+
+    } else {
+        // ── Q6_K path for V ───────────────────────────────────────────────
+        const int local_row = vrow - Nq - Nk;
+        const int row_bytes = nblk * 210;
+        const unsigned char* row_data = wv_data + (size_t)local_row * row_bytes;
+        float acc = 0.0f;
+
+        // Q6_K GEMV: 256 threads but we only have 32 (wave32).
+        // Each of the 32 threads processes 8 positions per block (256/32).
+        for (int blk = 0; blk < nblk; blk++) {
+            const unsigned char* bp = row_data + blk * 210;
+            const unsigned char* ql = bp;
+            const unsigned char* qh = bp + 128;
+            const signed char* scales = (const signed char*)(bp + 192);
+            const float d = fp16_to_f32(*(const unsigned short*)(bp + 208));
+
+            // Each lane handles 8 consecutive values: positions lane*8 .. lane*8+7
+            #pragma unroll
+            for (int li = 0; li < 8; li++) {
+                const int tid_eff = lane * 8 + li;  // effective position 0..255
+                const int n_group = tid_eff >> 7;
+                const int pos_in_group = tid_eff & 127;
+                const int sub = pos_in_group >> 5;
+                const int l = pos_in_group & 31;
+                const unsigned char* ql_g = ql + n_group * 64;
+                const unsigned char* qh_g = qh + n_group * 32;
+                const signed char* sc_g = scales + n_group * 8;
+                int q_val;
+                switch (sub) {
+                    case 0: q_val = (int)(ql_g[l] & 0xF) | (int)(((qh_g[l] >> 0) & 3) << 4); break;
+                    case 1: q_val = (int)(ql_g[32+l] & 0xF) | (int)(((qh_g[l] >> 2) & 3) << 4); break;
+                    case 2: q_val = (int)(ql_g[l] >> 4) | (int)(((qh_g[l] >> 4) & 3) << 4); break;
+                    default: q_val = (int)(ql_g[32+l] >> 4) | (int)(((qh_g[l] >> 6) & 3) << 4); break;
+                }
+                q_val -= 32;
+                const int is = l >> 4;
+                const float sc = (float)sc_g[is + sub * 2];
+                const int k_pos = blk * 256 + tid_eff;
+                acc = __fmaf_rn(d * sc * (float)q_val, xn_q6k[k_pos], acc);
+            }
+        }
+        for (int off = 16; off >= 1; off >>= 1) acc += __shfl_down(acc, off);
+        if (lane == 0) {
+            if (bias_v) acc += bias_v[local_row];
+            out_v[local_row] = acc;
+        }
+    }
+}
+#undef FUSED_RMS_QKV_Q6K_ROWS
+

@@ -121,6 +121,10 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn fused_rms_qkv_q4k_f32(&self, _p: &FusedRmsQkvQ4KF32Params) -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("fused_rms_qkv_q4k_f32".into()))
     }
+    /// Fused RMSNorm + QKV where wq=Q4K, wk=Q4K, wv=Q6K (Qwen2.5-1.5B GGUF layout).
+    fn fused_rms_qkv_q4k_q6k_f32(&self, _p: &crate::params::FusedRmsQkvQ4KQ6KF32Params) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rms_qkv_q4k_q6k_f32".into()))
+    }
     /// Fused RMSNorm + gate+up+SiLU Q4K — eliminates Q8 intermediate for MLP.
     /// Saves 1 kernel per MLP layer (rms_norm_quantize + gate_up_silu → single launch).
     fn fused_rms_gate_up_silu_q4k_f32(&self, _p: &FusedRmsGateUpSiluQ4KF32Params) -> Result<(), BackendError> {

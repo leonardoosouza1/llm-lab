@@ -108,43 +108,30 @@ pub fn token_id_to_text(id: u32) -> String {
     format!("[{}]", id)
 }
 
-/// Detecta se o prompt parece uma pergunta (termina com '?' ou começa com wh-/how/is/can/do).
-fn looks_like_question(prompt: &str) -> bool {
-    let p = prompt.trim().to_lowercase();
-    p.ends_with('?')
-        || p.starts_with("what ")
-        || p.starts_with("how ")
-        || p.starts_with("why ")
-        || p.starts_with("where ")
-        || p.starts_with("who ")
-        || p.starts_with("which ")
-        || p.starts_with("when ")
-        || p.starts_with("is ")
-        || p.starts_with("can ")
-        || p.starts_with("do ")
-        || p.starts_with("does ")
+/// Aplica o chat template Qwen2.5/Qwen3 Instruct.
+/// Formato: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+pub fn format_for_instruct(user_prompt: &str) -> String {
+    // Já tem o template aplicado? Não duplica.
+    if user_prompt.contains("<|im_start|>") {
+        return user_prompt.to_string();
+    }
+    format!(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        user_prompt.trim()
+    )
 }
 
-/// Formata o prompt para modelo BASE (sem chat template instruct).
-/// Para perguntas, usa formato Q/A que o modelo BASE entende.
-/// Para completions diretas (ex: "1+1="), passa sem alteração.
-pub fn format_for_base_model(prompt: &str) -> String {
-    // Já formatado? Não toca
-    if prompt.contains("Q:") && prompt.contains("\nA:") {
-        return prompt.to_string();
-    }
-    if looks_like_question(prompt) {
-        format!("Q: {}\nA:", prompt.trim_end_matches('?').to_string() + "?")
-    } else {
-        prompt.to_string()
-    }
-}
-
-/// Tokeniza com template BASE (Q/A) — compatível com modelos não-instruct.
-pub fn tokenize_qa(user_prompt: &str) -> Vec<Token> {
-    let formatted = format_for_base_model(user_prompt);
-    log::debug!("tokenize_qa: '{}' → '{}'", user_prompt, &formatted[..formatted.len().min(80)]);
+/// Tokeniza com chat template Qwen Instruct — usar para todos os modelos instruct.
+pub fn tokenize_instruct(user_prompt: &str) -> Vec<Token> {
+    let formatted = format_for_instruct(user_prompt);
+    log::debug!("tokenize_instruct: '{}' → '{}'", user_prompt, &formatted[..formatted.len().min(100)]);
     tokenize(&formatted)
+}
+
+/// Tokeniza com template BASE (Q/A) — mantido para compatibilidade com modelos não-instruct.
+#[allow(dead_code)]
+pub fn tokenize_qa(user_prompt: &str) -> Vec<Token> {
+    tokenize_instruct(user_prompt)
 }
 
 /// Fallback: tokenize byte-level (usado quando tokenizer.json não está disponível)

@@ -2840,7 +2840,12 @@ impl CausalLM {
                 log::warn!("SUPER FUSED RMS+QKV: active (nq={}, nk={}, k={})", qd, kd, h);
             }
             // Try fused RMSNorm+Quantize (1 launch vs 2) for decode — skipped if super_fused_qkv
-            let qkv_q8_pre = if super_fused_qkv { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
+            // Check if mixed Q4K+Q4K+Q6K path applies (do this BEFORE norm to skip unnecessary norm)
+            let is_mixed_q4k_q6k = n == 1 && matches!(norm_type, NormType::RMSNorm)
+                && matches!((&layer.wq, &layer.wk, &layer.wv),
+                    (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }, LayerWeight::Q6K { .. }));
+
+            let qkv_q8_pre = if super_fused_qkv || is_mixed_q4k_q6k { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
                     if self.backend.fused_rms_norm_quantize(&compute_core::FusedRmsNormQuantizeParams {
                         input: &self.scratch.x, weight: &layer.input_norm_w,
@@ -2891,10 +2896,38 @@ impl CausalLM {
                     _ => false,
                 }
             } else { false };
+            // Mixed Q4K+Q4K+Q6K fused path: wv=Q6K breaks the above — use dedicated kernel
+            // This is the Qwen2.5-1.5B GGUF layout: saves ~4 launches per layer vs fallback
+            let mixed_fused_qkv_ok = if n == 1 && !super_fused_qkv && !fused_qkv_ok {
+                match (&layer.wq, &layer.wk, &layer.wv) {
+                    (LayerWeight::Q4K { data: dq, .. }, LayerWeight::Q4K { data: dk, .. }, LayerWeight::Q6K { data: dv, .. }) => {
+                        static MIXED_QKV_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        let r = self.backend.fused_rms_qkv_q4k_q6k_f32(&compute_core::FusedRmsQkvQ4KQ6KF32Params {
+                            x: &self.scratch.x, norm_w: &layer.input_norm_w,
+                            wq: dq, wk: dk, wv: dv,
+                            out_q: &self.scratch.q, out_k: &self.scratch.k, out_v: &self.scratch.v,
+                            bias_q: layer.q_bias.as_ref(), bias_k: layer.k_bias.as_ref(), bias_v: layer.v_bias.as_ref(),
+                            nq: qd, nk: kd, nv: kd, k: h, eps,
+                        });
+                        if r.is_ok() && !MIXED_QKV_LOG.swap(true, AO::Relaxed) {
+                            log::warn!("FUSED QKV Q4K+Q4K+Q6K: active (nq={}, nk={}, k={}) — 5→1 launches", qd, kd, h);
+                        }
+                        r.is_ok()
+                    }
+                    _ => false,
+                }
+            } else { false };
 
-            if super_fused_qkv || fused_qkv_ok {
+            if super_fused_qkv || fused_qkv_ok || mixed_fused_qkv_ok {
                 if !FUSED_QKV_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::warn!("FUSED QKV: active (nq={}, nk={}, nv={}, k={})", qd, kd, kd, h);
+                    if !mixed_fused_qkv_ok {
+                        log::warn!("FUSED QKV: active (nq={}, nk={}, nv={}, k={})", qd, kd, kd, h);
+                    }
+                }
+                // mixed_fused_qkv already wrote normed+q+k+v; skip norm fallback below
+                if mixed_fused_qkv_ok {
+                    // norm was done inside the fused kernel — mark normed as computed
+                    // (no extra norm needed, outputs already in scratch.q/k/v)
                 }
             } else {
                 Self::project(&self.backend, &layer.wq, &self.scratch.normed, &self.scratch.q, n, qd, h, 0, 0.0, self.scratch.q8_scratch.as_ref(), qkv_q8_pre)?;

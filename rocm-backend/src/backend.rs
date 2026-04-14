@@ -6,7 +6,7 @@ use compute_core::{
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams, SoftmaxCausalParams,
         QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params, GemvQ4KF32Params, GemvBf16F32Params,
-        FusedRmsQkvQ4KF32Params, FusedRmsGateUpSiluQ4KF32Params,
+        FusedRmsQkvQ4KF32Params, FusedRmsGateUpSiluQ4KF32Params, FusedRmsQkvQ4KQ6KF32Params,
         FusedRmsQkvQ4Params, FusedRmsGateUpSiluQ4Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
         KvCacheWhtAppendParams, KvCacheWhtReadParams,
@@ -645,6 +645,23 @@ impl ComputeBackend for RocmBackend {
         unsafe {
             self.kernels.fused_rms_qkv_q4k_f32(
                 x_ptr,
+                f32_ptr(p.norm_w),
+                u8_ptr(p.wq), u8_ptr(p.wk), u8_ptr(p.wv),
+                f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),
+                bias_q, bias_k, bias_v,
+                p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32, p.eps,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_rms_qkv_q4k_q6k_f32(&self, p: &FusedRmsQkvQ4KQ6KF32Params) -> Result<(), BackendError> {
+        let bias_q = p.bias_q.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_k = p.bias_k.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        let bias_v = p.bias_v.map(|b| f32_ptr(b)).unwrap_or(std::ptr::null());
+        unsafe {
+            self.kernels.fused_rms_qkv_q4k_q6k_f32(
+                f32_ptr(p.x),
                 f32_ptr(p.norm_w),
                 u8_ptr(p.wq), u8_ptr(p.wk), u8_ptr(p.wv),
                 f32_mut_ptr(p.out_q), f32_mut_ptr(p.out_k), f32_mut_ptr(p.out_v),

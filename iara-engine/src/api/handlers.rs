@@ -771,7 +771,17 @@ pub async fn load_model_handler(
         };
 
         match load_result {
-            Ok(model) => {
+            Ok(mut model) => {
+                // Pre-warm: run a fake forward pass so ROCm JIT-compiles all kernels
+                // now (at load time) instead of on the first user request.
+                // This eliminates the 30-60s warmup period on first generation.
+                log::info!("🔥 Pre-warming GPU kernels (eliminates JIT on first request)...");
+                let warmup_start = std::time::Instant::now();
+                let _ = model.forward(&[1u32], None); // token_id=1, tiny forward
+                let _ = model.forward(&[1u32], None); // second pass = fully warm
+                model.reset_cache();
+                log::info!("✅ Kernels pre-warmed em {:.1}s", warmup_start.elapsed().as_secs_f32());
+
                 *model_arc.lock().await = Some(model);
                 model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                 model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -831,7 +841,8 @@ pub async fn generate_handler(
             let handle_clone = handle.clone();
             drop(batch_guard);
 
-            match handle_clone.submit(req.prompt.clone(), params).await {
+            let formatted_prompt = crate::tokenizer::format_for_instruct(&req.prompt);
+            match handle_clone.submit(formatted_prompt, params).await {
                 Ok(result) => {
                     let total_ms = start.elapsed().as_millis();
                     log::info!("✅ llama.cpp: {} tokens in {}ms ({:.1} tok/s)",
@@ -992,8 +1003,8 @@ async fn generate_internal(
         top_p: req.top_p,
     };
 
-    // Formato Q/A para modelo BASE: wrapa perguntas em "Q: ...\nA:".
-    let tokens = crate::tokenizer::tokenize_qa(&req.prompt);
+    // Chat template Qwen Instruct: <|im_start|>system/user/assistant
+    let tokens = crate::tokenizer::tokenize_instruct(&req.prompt);
     let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
     let prompt_eval_count = prompt_ids.len() as u32;
     let mut generated_text = String::new();

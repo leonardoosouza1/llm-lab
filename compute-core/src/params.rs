@@ -276,6 +276,27 @@ pub struct FusedRmsQkvQ4KF32Params<'a> {
     pub x_offset: usize,
 }
 
+/// Fused RMSNorm + QKV where wq=Q4K, wk=Q4K, wv=Q6K (Qwen2.5-1.5B GGUF layout).
+/// Collapses 5 launches into 1 for QKV decode on native backend.
+pub struct FusedRmsQkvQ4KQ6KF32Params<'a> {
+    pub x: &'a AnyTensor,
+    pub norm_w: &'a AnyTensor,
+    pub wq: &'a AnyTensor,   // Q4K
+    pub wk: &'a AnyTensor,   // Q4K
+    pub wv: &'a AnyTensor,   // Q6K
+    pub out_q: &'a AnyTensor,
+    pub out_k: &'a AnyTensor,
+    pub out_v: &'a AnyTensor,
+    pub bias_q: Option<&'a AnyTensor>,
+    pub bias_k: Option<&'a AnyTensor>,
+    pub bias_v: Option<&'a AnyTensor>,
+    pub nq: usize,
+    pub nk: usize,
+    pub nv: usize,
+    pub k: usize,
+    pub eps: f32,
+}
+
 /// Fused RMSNorm + gate+up+SiLU Q4K in one kernel.
 /// Eliminates Q8 intermediate for MLP: saves 1 launch per MLP layer.
 pub struct FusedRmsGateUpSiluQ4KF32Params<'a> {

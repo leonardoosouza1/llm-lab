@@ -115,6 +115,8 @@ pub struct GpuKernels {
     // Online BI measurement kernels (adaptive layer skip)
     fn_cosine_sim_1d: hipFunction_t,
     fn_copy_f32: hipFunction_t,
+    // Fused RMSNorm+QKV for mixed Q4K(wq,wk)+Q6K(wv) — Qwen2.5 GGUF layout
+    fn_fused_rms_qkv_q4k_q6k_f32: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -212,6 +214,7 @@ impl GpuKernels {
         // Online BI measurement kernels
         let fn_cosine_sim_1d = get_fn!("cosine_sim_1d");
         let fn_copy_f32 = get_fn!("copy_f32");
+        let fn_fused_rms_qkv_q4k_q6k_f32 = get_fn!("fused_rms_qkv_q4k_q6k_f32");
 
         Ok(Self {
             module,
@@ -278,6 +281,7 @@ impl GpuKernels {
             fn_gemv_ternary_f32_fast,
             fn_cosine_sim_1d,
             fn_copy_f32,
+            fn_fused_rms_qkv_q4k_q6k_f32,
         })
     }
 
@@ -3159,6 +3163,74 @@ impl GpuKernels {
                 &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_n as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // fused_rms_qkv_q4k_q6k_f32 — RMSNorm + QKV where wq=Q4K, wk=Q4K, wv=Q6K
+    // Matches Qwen2.5-1.5B GGUF layout: 1 launch instead of 5
+    // Grid : (ceil((Nq+Nk+Nv)/8), 1, 1)
+    // Block: (32, 8, 1) — shared = K floats
+    // ─────────────────────────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fused_rms_qkv_q4k_q6k_f32(
+        &self,
+        x: *const f32,
+        norm_w: *const f32,
+        wq_data: *const u8,
+        wk_data: *const u8,
+        wv_data: *const u8,
+        out_q: *mut f32,
+        out_k: *mut f32,
+        out_v: *mut f32,
+        bias_q: *const f32,
+        bias_k: *const f32,
+        bias_v: *const f32,
+        nq: i32, nk: i32, nv: i32, k: i32, eps: f32,
+    ) -> Result<(), HipError> {
+        let total = nq + nk + nv;
+        let grid = (((total + 7) / 8) as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = (k * 4) as u32;
+
+        let mut p_x   = x;
+        let mut p_nw  = norm_w;
+        let mut p_wq  = wq_data;
+        let mut p_wk  = wk_data;
+        let mut p_wv  = wv_data;
+        let mut p_oq  = out_q;
+        let mut p_ok  = out_k;
+        let mut p_ov  = out_v;
+        let mut p_bq  = bias_q;
+        let mut p_bk  = bias_k;
+        let mut p_bv  = bias_v;
+        let mut p_nq  = nq;
+        let mut p_nk  = nk;
+        let mut p_nv  = nv;
+        let mut p_k   = k;
+        let mut p_eps = eps;
+
+        hip_launch_kernel(
+            self.fn_fused_rms_qkv_q4k_q6k_f32,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_x   as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nw  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_wq  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wk  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_wv  as *mut *const u8  as *mut std::ffi::c_void,
+                &mut p_oq  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ok  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_ov  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_bq  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bk  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_bv  as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_nq  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nk  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_nv  as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+                &mut p_eps as *mut f32        as *mut std::ffi::c_void,
             ],
         )
     }
