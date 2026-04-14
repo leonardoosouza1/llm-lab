@@ -9,6 +9,7 @@ members = [
     "metaverse-core",
     "llama-sys",
     "iara-train",
+    "iara-observe",
 ]
 resolver = "2"
 
