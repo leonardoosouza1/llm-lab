@@ -37,6 +37,9 @@ compute-core = { path = "../compute-core" }
 # Telemetry: neuron observation, tensor snapshots, flow events
 iara-observe = { path = "../iara-observe" }
 
+# LoRA training engine (CPU f32, AdamW, safetensors)
+iara-train = { path = "../iara-train" }
+
 # GPU nativa — HIP FFI direto (sem candle, sem rocm-rs e seu kernel sorting quebrado)
 # Mantido como opcional: usado pelo rocm-backend via feature "rocm"
 hip-ffi = { path = "../hip-ffi", optional = true }

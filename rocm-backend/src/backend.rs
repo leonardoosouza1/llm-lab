@@ -5,7 +5,7 @@ use compute_core::{
         AddBiasParams, CfcForwardParams, EmbedParams, FusedNormBiasRopeParams, GeluMulParams, GemmBf16Params, GemvQ4Params, GemvQ4KParams, GemvQ6KParams,
         GravityScoreParams, KvCacheParams, KvCacheQuantizedParams, LayerNormParams, RmsNormParams,
         RopeParams, SgemmParams, SgemmStridedBatchedParams, SiluMulParams, SoftmaxParams, SoftmaxCausalParams,
-        QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params, GemvQ4KF32Params, GemvBf16F32Params,
+        QuantizeQ8Params, GemvQ4KQ8Params, GemvQ6KQ8Params, GemvQ4KF32Params, GemvQ6KF32Params, GemvBf16F32Params,
         FusedRmsQkvQ4KF32Params, FusedRmsGateUpSiluQ4KF32Params, FusedRmsQkvQ4KQ6KF32Params,
         FusedRmsQkvQ4Params, FusedRmsGateUpSiluQ4Params,
         KvCacheInt8AppendParams, KvCacheInt8ReadParams,
@@ -581,6 +581,17 @@ impl ComputeBackend for RocmBackend {
             }
         };
         result.map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_q6k_f32(&self, p: &GemvQ6KF32Params) -> Result<(), BackendError> {
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.gemv_q6k_f32_w32(
+                u8_ptr(p.data), x_ptr, f32_mut_ptr(p.out),
+                p.m as i32, p.n as i32, p.k as i32, p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn gemv_bf16_f32(&self, p: &GemvBf16F32Params) -> Result<(), BackendError> {

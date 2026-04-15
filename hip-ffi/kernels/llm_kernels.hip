@@ -4659,3 +4659,83 @@ extern "C" __global__ void fused_rms_qkv_q4k_q6k_f32(
 }
 #undef FUSED_RMS_QKV_Q6K_ROWS
 
+// ---------------------------------------------------------------------------
+// Kernel: gemv_q6k_f32_w32 — Q6_K × F32 GEMV, 1 warp per output row
+//
+// Direct F32 input — eliminates the quantize_q8 step before Q6K GEMV.
+// Saves 1 kernel launch per Q6K projection (wdown, wv when not fused).
+//
+// Q6_K block layout (210 bytes per 256 values):
+//   ql[128]  — 4-bit low parts (packed two nibbles per byte)
+//   qh[64]   — 2-bit high parts (2 bits per value)
+//   scales[16 int8] — scale per sub-group of 16
+//   d[f16]   — global scale
+//
+// Each thread handles 8 consecutive values per block (256 values / 32 lanes).
+//
+// Grid : (N, M, 1)   Block: (32, 1, 1)
+// Shared: none (pure register + warp shuffle)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gemv_q6k_f32_w32(
+    const unsigned char* __restrict__ w_data,  // [N, nblk*210] raw Q6_K bytes
+    const float*         __restrict__ x,       // [M, K] F32 input activations
+    float*               __restrict__ out,     // [M, N] F32 output
+    int M, int N, int K, float beta
+) {
+    const int row  = (int)blockIdx.x;
+    const int mi   = (int)blockIdx.y;
+    const int lane = (int)threadIdx.x;
+    if (row >= N || mi >= M) return;
+
+    const int nblk = K / 256;
+    const unsigned char* row_data = w_data + (size_t)row * nblk * 210;
+    const float* x_row = x + (size_t)mi * K;
+
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* bp     = row_data + blk * 210;
+        const unsigned char* ql     = bp;
+        const unsigned char* qh     = bp + 128;
+        const signed char*   scales = (const signed char*)(bp + 192);
+        const float d = fp16_to_f32(*(const unsigned short*)(bp + 208));
+
+        // Each lane handles 8 consecutive positions (lane*8 .. lane*8+7)
+        #pragma unroll
+        for (int li = 0; li < 8; li++) {
+            const int tid_eff     = lane * 8 + li;        // 0..255
+            const int n_group     = tid_eff >> 7;         // 0 or 1
+            const int pos_in_grp  = tid_eff & 127;        // 0..127
+            const int sub         = pos_in_grp >> 5;      // 0..3
+            const int l           = pos_in_grp & 31;      // 0..31
+
+            const unsigned char* ql_g  = ql     + n_group * 64;
+            const unsigned char* qh_g  = qh     + n_group * 32;
+            const signed char*   sc_g  = scales + n_group * 8;
+
+            int q_val;
+            switch (sub) {
+                case 0:  q_val = (int)(ql_g[l]      & 0xF) | (int)(((qh_g[l] >> 0) & 3) << 4); break;
+                case 1:  q_val = (int)(ql_g[32 + l] & 0xF) | (int)(((qh_g[l] >> 2) & 3) << 4); break;
+                case 2:  q_val = (int)(ql_g[l]      >> 4)  | (int)(((qh_g[l] >> 4) & 3) << 4); break;
+                default: q_val = (int)(ql_g[32 + l] >> 4)  | (int)(((qh_g[l] >> 6) & 3) << 4); break;
+            }
+            q_val -= 32;  // signed 6-bit: range [-32, 31]
+
+            const int   is  = l >> 4;  // 0 for l<16, 1 for l>=16
+            const float sc  = (float)sc_g[is + sub * 2];
+            const int   k_pos = blk * 256 + tid_eff;
+            acc = __fmaf_rn(d * sc * (float)q_val, x_row[k_pos], acc);
+        }
+    }
+
+    // Warp reduce (single wave32 — no shared memory needed)
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (lane == 0) {
+        const int out_idx = mi * N + row;
+        out[out_idx] = (beta == 0.0f) ? acc : __fmaf_rn(beta, out[out_idx], acc);
+    }
+}
+

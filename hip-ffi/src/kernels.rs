@@ -88,6 +88,7 @@ pub struct GpuKernels {
     fn_fused_gate_up_silu_q4k_multi: hipFunction_t,
     fn_gemv_q4k_f32_multi: hipFunction_t,
     fn_gemv_q4k_f32_w32: hipFunction_t,
+    fn_gemv_q6k_f32_w32: hipFunction_t,
     fn_gemv_bf16_f32_multi: hipFunction_t,
     fn_fused_rms_qkv_q4k_f32: hipFunction_t,
     fn_fused_rms_gate_up_silu_q4k_f32: hipFunction_t,
@@ -182,6 +183,7 @@ impl GpuKernels {
         let fn_fused_gate_up_silu_q4k_multi = get_fn!("fused_gate_up_silu_q4k_multi");
         let fn_gemv_q4k_f32_multi = get_fn!("gemv_q4k_f32_multi");
         let fn_gemv_q4k_f32_w32 = get_fn!("gemv_q4k_f32_w32");
+        let fn_gemv_q6k_f32_w32 = get_fn!("gemv_q6k_f32_w32");
         let fn_gemv_bf16_f32_multi = get_fn!("gemv_bf16_f32_multi");
         let fn_fused_rms_qkv_q4k_f32 = get_fn!("fused_rms_qkv_q4k_f32");
         let fn_fused_rms_gate_up_silu_q4k_f32 = get_fn!("fused_rms_gate_up_silu_q4k_f32");
@@ -260,6 +262,7 @@ impl GpuKernels {
             fn_fused_gate_up_silu_q4k_multi,
             fn_gemv_q4k_f32_multi,
             fn_gemv_q4k_f32_w32,
+            fn_gemv_q6k_f32_w32,
             fn_gemv_bf16_f32_multi,
             fn_fused_rms_qkv_q4k_f32,
             fn_fused_rms_gate_up_silu_q4k_f32,
@@ -1390,6 +1393,50 @@ impl GpuKernels {
             self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_m    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32        as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_q6k_f32_w32 — Q6_K weights × F32 activations GEMV, 1 warp/row
+    // Eliminates quantize_q8 before Q6K projections (wdown, wv).
+    // Grid : (N, M, 1)   Block: (32, 1, 1)
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn gemv_q6k_f32_w32(
+        &self,
+        w_data: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_data = w_data;
+        let mut p_x    = x;
+        let mut p_out  = out;
+        let mut p_m    = m;
+        let mut p_n    = n;
+        let mut p_k    = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q6k_f32_w32,
+            grid,
+            block,
+            0,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8  as *mut std::ffi::c_void,
                 &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_out  as *mut *mut f32   as *mut std::ffi::c_void,
                 &mut p_m    as *mut i32        as *mut std::ffi::c_void,

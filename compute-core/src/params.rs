@@ -215,6 +215,19 @@ pub struct QuantizeQ8Params<'a> {
     pub k: usize,                  // input dimension, must be multiple of 32
 }
 
+/// Q6_K × F32 GEMV — direct F32 activations, no Q8 intermediate.
+/// Eliminates quantize_q8 step before Q6K projections (wdown, wv).
+pub struct GemvQ6KF32Params<'a> {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub data: &'a AnyTensor,   // [n * (k/256) * 210] raw Q6_K blocks
+    pub x: &'a AnyTensor,      // [k] F32 activations
+    pub x_offset: usize,
+    pub out: &'a AnyTensor,    // [m, n] F32 output
+    pub beta: f32,
+}
+
 /// Q4_K × F32 GEMV — direct F32 activations, no Q8 intermediate.
 /// Eliminates quantize step between fused_gate_up_silu output and down projection.
 pub struct GemvQ4KF32Params<'a> {

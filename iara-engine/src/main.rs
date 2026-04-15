@@ -27,7 +27,8 @@ mod experimental;
 
 use crate::api::handlers::{AppState, generate_handler, debug_trace_handler, deep_trace_handler,
                             models_handler, load_model_handler, unload_model_handler,
-                            train_lnn_handler, lnn_status_handler, neuroviz_handler};
+                            train_lnn_handler, lnn_status_handler, neuroviz_handler,
+                            train_lora_handler};
 use crate::hardware::HardwareManager;
 use crate::lnn::EsnObserver;
 use crate::lnn::train::LnnTrainer;
@@ -336,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/generate",           post(generate_handler))
         .route("/api/trace",              post(deep_trace_handler))
         .route("/api/train-lnn",          post(train_lnn_handler))
+        .route("/api/train",              post(train_lora_handler))
         .route("/api/lnn/status",         get(lnn_status_handler))
         .route("/api/debug/last-trace",   get(debug_trace_handler))
         .route("/api/neuroviz",           post(neuroviz_handler))

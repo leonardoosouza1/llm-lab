@@ -1729,6 +1729,158 @@ fn build_neuroviz_token(
 }
 
 /// GET /api/lnn/status — Status do sistema LNN (ESN + CfC + Gravity + Training).
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/train — LoRA fine-tuning
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+pub struct TrainLoraRequest {
+    /// Path to tokenized .bin dataset (flat little-endian u32 token IDs).
+    pub data_path: String,
+    /// Directory with safetensors weights + config.json.
+    /// If omitted, uses models_dir/<model_name> from the currently loaded model's name.
+    pub model_dir: Option<String>,
+    #[serde(default = "default_lora_rank")]
+    pub lora_rank: usize,
+    #[serde(default = "default_lora_alpha")]
+    pub lora_alpha: f32,
+    #[serde(default = "default_lr")]
+    pub lr: f32,
+    #[serde(default = "default_steps")]
+    pub steps: usize,
+    #[serde(default = "default_seq_len")]
+    pub seq_len: usize,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_output_dir")]
+    pub output_dir: String,
+    #[serde(default = "default_checkpoint_every")]
+    pub checkpoint_every: usize,
+    #[serde(default = "default_log_every")]
+    pub log_every: usize,
+}
+
+fn default_lora_rank()       -> usize { 16 }
+fn default_lora_alpha()      -> f32   { 32.0 }
+fn default_lr()              -> f32   { 2e-4 }
+fn default_steps()           -> usize { 100 }
+fn default_seq_len()         -> usize { 64 }
+fn default_batch_size()      -> usize { 1 }
+fn default_output_dir()      -> String { "lora_output".into() }
+fn default_checkpoint_every()-> usize { 50 }
+fn default_log_every()       -> usize { 10 }
+
+/// POST /api/train
+///
+/// Spawns a background LoRA training task. Returns immediately with 202.
+/// Progress is broadcast via WebSocket as {"type":"train_progress",...} frames.
+pub async fn train_lora_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TrainLoraRequest>,
+) -> impl IntoResponse {
+    // Resolve model_dir: explicit in request or infer from currently loaded model.
+    let model_dir_str = match req.model_dir {
+        Some(ref d) => d.clone(),
+        None => {
+            // Try to infer from AppState (models_dir + first safetensors model present)
+            let guard = state.qwen_model.lock().await;
+            if guard.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "model_dir not specified and no model is loaded"
+                    })),
+                ).into_response();
+            }
+            drop(guard);
+            // Use models_dir as the model_dir (for single-model setups)
+            state.models_dir.to_string_lossy().into_owned()
+        }
+    };
+
+    let data_path    = PathBuf::from(&req.data_path);
+    let model_dir    = PathBuf::from(&model_dir_str);
+    let output_dir   = PathBuf::from(&req.output_dir);
+    let frame_tx     = state.frame_tx.clone();
+
+    let config = iara_train::TrainConfig {
+        lr: req.lr,
+        num_steps: req.steps,
+        batch_size: req.batch_size,
+        seq_len: req.seq_len,
+        checkpoint_every: req.checkpoint_every,
+        output_dir: output_dir.clone(),
+        lora_rank: req.lora_rank,
+        lora_alpha: req.lora_alpha,
+        log_every: req.log_every,
+        ..Default::default()
+    };
+
+    // Spawn CPU-bound training in a blocking thread so it doesn't block the async runtime.
+    tokio::task::spawn_blocking(move || {
+        let _ = frame_tx.send(serde_json::json!({
+            "type": "train_progress",
+            "status": "loading_model",
+            "message": format!("Loading model from {}", model_dir.display()),
+        }).to_string());
+
+        let weights = match iara_train::ModelWeights::from_dir(&model_dir) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "train_progress",
+                    "status": "error",
+                    "message": format!("Failed to load model weights: {e}"),
+                }).to_string());
+                return;
+            }
+        };
+
+        let mut lora = iara_train::LoraAdapter::new_for_qwen2(
+            config.lora_rank, config.lora_alpha, &weights.config,
+        );
+
+        let dataset = iara_train::TextDataset::from_token_file(&data_path, config.seq_len);
+
+        let _ = frame_tx.send(serde_json::json!({
+            "type": "train_progress",
+            "status": "started",
+            "message": format!("LoRA training started: {} steps, rank={}, lr={}",
+                config.num_steps, config.lora_rank, config.lr),
+            "trainable_params": lora.num_params(),
+            "dataset_samples": dataset.num_samples(),
+        }).to_string());
+
+        let trainer = iara_train::Trainer::new(config);
+        match trainer.train(&weights, &mut lora, &dataset) {
+            Ok(()) => {
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "train_progress",
+                    "status": "done",
+                    "message": format!("Training complete. LoRA saved to {}", output_dir.display()),
+                }).to_string());
+            }
+            Err(e) => {
+                let _ = frame_tx.send(serde_json::json!({
+                    "type": "train_progress",
+                    "status": "error",
+                    "message": format!("Training error: {e}"),
+                }).to_string());
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "status": "accepted",
+        "message": "LoRA training started in background. Watch WebSocket for progress.",
+        "model_dir": model_dir_str,
+        "data_path": req.data_path,
+        "steps": req.steps,
+        "lora_rank": req.lora_rank,
+        "output_dir": req.output_dir,
+    }))).into_response()
+}
+
 pub async fn lnn_status_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {

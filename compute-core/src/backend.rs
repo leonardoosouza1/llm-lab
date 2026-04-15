@@ -99,6 +99,11 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_q4k_f32         (&self, _p: &GemvQ4KF32Params)       -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_q4k_f32".into()))
     }
+    /// Q6_K × F32 GEMV — direct F32 input, no quantize_q8 step.
+    /// Saves 1 kernel launch vs (quantize_q8 + gemv_q6k_q8) path.
+    fn gemv_q6k_f32         (&self, _p: &GemvQ6KF32Params)       -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("gemv_q6k_f32".into()))
+    }
     /// BitNet 1.58 ternary GEMV: 2-bit packed {-1,0,+1} weights × F32 activations.
     /// Pure add/subtract inner loop — zero multiply instructions.
     /// Achieves ~2× memory bandwidth reduction vs Q4K (2 bits vs 4 bits per weight).

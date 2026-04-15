@@ -25,7 +25,7 @@ use compute_core::{
     ComputeBackend, AnyTensor,
     GemmBf16Params, SgemmStridedBatchedParams, EmbedParams, RmsNormParams, LayerNormParams,
     RopeParams, SoftmaxParams, SiluMulParams, GeluMulParams, KvCacheParams,
-    AddBiasParams, GemvQ4Params, GemvQ4KParams, GemvQ6KParams, FusedAttentionDecodeParams,
+    AddBiasParams, GemvQ4Params, GemvQ4KParams, GemvQ6KParams, GemvQ6KF32Params, FusedAttentionDecodeParams,
     GemvW8A16Params,
 };
 use half::bf16;
@@ -831,6 +831,20 @@ impl CausalLM {
                 }
             }
             LayerWeight::Q6K { data, n: _, k: _ } => {
+                // Fast path: direct F32 GEMV — eliminates quantize_q8 step (saves 1 launch).
+                if m == 1 {
+                    let f32_result = backend.gemv_q6k_f32(&GemvQ6KF32Params {
+                        m, n, k, data, x: input, x_offset: a_offset, out: output, beta,
+                    });
+                    if f32_result.is_ok() {
+                        static Q6K_F32_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !Q6K_F32_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!("Q6K F32: using direct F32 GEMV (m={}, n={}, k={}) — no Q8 quantize", m, n, k);
+                        }
+                        return Ok(());
+                    }
+                    // Fallthrough to Q8 path if gemv_q6k_f32 not supported
+                }
                 if let (Some(q8), true) = (q8_scratch, m == 1) {
                     if !q8_precomputed {
                         backend.quantize_q8(&compute_core::QuantizeQ8Params {
