@@ -780,7 +780,8 @@ impl CausalLM {
                 // ── Fast path: Q4K × F32 GEMV (decode, m=1) ──────────────────────
                 // Eliminates the intermediate Q8_1 quantize step (saves 1 kernel launch).
                 // gemv_q4k_f32_multi dequants Q4K on-the-fly with direct F32 dot product.
-                if m == 1 {
+                // Skipped by default (Q8 dp4a wave64 is faster). Set IARA_NO_Q8_MLP=1 to re-enable.
+                if m == 1 && std::env::var("IARA_NO_Q8_MLP").is_ok() {
                     let f32_result = backend.gemv_q4k_f32(&compute_core::GemvQ4KF32Params {
                         m, n, k, data, x: input, x_offset: a_offset, out: output, beta,
                     });
@@ -832,7 +833,7 @@ impl CausalLM {
             }
             LayerWeight::Q6K { data, n: _, k: _ } => {
                 // Fast path: direct F32 GEMV — eliminates quantize_q8 step (saves 1 launch).
-                if m == 1 && (!std::env::var("IARA_UNFUSED").is_ok() || std::env::var("IARA_FUSE_Q6KF32").is_ok()) {
+                if m == 1 && std::env::var("IARA_NO_Q8_MLP").is_ok() && (!std::env::var("IARA_UNFUSED").is_ok() || std::env::var("IARA_FUSE_Q6KF32").is_ok()) {
                     let f32_result = backend.gemv_q6k_f32(&GemvQ6KF32Params {
                         m, n, k, data, x: input, x_offset: a_offset, out: output, beta,
                     });
@@ -2609,6 +2610,9 @@ impl CausalLM {
         let force_fuse_attn = std::env::var("IARA_FUSE_ATTN").is_ok();
         let force_fuse_rope = std::env::var("IARA_FUSE_ROPE").is_ok();
         let force_fuse_q6kf32 = std::env::var("IARA_FUSE_Q6KF32").is_ok();
+        // Q8 dp4a wave64 for MLP & projections: ~40% faster than F32 super-fused.
+        // Disable with IARA_NO_Q8_MLP=1 to revert to F32 super-fused path.
+        let force_q8_mlp = !std::env::var("IARA_NO_Q8_MLP").is_ok();
         #[cfg(feature = "rocm")]
         hip_ffi::safe::reset_launch_count();
         let n    = token_ids.len();
@@ -3436,7 +3440,7 @@ impl CausalLM {
             section_time!(PROF_WO, _sec_t0);
             // ── Post-attention Normalization (+ optional fused quantize for MLP) ──
             // Check if super-fused MLP is possible — avoids norm+quantize if weights are Q4K
-            let super_fused_mlp_possible = n == 1 && (!unfused || force_fuse_mlp) && matches!(norm_type, NormType::RMSNorm)
+            let super_fused_mlp_possible = n == 1 && (!unfused || force_fuse_mlp) && !force_q8_mlp && matches!(norm_type, NormType::RMSNorm)
                 && matches!((&layer.wgate, &layer.wup), (LayerWeight::Q4K { .. }, LayerWeight::Q4K { .. }));
             let mlp_q8_pre = if super_fused_mlp_possible { false } else if n == 1 && matches!(norm_type, NormType::RMSNorm) {
                 if let Some(q8) = self.scratch.q8_scratch.as_ref() {
@@ -4109,11 +4113,10 @@ impl CausalLM {
         // args like seq_pos/seq_len change). hipGraphExecUpdate should handle
         // scalar-only changes without re-instantiation.
         //
-        // Enable with IARA_GRAPH=1. Requires: ternary weights + single-token decode.
-        // Previous full-model attempt failed due to conditional paths changing topology.
-        // Ternary + layer skip = fixed topology → graph update should succeed.
-        let use_graph = matches!(&self.layers[0].wq, LayerWeight::Ternary { .. })
-            && n == 1
+        // Enable with IARA_GRAPH=1. For decode (n=1), the kernel topology is fixed
+        // (same launches every token, only scalar args change). Graph update handles this.
+        // Works for both ternary and GGUF Q4K/Q6K models.
+        let use_graph = n == 1
             && std::env::var("IARA_GRAPH").map(|v| v == "1").unwrap_or(false);
 
         if use_graph {

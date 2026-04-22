@@ -105,6 +105,8 @@ pub struct RocmBackend {
     use_wave64: bool,
     /// Use Flash Attention 2 kernel (IARA_FLASH_ATTN=1) instead of original fused decode
     use_flash_attn: bool,
+    /// Use V2 kernels (IARA_V2=1): wave32 + dp4a + multi-row + no LDS
+    use_v2: bool,
 }
 
 // SAFETY: `BlasHandle` and `GpuKernels` both declare `unsafe impl Send + Sync`
@@ -146,11 +148,13 @@ impl RocmBackend {
         let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
 
-        let use_wave64 = std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
+        let use_v2 = std::env::var("IARA_V2").map(|v| v != "0").unwrap_or(true);
+        let use_wave64 = !use_v2 && std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
         let use_flash_attn = std::env::var("IARA_FLASH_ATTN").map(|v| v != "0").unwrap_or(true);
-        eprintln!("ROCm backend: using dedicated HIP stream + graph capture support{}{}",
-            if use_wave64 { " + Wave64 GEMV" } else { "" },
-            if use_flash_attn { " + Flash Attention 2" } else { "" });
+        eprintln!("ROCm backend: using dedicated HIP stream + graph capture support{}{}{}",
+            if use_v2 { " + V2 GEMV (wave32/dp4a/no-LDS)" } else if use_wave64 { " + Wave64 GEMV" } else { "" },
+            if use_flash_attn { " + Flash Attention 2" } else { "" },
+            if use_v2 { "" } else { "" });
 
         Ok(Self {
             blas,
@@ -163,6 +167,7 @@ impl RocmBackend {
             capturing: std::sync::atomic::AtomicBool::new(false),
             use_wave64,
             use_flash_attn,
+            use_v2,
         })
     }
 }
@@ -535,7 +540,12 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k_q8(&self, p: &GemvQ4KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            if self.use_wave64 {
+            if self.use_v2 {
+                self.kernels.gemv_q4k_q8_v2(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else if self.use_wave64 {
                 self.kernels.gemv_q4k_q8_w64(
                     u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                     p.m as i32, p.n as i32, p.k as i32, p.beta,
@@ -552,10 +562,22 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q6k_q8(&self, p: &GemvQ6KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            self.kernels.gemv_q6k_q8(
-                u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
-                p.m as i32, p.n as i32, p.k as i32, p.beta,
-            )
+            if self.use_v2 {
+                self.kernels.gemv_q6k_q8_v2(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else if self.use_wave64 {
+                self.kernels.gemv_q6k_q8_w64(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else {
+                self.kernels.gemv_q6k_q8(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            }
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
@@ -596,8 +618,8 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_bf16_f32(&self, p: &GemvBf16F32Params) -> Result<(), BackendError> {
         let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
-        log::debug!("gemv_bf16_f32: wave64={}, n={}, k={}", self.use_wave64, p.n, p.k);
-        let result = if self.use_wave64 {
+        log::debug!("gemv_bf16_f32: wave64={}, v2={}, n={}, k={}", self.use_wave64, self.use_v2, p.n, p.k);
+        let result = if self.use_wave64 && !self.use_v2 {
             unsafe {
                 self.kernels.gemv_bf16_f32_w64(
                     u16_ptr(p.w), x_ptr, f32_mut_ptr(p.out),
@@ -1236,7 +1258,7 @@ impl ComputeBackend for RocmBackend {
             let bq = p.bias_q.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
             let bk = p.bias_k.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
             let bv = p.bias_v.map(|t| f32_ptr(t)).unwrap_or(std::ptr::null());
-            if self.use_wave64 {
+            if self.use_wave64 && !self.use_v2 {
                 self.kernels.fused_qkv_q4k_w64(
                     u8_ptr(p.wq_data), u8_ptr(p.wk_data), u8_ptr(p.wv_data),
                     u8_ptr(p.x_q8),
@@ -1245,6 +1267,7 @@ impl ComputeBackend for RocmBackend {
                     p.nq as i32, p.nk as i32, p.nv as i32, p.k as i32,
                 )
             } else {
+                // V2 and non-wave64 both use wave32 fused QKV
                 self.kernels.fused_qkv_q4k(
                     u8_ptr(p.wq_data), u8_ptr(p.wk_data), u8_ptr(p.wv_data),
                     u8_ptr(p.x_q8),
@@ -1268,6 +1291,11 @@ impl ComputeBackend for RocmBackend {
                     gate_ptr, up_ptr, q8_ptr, out_ptr,
                     p.n as i32, p.k as i32,
                 )
+            } else if self.use_v2 {
+                self.kernels.fused_gate_up_silu_q4k_v2(
+                    gate_ptr, up_ptr, q8_ptr, out_ptr,
+                    p.n as i32, p.k as i32,
+                )
             } else if self.use_wave64 {
                 self.kernels.fused_gate_up_silu_q4k_w64(
                     gate_ptr, up_ptr, q8_ptr, out_ptr,
@@ -1286,7 +1314,7 @@ impl ComputeBackend for RocmBackend {
     fn fused_attention_decode(&self, p: &FusedAttentionDecodeParams) -> Result<(), BackendError> {
         unsafe {
             if self.use_flash_attn {
-                self.kernels.flash_attention_decode(
+                self.kernels.flash_attention_decode_v2(
                     f32_ptr(p.q),
                     f32_ptr(p.k_cache),
                     f32_ptr(p.v_cache),

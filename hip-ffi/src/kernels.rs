@@ -100,6 +100,7 @@ pub struct GpuKernels {
     fn_kv_cache_wht_dequant: hipFunction_t,
     // Flash Attention decode kernel (Item 5)
     fn_flash_attention_decode: hipFunction_t,
+    fn_flash_attention_decode_v2: hipFunction_t,
     // Wave64 GEMV kernels (2.26x faster BW on RDNA2)
     module_w64: hipModule_t,
     fn_gemv_q4k_q8_w64: hipFunction_t,
@@ -118,6 +119,10 @@ pub struct GpuKernels {
     fn_copy_f32: hipFunction_t,
     // Fused RMSNorm+QKV for mixed Q4K(wq,wk)+Q6K(wv) — Qwen2.5 GGUF layout
     fn_fused_rms_qkv_q4k_q6k_f32: hipFunction_t,
+    // V2 kernels — wave32 + dp4a + multi-row + no LDS (L0 cache for Q8_1)
+    fn_gemv_q4k_q8_v2: hipFunction_t,
+    fn_fused_gate_up_silu_q4k_v2: hipFunction_t,
+    fn_gemv_q6k_q8_v2: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -193,6 +198,7 @@ impl GpuKernels {
         let fn_kv_cache_wht_quant_append = get_fn!("kv_cache_wht_quant_append");
         let fn_kv_cache_wht_dequant = get_fn!("kv_cache_wht_dequant");
         let fn_flash_attention_decode = get_fn!("flash_attention_decode");
+        let fn_flash_attention_decode_v2 = get_fn!("flash_attention_decode_v2");
 
         // Load wave64 GEMV kernels
         let module_w64 = hip_module_load_data(KERNEL_W64_BYTES)?;
@@ -217,6 +223,11 @@ impl GpuKernels {
         let fn_cosine_sim_1d = get_fn!("cosine_sim_1d");
         let fn_copy_f32 = get_fn!("copy_f32");
         let fn_fused_rms_qkv_q4k_q6k_f32 = get_fn!("fused_rms_qkv_q4k_q6k_f32");
+
+        // V2 kernels — wave32, multi-row, no LDS
+        let fn_gemv_q4k_q8_v2 = get_fn!("gemv_q4k_q8_v2");
+        let fn_fused_gate_up_silu_q4k_v2 = get_fn!("fused_gate_up_silu_q4k_v2");
+        let fn_gemv_q6k_q8_v2 = get_fn!("gemv_q6k_q8_v2");
 
         Ok(Self {
             module,
@@ -272,6 +283,7 @@ impl GpuKernels {
             fn_kv_cache_wht_quant_append,
             fn_kv_cache_wht_dequant,
             fn_flash_attention_decode,
+            fn_flash_attention_decode_v2,
             module_w64,
             fn_gemv_q4k_q8_w64,
             fn_fused_gate_up_silu_q4k_w64,
@@ -285,6 +297,9 @@ impl GpuKernels {
             fn_cosine_sim_1d,
             fn_copy_f32,
             fn_fused_rms_qkv_q4k_q6k_f32,
+            fn_gemv_q4k_q8_v2,
+            fn_fused_gate_up_silu_q4k_v2,
+            fn_gemv_q6k_q8_v2,
         })
     }
 
@@ -1094,6 +1109,135 @@ impl GpuKernels {
             grid,
             block,
             shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V2: gemv_q4k_q8_v2 — wave32 + dp4a + 4 rows/block + NO LDS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub unsafe fn gemv_q4k_q8_v2(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        const NROWS: u32 = 4;
+        let grid = (((n as u32) + NROWS - 1) / NROWS, m.max(1) as u32, 1);
+        let block = (32u32, NROWS, 1);
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q4k_q8_v2,
+            grid,
+            block,
+            0,  // zero shared memory
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V2: fused_gate_up_silu_q4k_v2 — wave32 + dp4a + 4 rows/block + NO LDS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub unsafe fn fused_gate_up_silu_q4k_v2(
+        &self,
+        gate_data: *const u8,
+        up_data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), HipError> {
+        const NROWS: u32 = 4;
+        let grid = (((n as u32) + NROWS - 1) / NROWS, 1, 1);
+        let block = (32u32, NROWS, 1);
+
+        let mut p_gate = gate_data;
+        let mut p_up = up_data;
+        let mut p_x = x_q8;
+        let mut p_out = out;
+        let mut p_n = n;
+        let mut p_k = k;
+
+        hip_launch_kernel(
+            self.fn_fused_gate_up_silu_q4k_v2,
+            grid,
+            block,
+            0,
+            self.stream,
+            &mut [
+                &mut p_gate as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_up   as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out  as *mut *mut f32  as *mut std::ffi::c_void,
+                &mut p_n    as *mut i32       as *mut std::ffi::c_void,
+                &mut p_k    as *mut i32       as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V2: gemv_q6k_q8_v2 — wave32 + 4 rows/block + NO LDS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub unsafe fn gemv_q6k_q8_v2(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        const NROWS: u32 = 4;
+        let grid = (((n as u32) + NROWS - 1) / NROWS, m.max(1) as u32, 1);
+        let block = (32u32, NROWS, 1);
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_q6k_q8_v2,
+            grid,
+            block,
+            0,
             self.stream,
             &mut [
                 &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
@@ -2769,6 +2913,56 @@ impl GpuKernels {
 
         hip_launch_kernel(
             self.fn_flash_attention_decode,
+            grid, block, shared_bytes, self.stream,
+            &mut [
+                &mut p_q as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_k as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_v as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_seq as *mut i32 as *mut std::ffi::c_void,
+                &mut p_hdim as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nh as *mut i32 as *mut std::ffi::c_void,
+                &mut p_nkv as *mut i32 as *mut std::ffi::c_void,
+                &mut p_scale as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Item 5b: Flash Attention Decode v2 — warp-only, zero __syncthreads
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Flash Attention v2 for single-token decode.
+    /// Uses 1 warp (32 threads) per Q head with warp shuffle reduction.
+    /// Zero shared memory, zero __syncthreads. Requires head_dim=128.
+    pub unsafe fn flash_attention_decode_v2(
+        &self,
+        q: *const f32,
+        k_cache: *const f32,
+        v_cache: *const f32,
+        out: *mut f32,
+        seq_len: i32,
+        head_dim: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        scale: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n_heads as u32, 1, 1);
+        let block = (32u32, 1, 1);  // 1 warp per block
+        let shared_bytes = 0u32;
+
+        let mut p_q = q;
+        let mut p_k = k_cache;
+        let mut p_v = v_cache;
+        let mut p_out = out;
+        let mut p_seq = seq_len;
+        let mut p_hdim = head_dim;
+        let mut p_nh = n_heads;
+        let mut p_nkv = n_kv_heads;
+        let mut p_scale = scale;
+
+        hip_launch_kernel(
+            self.fn_flash_attention_decode_v2,
             grid, block, shared_bytes, self.stream,
             &mut [
                 &mut p_q as *mut *const f32 as *mut std::ffi::c_void,
