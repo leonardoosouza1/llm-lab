@@ -16,7 +16,7 @@ export CLANG_PATH=$ROCM_LLVM_PATH/bin/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $ROCM_LLVM_PATH/lib/clang/22/include -I$ROCM_PATH/include"
 export HSA_OVERRIDE_GFX_VERSION=10.3.0
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 CARGO_BIN="${HOME}/.cargo/bin/cargo"

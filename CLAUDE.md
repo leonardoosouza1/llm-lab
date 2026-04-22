@@ -15,17 +15,44 @@ Suporta múltiplos backends de hardware detectados em runtime:
 
 ```
 llm-lab/
-├── compute-core/       # Traits e param-structs (sem impl de hardware)
-│   └── src/            # ComputeBackend trait, AnyTensor, params
-├── rocm-backend/       # Impl AMD ROCm: wraps hip-ffi, hipBLAS + kernels HIP
-├── opencl-backend/     # Impl Intel iGPU: OpenCL C kernels (JIT) + GEMM
-├── hip-ffi/            # Bindings HIP/hipBLAS de baixo nível (usados por rocm-backend)
-├── iara-engine/        # Servidor Rust (tokio + axum) — usa só compute-core
-│   └── src/            # Ver iara-engine/CLAUDE.md
-├── frontend/           # Dashboard Vue3 (5 abas)
-├── models/             # Pesos safetensors (não versionados)
-│   └── qwen3-8b/       # Modelo ativo (36 camadas, 8.2B params)
-└── run_iara.sh         # Script de execução com vars ROCm
+├── Cargo.toml              # workspace
+├── CLAUDE.md
+│
+├── compute-core/           # Traits e param-structs (sem impl de hardware)
+├── rocm-backend/           # Impl AMD ROCm: wraps hip-ffi, hipBLAS + kernels HIP
+├── opencl-backend/         # Impl Intel iGPU: OpenCL C kernels (JIT) + GEMM
+├── ck-backend/             # Composable Kernels (WIP)
+├── hip-ffi/                # Bindings HIP/hipBLAS de baixo nível
+├── llama-sys/              # FFI llama.cpp (backend de alta performance)
+├── iara-engine/            # Servidor Rust (tokio + axum) — core de inferência
+├── iara-train/             # LoRA training + compressão DNA (planejado)
+├── iara-observe/           # Telemetria/observabilidade
+├── metaverse-core/         # Simulação metaverse (standalone)
+│
+├── scripts/                # Todos os .sh executáveis
+│   ├── run_iara.sh         # ROCm (AMD)
+│   ├── run_igpu.sh         # OpenCL (Intel)
+│   ├── run_stress.sh       # Stress test
+│   ├── bench.sh
+│   ├── compare_ollama.sh
+│   ├── tools/              # Python utilities (check_gguf, parse_gguf, ...)
+│   └── experiments/        # Python experiments
+│
+├── docs/                   # Documentação
+│   ├── architecture/       # ADRs, biotensor spec, DNA V4 handoff, pulse arch
+│   ├── quantization/       # QUANTIZATION*.md, cache
+│   ├── benchmarks/
+│   ├── research/           # RESEARCH.md + rust-stubs/ (referência)
+│   ├── meta/               # Roadmap, changelog
+│   └── prompts/
+│
+├── data/                   # JSON de topologia, DB, artifacts
+├── frontend/               # Dashboard Vue3
+│   ├── src/
+│   └── viz/                # JSX/HTML experimentais (weight-landscape, neural-viz-3d)
+│
+├── models/                 # Pesos safetensors (gitignored)
+└── vendor/                 # Deps vendored (llama-cpp)
 ```
 
 ## Fluxo de dados completo
@@ -77,11 +104,15 @@ Frontend: heatmap de camadas, top tokens, timeline
 
 ```bash
 # AMD ROCm (casa)
-./run_iara.sh            # debug
-./run_iara.sh release    # release
+./scripts/run_iara.sh            # debug
+./scripts/run_iara.sh release    # release
 
-# Intel iGPU (notebook) — sem ROCm
-cargo run -p iara-engine --no-default-features --features opencl
+# Intel iGPU (notebook)
+./scripts/run_igpu.sh            # ou: cargo run -p iara-engine --no-default-features --features opencl
+
+# Stress test
+./scripts/run_stress.sh
+
 # Acesse: http://localhost:3000
 ```
 

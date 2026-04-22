@@ -4,7 +4,7 @@
 // Requires a running IARA server with a model loaded.
 //
 // Usage:
-//   Terminal 1:  ./run_iara.sh release
+//   Terminal 1:  ./scripts/run_iara.sh release
 //   Terminal 2:  curl -X POST localhost:3000/api/load-model -H 'Content-Type: application/json' -d '{"name":"qwen2.5-1.5b"}'
 //   Terminal 2:  cargo run --release -p iara-engine --bin stress_test
 // ============================================================================
@@ -134,7 +134,7 @@ async fn main() {
             println!("FATAL: Server not reachable at {}", BASE_URL);
             println!("Error: {}", e);
             println!("\nStart the server first:");
-            println!("  Terminal 1: ./run_iara.sh release");
+            println!("  Terminal 1: ./scripts/run_iara.sh release");
             println!("  Terminal 2: curl -X POST localhost:3000/api/load-model \\");
             println!("    -H 'Content-Type: application/json' -d '{{\"name\":\"qwen2.5-1.5b\"}}'");
             std::process::exit(1);

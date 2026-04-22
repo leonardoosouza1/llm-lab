@@ -1,7 +1,7 @@
 //! Performance benchmark suite for IARA Engine.
 //!
 //! Run with a live server:
-//!   RUST_LOG=info IARA_QUANTIZE=1 ./run_iara.sh release &
+//!   RUST_LOG=info IARA_QUANTIZE=1 ./scripts/run_iara.sh release &
 //!   cargo test --release -p iara-engine --test benchmark -- --ignored --nocapture
 //!
 //! Results saved to: benchmark_results.json

@@ -12,8 +12,9 @@ rm -f iara-engine/target/.package-cache
 export ROCM_PATH=/opt/rocm-7.2.1
 export ROCM_LLVM_PATH=$ROCM_PATH/llvm
 # llama.cpp vendored libs + ROCm
-SCRIPT_DIR_LD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export LD_LIBRARY_PATH=$SCRIPT_DIR_LD/vendor/llama-cpp/lib:$ROCM_PATH/lib:$ROCM_LLVM_PATH/lib:$LD_LIBRARY_PATH
+# Script mora em scripts/ — ROOT_DIR é o workspace raiz
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export LD_LIBRARY_PATH=$ROOT_DIR/vendor/llama-cpp/lib:$ROCM_PATH/lib:$ROCM_LLVM_PATH/lib:$LD_LIBRARY_PATH
 
 # 3. Forçar Bindgen a usar o LLVM do ROCm
 export LIBCLANG_PATH=$ROCM_LLVM_PATH/lib
@@ -30,7 +31,7 @@ echo "🔧 GFX_OVERRIDE: $HSA_OVERRIDE_GFX_VERSION"
 # Argumentos:
 #   $1 = modo: release | debug | q4 | q4-release
 #   $2 = diretório dos modelos (default: ./models)
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$ROOT_DIR"
 cd "$SCRIPT_DIR"
 
 CARGO_BIN="${HOME}/.cargo/bin/cargo"
