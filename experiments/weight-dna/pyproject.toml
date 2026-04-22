@@ -1,0 +1,18 @@
+[project]
+name = "weight-dna"
+version = "0.0.1"
+description = "Weight DNA POC - Fase 0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.44",
+  "datasets>=2.21",
+  "tqdm>=4.66",
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "safetensors>=0.4",
+  "accelerate>=0.33",
+]
+
+[tool.uv]
+# We intentionally allow any torch (CPU build from PyPI is fine for baseline)

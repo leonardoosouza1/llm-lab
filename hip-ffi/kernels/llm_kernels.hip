@@ -2045,6 +2045,278 @@ extern "C" __global__ void fused_gate_up_silu_q4k_multi(
 }
 #undef FUSED_MLP_ROWS
 
+// ===========================================================================
+// V2 KERNELS — Wave32 + dp4a + multi-row + NO LDS
+//
+// Key design principles (from RDNA2/llama.cpp research):
+//   1. Wave32 native (1 SIMD cycle vs 2 for wave64)
+//   2. dp4a via __builtin_amdgcn_sdot4 (4×INT8 dot product)
+//   3. Multi-row blocks (4 rows per block, 4 warps)
+//   4. NO LDS for Q8_1 activation — L0 cache handles reuse (1.7KB << 16KB L0)
+//   5. Separated d/dmin accumulators (1 float sub at end vs per-block)
+//   6. Higher occupancy via launch_bounds
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_q4k_q8_v2 — Q4_K × Q8_1 GEMV, wave32, 4 rows/block, no LDS
+//
+// Grid : (ceil(N/4), M, 1)
+// Block: (32, 4, 1) — 4 warps, each handles one output row
+// ---------------------------------------------------------------------------
+#define GEMV_V2_NROWS 4
+__launch_bounds__(32 * GEMV_V2_NROWS, 4)
+extern "C" __global__ void gemv_q4k_q8_v2(
+    const unsigned char* __restrict__ w_data,  // [N * nblk * 144] raw Q4_K
+    const unsigned char* __restrict__ x_q8,    // [M * (K/32) * 36] Q8_1 blocks
+    float*               __restrict__ out,     // [M, N] output
+    int M, int N, int K,
+    float beta
+) {
+    const int row = blockIdx.x * GEMV_V2_NROWS + threadIdx.y;
+    const int mi  = blockIdx.y;
+    if (mi >= M || row >= N) return;
+
+    const int lane   = threadIdx.x;   // 0..31
+    const int group  = lane >> 3;     // 0..3  (4 sub-blocks of 8 lanes)
+    const int lane_g = lane & 7;      // 0..7  within sub-block
+    const int nblk   = K / 256;
+
+    const unsigned char* __restrict__ row_w  = w_data + (size_t)row * nblk * 144;
+    const unsigned char* __restrict__ x_base = x_q8 + (size_t)mi * (K / 32) * 36;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* bp = row_w + blk * 144;
+
+        // Combined d/dmin as uint32 → 1 load instead of 2 fp16
+        const unsigned int dm = *(const unsigned int*)bp;
+        const float d    = fp16_to_f32((unsigned short)(dm & 0xFFFF));
+        const float dmin = fp16_to_f32((unsigned short)(dm >> 16));
+
+        // Unpack sub-block scales
+        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+        unpack_scale_min_k4(2 * group,     bp + 4, &sc_lo, &m_lo);
+        unpack_scale_min_k4(2 * group + 1, bp + 4, &sc_hi, &m_hi);
+
+        // Q4 weight: 4 bytes = 8 nibbles per thread, perfectly coalesced across 32 lanes
+        const int q4 = *(const int*)(bp + 16 + group * 32 + lane_g * 4);
+
+        // Q8_1 activation: 2 sub-blocks per group, loaded from global (L0-cached)
+        const int q8_idx = blk * 8 + 2 * group;
+        const unsigned char* q8lp = x_base + (size_t)q8_idx * 36;
+        const unsigned char* q8hp = q8lp + 36;
+
+        const float d8l = fp16_to_f32(*(const unsigned short*)q8lp);
+        const float d8h = fp16_to_f32(*(const unsigned short*)q8hp);
+        const int u_lo = *(const int*)(q8lp + 4 + lane_g * 4);
+        const int u_hi = *(const int*)(q8hp + 4 + lane_g * 4);
+
+        // dp4a: 4×INT8 dot product + accumulate
+        const int dot_lo = dp4a(q4 & 0x0F0F0F0F, u_lo, 0);
+        const int dot_hi = dp4a((q4 >> 4) & 0x0F0F0F0F, u_hi, 0);
+        const int sum_lo = dp4a(0x01010101, u_lo, 0);
+        const int sum_hi = dp4a(0x01010101, u_hi, 0);
+
+        // Separated accumulators — integer dot*scale before float (fewer float ops)
+        sumf_d += d * (d8l * (float)(dot_lo * (int)sc_lo) + d8h * (float)(dot_hi * (int)sc_hi));
+        sumf_m += dmin * (d8l * (float)(sum_lo * (int)m_lo) + d8h * (float)(sum_hi * (int)m_hi));
+    }
+
+    float acc = sumf_d - sumf_m;
+
+    // Warp shuffle reduction — zero LDS, zero __syncthreads
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (lane == 0) {
+        const int out_idx = mi * N + row;
+        out[out_idx] = (beta != 0.0f) ? __fmaf_rn(beta, out[out_idx], acc) : acc;
+    }
+}
+#undef GEMV_V2_NROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_gate_up_silu_q4k_v2 — Fused gate+up+SiLU, wave32, 4 rows/block
+//
+// Computes SiLU(gate_proj(x)) * up_proj(x) for each output row.
+// Both projections share the same Q8_1 activation vector (L0-cached).
+//
+// Grid : (ceil(N/4), 1, 1)
+// Block: (32, 4, 1) — 4 warps, each handles one output row
+// ---------------------------------------------------------------------------
+#define FUSED_V2_NROWS 4
+__launch_bounds__(32 * FUSED_V2_NROWS, 2)
+extern "C" __global__ void fused_gate_up_silu_q4k_v2(
+    const unsigned char* __restrict__ gate_data,
+    const unsigned char* __restrict__ up_data,
+    const unsigned char* __restrict__ x_q8,
+    float*               __restrict__ out,
+    int N, int K
+) {
+    const int row = blockIdx.x * FUSED_V2_NROWS + threadIdx.y;
+    if (row >= N) return;
+
+    const int lane   = threadIdx.x;
+    const int group  = lane >> 3;
+    const int lane_g = lane & 7;
+    const int nblk   = K / 256;
+
+    const unsigned char* __restrict__ gate_w = gate_data + (size_t)row * nblk * 144;
+    const unsigned char* __restrict__ up_w   = up_data   + (size_t)row * nblk * 144;
+    const unsigned char* __restrict__ x_base = x_q8;  // M=1 for decode
+
+    float g_sumf_d = 0.0f, g_sumf_m = 0.0f;
+    float u_sumf_d = 0.0f, u_sumf_m = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        // ── Gate weights ──
+        const unsigned char* gbp = gate_w + blk * 144;
+        const unsigned int gdm = *(const unsigned int*)gbp;
+        const float gd    = fp16_to_f32((unsigned short)(gdm & 0xFFFF));
+        const float gdmin = fp16_to_f32((unsigned short)(gdm >> 16));
+        unsigned char gsc_lo, gm_lo, gsc_hi, gm_hi;
+        unpack_scale_min_k4(2 * group,     gbp + 4, &gsc_lo, &gm_lo);
+        unpack_scale_min_k4(2 * group + 1, gbp + 4, &gsc_hi, &gm_hi);
+        const int gq4 = *(const int*)(gbp + 16 + group * 32 + lane_g * 4);
+
+        // ── Up weights ──
+        const unsigned char* ubp = up_w + blk * 144;
+        const unsigned int udm = *(const unsigned int*)ubp;
+        const float ud    = fp16_to_f32((unsigned short)(udm & 0xFFFF));
+        const float udmin = fp16_to_f32((unsigned short)(udm >> 16));
+        unsigned char usc_lo, um_lo, usc_hi, um_hi;
+        unpack_scale_min_k4(2 * group,     ubp + 4, &usc_lo, &um_lo);
+        unpack_scale_min_k4(2 * group + 1, ubp + 4, &usc_hi, &um_hi);
+        const int uq4 = *(const int*)(ubp + 16 + group * 32 + lane_g * 4);
+
+        // ── Shared Q8_1 activation (L0-cached across warps) ──
+        const int q8_idx = blk * 8 + 2 * group;
+        const unsigned char* q8lp = x_base + (size_t)q8_idx * 36;
+        const unsigned char* q8hp = q8lp + 36;
+        const float d8l = fp16_to_f32(*(const unsigned short*)q8lp);
+        const float d8h = fp16_to_f32(*(const unsigned short*)q8hp);
+        const int u_lo = *(const int*)(q8lp + 4 + lane_g * 4);
+        const int u_hi = *(const int*)(q8hp + 4 + lane_g * 4);
+
+        // ── Gate dp4a ──
+        const int gdot_lo = dp4a(gq4 & 0x0F0F0F0F, u_lo, 0);
+        const int gdot_hi = dp4a((gq4 >> 4) & 0x0F0F0F0F, u_hi, 0);
+        const int gsum_lo = dp4a(0x01010101, u_lo, 0);
+        const int gsum_hi = dp4a(0x01010101, u_hi, 0);
+        g_sumf_d += gd * (d8l * (float)(gdot_lo * (int)gsc_lo) + d8h * (float)(gdot_hi * (int)gsc_hi));
+        g_sumf_m += gdmin * (d8l * (float)(gsum_lo * (int)gm_lo) + d8h * (float)(gsum_hi * (int)gm_hi));
+
+        // ── Up dp4a ──
+        const int udot_lo = dp4a(uq4 & 0x0F0F0F0F, u_lo, 0);
+        const int udot_hi = dp4a((uq4 >> 4) & 0x0F0F0F0F, u_hi, 0);
+        const int usum_lo = dp4a(0x01010101, u_lo, 0);
+        const int usum_hi = dp4a(0x01010101, u_hi, 0);
+        u_sumf_d += ud * (d8l * (float)(udot_lo * (int)usc_lo) + d8h * (float)(udot_hi * (int)usc_hi));
+        u_sumf_m += udmin * (d8l * (float)(usum_lo * (int)um_lo) + d8h * (float)(usum_hi * (int)um_hi));
+    }
+
+    float gate_val = g_sumf_d - g_sumf_m;
+    float up_val   = u_sumf_d - u_sumf_m;
+
+    // Warp reduction — zero LDS
+    for (int off = 16; off >= 1; off >>= 1) {
+        gate_val += __shfl_down(gate_val, off);
+        up_val   += __shfl_down(up_val, off);
+    }
+
+    if (lane == 0) {
+        // SiLU(gate) * up
+        float silu = gate_val / (1.0f + __expf(-gate_val));
+        out[row] = silu * up_val;
+    }
+}
+#undef FUSED_V2_NROWS
+
+// ---------------------------------------------------------------------------
+// Kernel: gemv_q6k_q8_v2 — Q6_K × Q8_1 GEMV, wave32, 4 rows/block, no LDS
+//
+// Same data access as proven gemv_q6k_q8 but with multi-row blocks.
+// Q6_K: 210 bytes per 256 values = ql[128] + qh[64] + scales[16] + d[2]
+//
+// Grid : (ceil(N/4), M, 1)
+// Block: (32, 4, 1)
+// ---------------------------------------------------------------------------
+#define GEMV_Q6K_V2_NROWS 4
+__launch_bounds__(32 * GEMV_Q6K_V2_NROWS, 4)
+extern "C" __global__ void gemv_q6k_q8_v2(
+    const unsigned char* __restrict__ w_data,
+    const unsigned char* __restrict__ x_q8,
+    float*               __restrict__ out,
+    int M, int N, int K,
+    float beta
+) {
+    const int row = blockIdx.x * GEMV_Q6K_V2_NROWS + threadIdx.y;
+    const int mi  = blockIdx.y;
+    if (mi >= M || row >= N) return;
+
+    const int lane = threadIdx.x;
+    const int nblk = K / 256;
+
+    const unsigned char* __restrict__ row_w  = w_data + (size_t)row * nblk * 210;
+    const unsigned char* __restrict__ x_base = x_q8 + (size_t)mi * (K / 32) * 36;
+
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* bp = row_w + blk * 210;
+        const unsigned char* ql = bp;
+        const unsigned char* qh = bp + 128;
+        const signed char* scales = (const signed char*)(bp + 192);
+        const float d6 = fp16_load(bp + 208);
+
+        // Process 8 sub-groups (each 32 values) — same pattern as gemv_q6k_q8
+        for (int q8_sub = 0; q8_sub < 8; q8_sub++) {
+            const int n_group = q8_sub >> 2;
+            const int sub = q8_sub & 3;
+
+            const unsigned char* ql_g = ql + n_group * 64;
+            const unsigned char* qh_g = qh + n_group * 32;
+            const signed char* sc_g = scales + n_group * 8;
+
+            const int is = lane >> 4;
+            const float sc = (float)sc_g[is + sub * 2];
+
+            int q_val;
+            switch (sub) {
+                case 0: q_val = (int)( ql_g[lane]      & 0xF) | (int)(((qh_g[lane] >> 0) & 3) << 4); break;
+                case 1: q_val = (int)( ql_g[32+lane]   & 0xF) | (int)(((qh_g[lane] >> 2) & 3) << 4); break;
+                case 2: q_val = (int)((ql_g[lane]      >> 4)) | (int)(((qh_g[lane] >> 4) & 3) << 4); break;
+                default: q_val = (int)((ql_g[32+lane]  >> 4)) | (int)(((qh_g[lane] >> 6) & 3) << 4); break;
+            }
+            q_val -= 32;
+
+            // Q8_1 activation (L0-cached across warps in the block)
+            const int q8_blk_idx = blk * 8 + q8_sub;
+            const unsigned char* q8_bp = x_base + (size_t)q8_blk_idx * 36;
+            const float d8 = fp16_to_f32(*(const unsigned short*)(q8_bp + 0));
+            const int q8_val = (int)((const signed char*)(q8_bp + 4))[lane];
+
+            float fval = sc * (float)(q_val * q8_val);
+
+            // Warp reduce per sub-group
+            for (int off = 16; off >= 1; off >>= 1)
+                fval += __shfl_down(fval, off);
+
+            if (lane == 0) {
+                acc += d6 * d8 * fval;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        const int out_idx = mi * N + row;
+        out[out_idx] = (beta != 0.0f) ? __fmaf_rn(beta, out[out_idx], acc) : acc;
+    }
+}
+#undef GEMV_Q6K_V2_NROWS
+
 // ---------------------------------------------------------------------------
 // Kernel: gemv_q4k_f32_multi — Q4_K weights × F32 activations GEMV
 //
@@ -4048,6 +4320,100 @@ extern "C" __global__ void flash_attention_decode(
     // Write output
     if (tid < head_dim && l > 0.0f) {
         out[head * head_dim + tid] = acc / l;
+    }
+}
+
+// ============================================================================
+// ITEM 5b: Flash Attention Decode v2 — Warp-only, zero __syncthreads
+// ============================================================================
+// Optimised decode attention for single-token generation (n=1).
+//
+// Key differences from v1 (flash_attention_decode):
+//   - 1 warp (32 threads) per Q head instead of 128 threads
+//   - Each thread owns head_dim/32 = 4 elements (for head_dim=128)
+//   - Dot product via warp shuffle only — NO __syncthreads at all
+//   - No shared memory — K/V read directly from global (L2 handles reuse)
+//   - Online softmax (FlashAttention-2 style)
+//
+// Grid : (n_heads, 1, 1)  — one block per Q head
+// Block: (32, 1, 1)       — one warp per block
+// Shared: 0 bytes
+
+__launch_bounds__(32, 16)   // max 16 waves/CU for register pressure hint
+extern "C" __global__ void flash_attention_decode_v2(
+    const float* __restrict__ q,        // [n_heads * head_dim]
+    const float* __restrict__ k_cache,  // [seq_len, n_kv_heads * head_dim]
+    const float* __restrict__ v_cache,  // [seq_len, n_kv_heads * head_dim]
+    float*       __restrict__ out,      // [n_heads * head_dim]
+    int seq_len,
+    int head_dim,
+    int n_heads,
+    int n_kv_heads,
+    float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= n_heads) return;
+    const int lane = threadIdx.x;  // 0..31
+
+    // GQA mapping
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+    const int kv_base = kv_head * head_dim;
+
+    // Each thread owns 4 consecutive Q elements (head_dim=128 / 32 lanes = 4)
+    const int base = lane * 4;
+    float q0 = q[head * head_dim + base + 0];
+    float q1 = q[head * head_dim + base + 1];
+    float q2 = q[head * head_dim + base + 2];
+    float q3 = q[head * head_dim + base + 3];
+
+    // Online softmax state
+    float m = -1e30f;   // running max
+    float l = 0.0f;     // running sum of exp
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;  // V accumulator
+
+    for (int s = 0; s < seq_len; s++) {
+        const int off = s * kv_stride + kv_base + base;
+
+        // Q·K dot product: each thread computes partial sum of 4 elements
+        float dot = q0 * k_cache[off]
+                  + q1 * k_cache[off + 1]
+                  + q2 * k_cache[off + 2]
+                  + q3 * k_cache[off + 3];
+
+        // Warp-wide reduction (wave32 shuffle — no __syncthreads)
+        dot += __shfl_xor(dot, 16);
+        dot += __shfl_xor(dot,  8);
+        dot += __shfl_xor(dot,  4);
+        dot += __shfl_xor(dot,  2);
+        dot += __shfl_xor(dot,  1);
+        // All lanes now have the full dot product
+
+        float score = dot * scale;
+
+        // Online softmax update
+        float m_new = fmaxf(m, score);
+        float exp_diff = __expf(m - m_new);
+        float p = __expf(score - m_new);
+
+        // Rescale accumulator and add new V contribution
+        a0 = a0 * exp_diff + p * v_cache[off];
+        a1 = a1 * exp_diff + p * v_cache[off + 1];
+        a2 = a2 * exp_diff + p * v_cache[off + 2];
+        a3 = a3 * exp_diff + p * v_cache[off + 3];
+
+        l = l * exp_diff + p;
+        m = m_new;
+    }
+
+    // Write normalised output
+    if (l > 0.0f) {
+        float inv_l = 1.0f / l;
+        const int out_base = head * head_dim + base;
+        out[out_base + 0] = a0 * inv_l;
+        out[out_base + 1] = a1 * inv_l;
+        out[out_base + 2] = a2 * inv_l;
+        out[out_base + 3] = a3 * inv_l;
     }
 }
 
