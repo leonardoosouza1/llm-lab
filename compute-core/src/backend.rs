@@ -121,6 +121,35 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_w8a16           (&self, _p: &GemvW8A16Params)        -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_w8a16".into()))
     }
+    /// SVD-factorized BF16 GEMV (DNA V4 virtual tensor).
+    /// Default impl chains two gemm_bf16_f32 calls via `scratch` — no kernel required.
+    /// Backends may override with a fused kernel for throughput.
+    fn gemv_svd_bf16(&self, p: &GemvSvdBf16Params) -> Result<(), BackendError> {
+        // Step 1: H [rank] = B [rank, cols] · X [cols]
+        self.gemm_bf16_f32(&GemmBf16Params {
+            m: 1,
+            n: p.rank,
+            k: p.cols,
+            alpha: 1.0,
+            beta: 0.0,
+            a: p.x,
+            a_offset: p.x_offset,
+            b: p.b,
+            c: p.scratch,
+        })?;
+        // Step 2: Y [rows] = A [rows, rank] · H [rank]
+        self.gemm_bf16_f32(&GemmBf16Params {
+            m: 1,
+            n: p.rows,
+            k: p.rank,
+            alpha: 1.0,
+            beta: p.beta,
+            a: p.scratch,
+            a_offset: 0,
+            b: p.a,
+            c: p.out,
+        })
+    }
     /// Fused RMSNorm + Q/K/V Q4K projection — eliminates Q8 intermediate.
     /// Saves 1 kernel per attention layer (rms_norm_quantize + fused_qkv → single launch).
     fn fused_rms_qkv_q4k_f32(&self, _p: &FusedRmsQkvQ4KF32Params) -> Result<(), BackendError> {

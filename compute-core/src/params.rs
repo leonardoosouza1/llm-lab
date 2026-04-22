@@ -252,6 +252,26 @@ pub struct GemvBf16F32Params<'a> {
     pub out: &'a AnyTensor,   // [n] F32 output
 }
 
+/// SVD-factorized GEMV: W ≈ A·B (rank-r thin SVD). Never reconstruct W in VRAM.
+///
+/// Shapes:
+///   W [rows, cols] factorized as A [rows, rank] · B [rank, cols]
+///   Y = W · X  ≡  Y = A · (B · X)
+/// Storage on disk/VRAM: A + B = (rows+cols)·rank·2B vs rows·cols·2B → ~95% savings at rank=64.
+/// Compute: 2 chained matvecs through scratch [rank] buffer.
+pub struct GemvSvdBf16Params<'a> {
+    pub rows: usize,              // output dim (= W rows)
+    pub cols: usize,              // input dim  (= W cols)
+    pub rank: usize,              // SVD rank (typ. 64-256)
+    pub a: &'a AnyTensor,         // [rows, rank] BF16
+    pub b: &'a AnyTensor,         // [rank, cols] BF16
+    pub x: &'a AnyTensor,         // [cols] F32 activations
+    pub x_offset: usize,          // element offset into x (F32)
+    pub scratch: &'a AnyTensor,   // [rank] F32 intermediate (device-resident, pre-allocated)
+    pub out: &'a AnyTensor,       // [rows] F32 output
+    pub beta: f32,                // 0.0 = overwrite; 1.0 = residual accumulate
+}
+
 /// W8A32 GEMV — INT8 weights × F32 activations → F32 output.
 /// Weights are quantized symmetrically per-row: w_f32 = w_i8 * scale[row].
 /// Halves memory bandwidth vs BF16 GEMV (1 byte/weight vs 2 bytes).

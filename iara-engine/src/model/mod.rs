@@ -564,6 +564,10 @@ pub enum LayerWeight {
     /// Halves weight memory bandwidth vs BF16: 1 byte/weight → ~2× decode speed.
     /// Quantized from BF16 at load time via quantize_w8_to_gpu().
     W8 { data: AnyTensor, scales: AnyTensor, n: usize, k: usize },
+    /// DNA V4 SVD factorization: W ≈ A·B, never materialize W in VRAM.
+    /// `a`: [n, rank] BF16, `b`: [rank, k] BF16, `scratch`: [rank] F32 device buffer.
+    /// Compute: Y = A·(B·X) via two chained gemm_bf16_f32 calls. ~95% memory savings.
+    Svd { a: AnyTensor, b: AnyTensor, scratch: AnyTensor, n: usize, k: usize, rank: usize },
 }
 
 impl LayerWeight {
@@ -579,6 +583,7 @@ impl LayerWeight {
             LayerWeight::Q6K { n, k, .. } => n * (k / 256) * 210,
             LayerWeight::Ternary { n, k, .. } => n * ((k + 3) / 4), // 2 bits/weight
             LayerWeight::W8 { n, k, .. } => n * k + n * 4,          // 1 byte/weight + 4 bytes scale/row
+            LayerWeight::Svd { n, k, rank, .. } => (n + k) * rank * 2 + rank * 4, // A + B + scratch
         }
     }
 }
@@ -726,6 +731,7 @@ impl CausalLM {
                     LayerWeight::Q6K { .. } => "Q6K",
                     LayerWeight::Ternary { .. } => "Ternary",
                     LayerWeight::W8 { .. } => "W8",
+                    LayerWeight::Svd { .. } => "SVD",
                 };
                 log::warn!("project() first call: weight={}, m={}, n={}, k={}, q8_scratch={}, precomputed={}",
                     wtype, m, n, k, q8_scratch.is_some(), q8_precomputed);
@@ -900,6 +906,28 @@ impl CausalLM {
                     n, k,
                     w: data,
                     scales,
+                    x: input,
+                    x_offset: a_offset,
+                    out: output,
+                    beta,
+                })?;
+            }
+            LayerWeight::Svd { a, b, scratch, n: _, k: _, rank } => {
+                // DNA V4 factorized projection: Y = A·(B·X) via 2 chained gemm_bf16_f32.
+                // Default trait impl handles the chaining — any backend with gemm_bf16_f32 works.
+                // Requires m=1 (decode path only); prefill falls back to gemm on reconstructed W
+                // which defeats the compression — we reject that case loudly.
+                if m != 1 {
+                    return Err(ModelError::Model(format!(
+                        "SVD weight only supports decode (m=1), got m={m}. \
+                         Prefill on SVD weights would need a batched gemv_svd — not implemented yet."
+                    )));
+                }
+                backend.gemv_svd_bf16(&compute_core::GemvSvdBf16Params {
+                    rows: n,
+                    cols: k,
+                    rank: *rank,
+                    a, b, scratch,
                     x: input,
                     x_offset: a_offset,
                     out: output,
@@ -1496,6 +1524,7 @@ impl CausalLM {
                 LayerWeight::Q4(_) => log::info!("  L0.wq Q4 (IARA quantized)"),
                 LayerWeight::Ternary { n, k, scale, .. } => log::info!("  L0.wq Ternary [{}×{}] scale={:.4}", n, k, scale),
                 LayerWeight::W8 { n, k, .. } => log::info!("  L0.wq W8 INT8 [{}×{}]", n, k),
+                LayerWeight::Svd { n, k, rank, .. } => log::info!("  L0.wq SVD [{}×{}] rank={}", n, k, rank),
             }
 
             // Check layer 0 input_norm (F32)

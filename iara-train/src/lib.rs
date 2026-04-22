@@ -1,5 +1,6 @@
 pub mod model;
 pub mod train;
+pub mod distill;
 
 // Re-export commonly used types for convenience
 pub use model::weights::ModelWeights;
