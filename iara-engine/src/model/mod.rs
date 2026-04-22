@@ -913,17 +913,12 @@ impl CausalLM {
                 })?;
             }
             LayerWeight::Svd { a, b, scratch, n: _, k: _, rank } => {
-                // DNA V4 factorized projection: Y = A·(B·X) via 2 chained gemm_bf16_f32.
+                // DNA V4 factorized projection: Y = X · Wᵀ = (X · Bᵀ) · Aᵀ via 2 chained gemm_bf16_f32.
                 // Default trait impl handles the chaining — any backend with gemm_bf16_f32 works.
-                // Requires m=1 (decode path only); prefill falls back to gemm on reconstructed W
-                // which defeats the compression — we reject that case loudly.
-                if m != 1 {
-                    return Err(ModelError::Model(format!(
-                        "SVD weight only supports decode (m=1), got m={m}. \
-                         Prefill on SVD weights would need a batched gemv_svd — not implemented yet."
-                    )));
-                }
+                // Supports both decode (m=1) and prefill (m>1). Scratch must be sized for
+                // `max_m * rank` F32 elements (caller's responsibility at allocation time).
                 backend.gemv_svd_bf16(&compute_core::GemvSvdBf16Params {
+                    m,
                     rows: n,
                     cols: k,
                     rank: *rank,
@@ -1261,6 +1256,195 @@ impl CausalLM {
             quantized: false,
             kuramoto_router,
             sparse_scratch,
+            #[cfg(feature = "experimental")]
+            stimulus_tx: None,
+            telemetry_enabled: false,
+            layer_router,
+        })
+    }
+
+    /// Carrega modelo a partir de arquivo `.dna` (DNA V4 — SVD factorization).
+    ///
+    /// Projection weights arrive as `DnaTensor::Svd { a, b, rows, cols, rank }` →
+    /// wrapped as `LayerWeight::Svd` with a per-projection `[rank]` F32 scratch buffer.
+    /// Non-factorized tensors (embed, lm_head, norms, biases) arrive as
+    /// `DnaTensor::Full` and become `LayerWeight::Bf16` / direct `AnyTensor`.
+    pub fn load_dna(
+        dna_path: &Path,
+        cfg: ModelCfg,
+        arch: ModelArchitecture,
+        backend: Arc<dyn ComputeBackend>,
+    ) -> ModelResult<Self> {
+        use crate::storage::dna::{DnaModel, DnaTensor};
+
+        log::info!(
+            "⏳ Carregando modelo DNA [{}]: {} camadas, hidden={}, vocab={}, path={}",
+            arch.family, cfg.num_layers, cfg.hidden_size, cfg.vocab_size, dna_path.display()
+        );
+
+        let mut dna = DnaModel::load(dna_path, &backend)
+            .map_err(|e| ModelError::Model(format!("Falha ao carregar .dna: {e}")))?;
+        log::info!(
+            "  → .dna carregado: {} tensores, max_rank={}, version={}",
+            dna.tensors.len(), dna.max_rank, dna.version
+        );
+
+        let tmap = &arch.tensor_map;
+
+        // Helper: take a Full tensor by name, returning the underlying AnyTensor.
+        fn take_full(dna: &mut crate::storage::dna::DnaModel, name: &str) -> ModelResult<AnyTensor> {
+            match dna.tensors.remove(name) {
+                Some(DnaTensor::Full { tensor, .. }) => Ok(tensor),
+                Some(DnaTensor::Svd { .. }) => Err(ModelError::Model(format!(
+                    "Tensor '{}' está como SVD mas esperado Full (norm/bias/embed)", name
+                ))),
+                None => Err(ModelError::Model(format!("Tensor '{}' não encontrado no .dna", name))),
+            }
+        }
+
+        // Helper: take any tensor by name and convert to LayerWeight.
+        // SVD → LayerWeight::Svd (com scratch [rank] F32); Full → LayerWeight::Bf16.
+        fn take_layer_weight(
+            dna: &mut crate::storage::dna::DnaModel,
+            backend: &Arc<dyn ComputeBackend>,
+            name: &str,
+        ) -> ModelResult<LayerWeight> {
+            match dna.tensors.remove(name) {
+                Some(DnaTensor::Svd { a, b, rows, cols, rank }) => {
+                    let scratch = backend.alloc_f32(&[rank]);
+                    Ok(LayerWeight::Svd { a, b, scratch, n: rows, k: cols, rank })
+                }
+                Some(DnaTensor::Full { tensor, .. }) => Ok(LayerWeight::Bf16(tensor)),
+                None => Err(ModelError::Model(format!("Tensor '{}' não encontrado no .dna", name))),
+            }
+        }
+
+        // Optional take helper: None if absent, Error if present-but-wrong-kind.
+        fn take_full_opt(
+            dna: &mut crate::storage::dna::DnaModel,
+            name_opt: Option<&String>,
+        ) -> ModelResult<Option<AnyTensor>> {
+            let Some(name) = name_opt else { return Ok(None); };
+            if !dna.tensors.contains_key(name) { return Ok(None); }
+            Ok(Some(take_full(dna, name)?))
+        }
+
+        // ── Embedding ───────────────────────────────────────────────────────
+        log::info!("  → embed_tokens");
+        let embed = take_full(&mut dna, &tmap.embed)?;
+
+        // ── Camadas ─────────────────────────────────────────────────────────
+        let kv_dim  = cfg.num_kv_heads * cfg.head_dim;
+        let max_seq = cfg.max_seq_len;
+
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if i % 8 == 0 { log::info!("  → layers {}/{} (DNA SVD)", i, cfg.num_layers); }
+
+            let wq_name    = tmap.layer_tensor(i, &tmap.attn_q);
+            let wk_name    = tmap.layer_tensor(i, &tmap.attn_k);
+            let wv_name    = tmap.layer_tensor(i, &tmap.attn_v);
+            let wo_name    = tmap.layer_tensor(i, &tmap.attn_o);
+            let wgate_name = tmap.layer_tensor(i, &tmap.mlp_gate);
+            let wup_name   = tmap.layer_tensor(i, &tmap.mlp_up);
+            let wdown_name = tmap.layer_tensor(i, &tmap.mlp_down);
+            let in_norm    = tmap.layer_tensor(i, &tmap.input_norm);
+            let pa_norm    = tmap.layer_tensor(i, &tmap.post_attn_norm);
+
+            let qbn = tmap.layer_tensor_opt(i, &tmap.attn_q_bias);
+            let kbn = tmap.layer_tensor_opt(i, &tmap.attn_k_bias);
+            let vbn = tmap.layer_tensor_opt(i, &tmap.attn_v_bias);
+            let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
+            let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
+
+            let wq    = take_layer_weight(&mut dna, &backend, &wq_name)?;
+            let wk    = take_layer_weight(&mut dna, &backend, &wk_name)?;
+            let wv    = take_layer_weight(&mut dna, &backend, &wv_name)?;
+            let wo    = take_layer_weight(&mut dna, &backend, &wo_name)?;
+            let wgate = take_layer_weight(&mut dna, &backend, &wgate_name)?;
+            let wup   = take_layer_weight(&mut dna, &backend, &wup_name)?;
+            let wdown = take_layer_weight(&mut dna, &backend, &wdown_name)?;
+
+            let input_norm_w     = take_full(&mut dna, &in_norm)?;
+            let post_attn_norm_w = take_full(&mut dna, &pa_norm)?;
+
+            let q_bias   = take_full_opt(&mut dna, qbn.as_ref())?;
+            let k_bias   = take_full_opt(&mut dna, kbn.as_ref())?;
+            let v_bias   = take_full_opt(&mut dna, vbn.as_ref())?;
+            let q_norm_w = take_full_opt(&mut dna, qnn.as_ref())?;
+            let k_norm_w = take_full_opt(&mut dna, knn.as_ref())?;
+
+            layers.push(TransformerLayer {
+                wq, wk, wv, wo, wgate, wup, wdown,
+                q_bias, k_bias, v_bias,
+                q_norm_w, k_norm_w,
+                input_norm_w,
+                post_attn_norm_w,
+                kv_k: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+                kv_v: GpuKvCache::new(&backend, max_seq, kv_dim, cfg.num_kv_heads, cfg.head_dim),
+            });
+        }
+
+        if layers.first().map_or(false, |l| l.q_norm_w.is_some()) {
+            log::info!("  → QK Normalization detectada (DNA): q_norm + k_norm em todas as camadas");
+        }
+
+        // ── Final norm ──────────────────────────────────────────────────────
+        let norm_w = take_full(&mut dna, &tmap.final_norm)?;
+        let norm_b = take_full_opt(&mut dna, tmap.final_norm_bias.as_ref())?;
+
+        // ── LM head ─────────────────────────────────────────────────────────
+        // Tied weights path exige `lm_head` explícito no .dna (não reutilizamos `embed`
+        // pois `AnyTensor` do device não é clonável). Writers devem gravar ambos.
+        let lm_head = if dna.tensors.contains_key(&tmap.lm_head) {
+            take_layer_weight(&mut dna, &backend, &tmap.lm_head)?
+        } else if arch.tie_word_embeddings {
+            return Err(ModelError::Model(
+                "tied word embeddings no .dna exige 'lm_head' presente como tensor separado. \
+                 Rebuild do .dna incluindo lm_head explícito.".into()
+            ));
+        } else {
+            return Err(ModelError::Model(format!(
+                "Tensor lm_head '{}' não encontrado no .dna", tmap.lm_head
+            )));
+        };
+
+        // ── VRAM accounting ────────────────────────────────────────────────
+        let bf16_bytes = |t: &AnyTensor| t.numel() * 2;
+        let f32_bytes  = |t: &AnyTensor| t.numel() * 4;
+        let layer_weight_bytes = |w: &LayerWeight| w.vram_bytes();
+
+        let mut vram_bytes = bf16_bytes(&embed) + layer_weight_bytes(&lm_head);
+        for l in &layers {
+            vram_bytes += layer_weight_bytes(&l.wq) + layer_weight_bytes(&l.wk) + layer_weight_bytes(&l.wv)
+                        + layer_weight_bytes(&l.wo) + layer_weight_bytes(&l.wgate)
+                        + layer_weight_bytes(&l.wup) + layer_weight_bytes(&l.wdown);
+            vram_bytes += f32_bytes(&l.input_norm_w) + f32_bytes(&l.post_attn_norm_w);
+            vram_bytes += l.kv_k.data.numel() * 4 + l.kv_v.data.numel() * 4;
+        }
+
+        log::info!("✅ Modelo DNA [{}] carregado — memória estimada: {:.2} GB",
+            arch.family, vram_bytes as f64 / 1e9);
+
+        let scratch = ForwardScratchpad::new(&cfg, &backend);
+        let layer_router = OnlineLayerRouter::new(&backend, cfg.num_layers, cfg.hidden_size);
+
+        Ok(Self {
+            embed,
+            layers,
+            norm_w,
+            norm_b,
+            lm_head,
+            cfg,
+            arch,
+            vram_bytes,
+            backend,
+            scratch,
+            cfc: None,
+            gravity: None,
+            quantized: false,
+            kuramoto_router: None,
+            sparse_scratch: None,
             #[cfg(feature = "experimental")]
             stimulus_tx: None,
             telemetry_enabled: false,

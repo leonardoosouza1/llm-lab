@@ -12,7 +12,7 @@ use compute_core::{
         KvCacheWhtAppendParams, KvCacheWhtReadParams,
         GatherRowsBf16Params, GatherColsBf16Params,
         KuramotoCoherenceParams, TopkSelectParams, FusedAttentionDecodeParams, FusedGateUpSiluParams, FusedQkvParams, FusedRmsNormQuantizeParams, FusedRopeKvCopyParams,
-        GemvTernaryF32Params, GemvW8A16Params,
+        GemvTernaryF32Params, GemvW8A16Params, GemvSvdBf16Params,
     },
     AnyTensor, BackendError, ComputeBackend, DType,
 };
@@ -635,6 +635,45 @@ impl ComputeBackend for RocmBackend {
             }
         };
         result.map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn gemv_svd_bf16(&self, p: &GemvSvdBf16Params) -> Result<(), BackendError> {
+        // LDS budget on RDNA2: 64 KB per block. Kernel uses (cols + rank) * 4 bytes.
+        // Cap rank ≤ 1024 and (cols + rank) ≤ 12288 (48 KB) to leave headroom for
+        // warp_sums[8] (32 B) + compiler spill. Fall back to default 2-gemm path otherwise.
+        const RANK_CAP: usize = 1024;
+        const LDS_FLOATS_CAP: usize = 12288;
+        // Fused kernel only handles decode (m=1). Fall back to 2-gemm chain
+        // for prefill (m>1) or when LDS budget is exceeded.
+        if p.m != 1 || p.rank > RANK_CAP || (p.cols + p.rank) > LDS_FLOATS_CAP {
+            self.gemm_bf16_f32(&GemmBf16Params {
+                m: p.m, n: p.rank, k: p.cols,
+                alpha: 1.0, beta: 0.0,
+                a: p.x, a_offset: p.x_offset,
+                b: p.b, c: p.scratch,
+            })?;
+            return self.gemm_bf16_f32(&GemmBf16Params {
+                m: p.m, n: p.rows, k: p.rank,
+                alpha: 1.0, beta: p.beta,
+                a: p.scratch, a_offset: 0,
+                b: p.a, c: p.out,
+            });
+        }
+
+        let x_ptr = unsafe { f32_ptr(p.x).add(p.x_offset) };
+        unsafe {
+            self.kernels.gemv_svd_bf16_fused(
+                u16_ptr(p.a),
+                u16_ptr(p.b),
+                x_ptr,
+                f32_mut_ptr(p.out),
+                p.rows as i32,
+                p.cols as i32,
+                p.rank as i32,
+                p.beta,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     fn gemv_w8a16(&self, p: &GemvW8A16Params) -> Result<(), BackendError> {

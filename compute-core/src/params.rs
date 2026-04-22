@@ -252,23 +252,30 @@ pub struct GemvBf16F32Params<'a> {
     pub out: &'a AnyTensor,   // [n] F32 output
 }
 
-/// SVD-factorized GEMV: W ≈ A·B (rank-r thin SVD). Never reconstruct W in VRAM.
+/// SVD-factorized GEMV/GEMM: W ≈ A·B (rank-r thin SVD). Never reconstruct W in VRAM.
 ///
 /// Shapes:
 ///   W [rows, cols] factorized as A [rows, rank] · B [rank, cols]
-///   Y = W · X  ≡  Y = A · (B · X)
+///   For X [m, cols] (row-major activations):
+///     Y [m, rows] = X · Wᵀ = X · Bᵀ · Aᵀ = (X · Bᵀ) · Aᵀ
+///   `m = 1` is the decode path; `m > 1` is the prefill path.
 /// Storage on disk/VRAM: A + B = (rows+cols)·rank·2B vs rows·cols·2B → ~95% savings at rank=64.
-/// Compute: 2 chained matvecs through scratch [rank] buffer.
+/// Compute: 2 chained GEMMs through `scratch` buffer.
+///
+/// Scratch sizing: caller MUST allocate `scratch` with at least `max_m * rank` F32 elements,
+/// where `max_m` is the maximum token batch seen during forward (typically the prefill
+/// sequence length cap). For decode-only usage, `rank` is sufficient.
 pub struct GemvSvdBf16Params<'a> {
+    pub m: usize,                 // token batch (1 = decode, n_tokens = prefill)
     pub rows: usize,              // output dim (= W rows)
     pub cols: usize,              // input dim  (= W cols)
     pub rank: usize,              // SVD rank (typ. 64-256)
     pub a: &'a AnyTensor,         // [rows, rank] BF16
     pub b: &'a AnyTensor,         // [rank, cols] BF16
-    pub x: &'a AnyTensor,         // [cols] F32 activations
+    pub x: &'a AnyTensor,         // [m, cols] F32 activations
     pub x_offset: usize,          // element offset into x (F32)
-    pub scratch: &'a AnyTensor,   // [rank] F32 intermediate (device-resident, pre-allocated)
-    pub out: &'a AnyTensor,       // [rows] F32 output
+    pub scratch: &'a AnyTensor,   // [m * rank] F32 intermediate (device-resident, pre-allocated)
+    pub out: &'a AnyTensor,       // [m, rows] F32 output
     pub beta: f32,                // 0.0 = overwrite; 1.0 = residual accumulate
 }
 

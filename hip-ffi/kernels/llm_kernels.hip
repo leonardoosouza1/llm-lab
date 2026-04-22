@@ -5105,3 +5105,101 @@ extern "C" __global__ void gemv_q6k_f32_w32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel: gemv_svd_bf16_fused — SVD-factorized GEMV in a single launch
+//
+// Computes Y = A · (B · X) where:
+//   A [rows, rank] BF16 (row-major, stored as u16)
+//   B [rank, cols] BF16 (row-major, stored as u16)
+//   X [cols]       F32
+//   Y [rows]       F32
+//
+// Y[i] = Σ_k A[i,k] * (Σ_j B[k,j] * X[j])
+//
+// Grid : (rows, 1, 1) — one block per output row
+// Block: (32, 8, 1)   — 256 threads, 8 warps of 32 lanes (wave32)
+// Shared: (cols + rank) * sizeof(float)
+//
+// Phase 1: all 256 threads cooperatively load X into LDS.
+// Phase 2: each warp reduces one (or more) k in [0, rank), computing
+//          scratch[k] = Σ_j B[k,j] * X[j] via stride-32 lane walk + warp reduce.
+// Phase 3: all 256 threads compute partial Y[i] = Σ_k A[i,k] * scratch[k]
+//          over rank, then block-reduce to lane 0 of warp 0.
+//
+// Cap rank ≤ 1024 (scratch = 4 KB) at caller side; this kernel does not check.
+// Cap cols ≤ ~14000 (LDS budget ~56 KB F32) likewise caller-gated.
+// ---------------------------------------------------------------------------
+#define GEMV_SVD_BLOCK 256
+__launch_bounds__(GEMV_SVD_BLOCK, 2)
+extern "C" __global__ void gemv_svd_bf16_fused(
+    const unsigned short* __restrict__ A,   // [rows, rank] BF16
+    const unsigned short* __restrict__ B,   // [rank, cols] BF16
+    const float*          __restrict__ X,   // [cols] F32
+    float*                __restrict__ Y,   // [rows] F32
+    int rows, int cols, int rank,
+    float beta
+) {
+    const int i       = (int)blockIdx.x;       // output row
+    const int lane    = (int)threadIdx.x;      // 0..31
+    const int warp_id = (int)threadIdx.y;      // 0..7
+    const int tid     = warp_id * 32 + lane;   // 0..255
+
+    if (i >= rows) return;
+
+    extern __shared__ float smem[];
+    float* x_smem       = smem;            // [cols]
+    float* scratch_smem = smem + cols;     // [rank]
+
+    // ── Phase 1: cooperatively load X → LDS ───────────────────────────────
+    for (int j = tid; j < cols; j += GEMV_SVD_BLOCK) {
+        x_smem[j] = X[j];
+    }
+    __syncthreads();
+
+    // ── Phase 2: scratch[k] = Σ_j B[k,j] * x[j] — one warp per k chunk ────
+    // Each warp owns k values with stride 8 (= num_warps).
+    for (int k = warp_id; k < rank; k += 8) {
+        const unsigned short* __restrict__ b_row = B + (size_t)k * cols;
+        float acc_k = 0.0f;
+        for (int j = lane; j < cols; j += 32) {
+            acc_k += bf16_to_f32(b_row[j]) * x_smem[j];
+        }
+        // Warp reduction (wave32)
+        for (int off = 16; off >= 1; off >>= 1) {
+            acc_k += __shfl_down(acc_k, off);
+        }
+        if (lane == 0) {
+            scratch_smem[k] = acc_k;
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 3: Y[i] = Σ_k A[i,k] * scratch[k] — all 256 threads reduce ──
+    const unsigned short* __restrict__ a_row = A + (size_t)i * rank;
+    float y_acc = 0.0f;
+    for (int k = tid; k < rank; k += GEMV_SVD_BLOCK) {
+        y_acc += bf16_to_f32(a_row[k]) * scratch_smem[k];
+    }
+
+    // Warp reduction
+    for (int off = 16; off >= 1; off >>= 1) {
+        y_acc += __shfl_down(y_acc, off);
+    }
+
+    // Cross-warp reduction via LDS
+    __shared__ float warp_sums[8];
+    if (lane == 0) warp_sums[warp_id] = y_acc;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float v = (lane < 8) ? warp_sums[lane] : 0.0f;
+        for (int off = 4; off >= 1; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        if (lane == 0) {
+            Y[i] = (beta == 0.0f) ? v : __fmaf_rn(beta, Y[i], v);
+        }
+    }
+}
+#undef GEMV_SVD_BLOCK
+

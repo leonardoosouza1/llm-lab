@@ -121,13 +121,18 @@ pub trait ComputeBackend: Send + Sync + 'static {
     fn gemv_w8a16           (&self, _p: &GemvW8A16Params)        -> Result<(), BackendError> {
         Err(BackendError::NotImplemented("gemv_w8a16".into()))
     }
-    /// SVD-factorized BF16 GEMV (DNA V4 virtual tensor).
+    /// SVD-factorized BF16 GEMM/GEMV (DNA V4 virtual tensor).
     /// Default impl chains two gemm_bf16_f32 calls via `scratch` — no kernel required.
+    /// Handles both decode (m=1) and prefill (m>1) with the same math path.
     /// Backends may override with a fused kernel for throughput.
+    ///
+    /// Scratch buffer must hold `m * rank` F32 elements.
     fn gemv_svd_bf16(&self, p: &GemvSvdBf16Params) -> Result<(), BackendError> {
-        // Step 1: H [rank] = B [rank, cols] · X [cols]
+        // Step 1: scratch [m, rank] = X [m, cols] · Bᵀ [cols, rank]
+        // gemm_bf16_f32 treats `b` as [n, k] (pre-transposed layout in VRAM), so passing
+        // B tensor of shape [rank, cols] with n=rank, k=cols yields X · Bᵀ.
         self.gemm_bf16_f32(&GemmBf16Params {
-            m: 1,
+            m: p.m,
             n: p.rank,
             k: p.cols,
             alpha: 1.0,
@@ -137,9 +142,10 @@ pub trait ComputeBackend: Send + Sync + 'static {
             b: p.b,
             c: p.scratch,
         })?;
-        // Step 2: Y [rows] = A [rows, rank] · H [rank]
+        // Step 2: Y [m, rows] = scratch [m, rank] · Aᵀ [rank, rows]
+        // A tensor is [rows, rank]; with n=rows, k=rank we get scratch · Aᵀ.
         self.gemm_bf16_f32(&GemmBf16Params {
-            m: 1,
+            m: p.m,
             n: p.rows,
             k: p.rank,
             alpha: 1.0,
@@ -317,4 +323,97 @@ pub trait ComputeBackend: Send + Sync + 'static {
 
     /// (free_bytes, total_bytes) — opcional, retorna None se não disponível.
     fn mem_info(&self) -> Option<(usize, usize)> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Verifies the SVD-factorized GEMM math that `gemv_svd_bf16`'s default impl
+    //! encodes. Since no CPU ComputeBackend ships in this crate, we emulate the
+    //! two gemm_bf16_f32 calls with a pure-F32 row-major matmul helper and
+    //! confirm `(X · Bᵀ) · Aᵀ ≈ X · (A·B)ᵀ` — i.e., that the chained form
+    //! produces the same output as computing against the reconstructed W.
+    //!
+    //! This locks in the math of the default impl; the full backend integration
+    //! is covered by rocm-backend / opencl-backend smoke tests at runtime.
+    //!
+    //! Backend-level numerical tests against real hardware are deferred until a
+    //! ROCm/OpenCL test harness is available — document only here.
+
+    /// Row-major F32 matmul: C [m, n] = A [m, k] · B [k, n], beta-scaled.
+    fn matmul_rm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    /// Treats `b` as `[n, k]` pre-transposed (matches gemm_bf16_f32's `b` layout).
+    /// Computes C [m, n] = A [m, k] · Bᵀ, where B is stored [n, k] row-major.
+    fn matmul_b_transposed(a: &[f32], b_nk: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b_nk[j * k + p];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    fn run_case(m: usize) {
+        let rows = 7usize;  // W.rows (output dim)
+        let cols = 11usize; // W.cols (input dim)
+        let rank = 3usize;
+
+        // Deterministic pseudo-random fill.
+        let mk = |n: usize, seed: u32| -> Vec<f32> {
+            (0..n).map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                ((x & 0xFFFF) as f32 / 65535.0) - 0.5
+            }).collect()
+        };
+
+        let a_mat = mk(rows * rank, 1); // A [rows, rank]
+        let b_mat = mk(rank * cols, 2); // B [rank, cols]
+        let x     = mk(m * cols, 3);    // X [m, cols]
+
+        // Reference: reconstruct W [rows, cols] = A · B, then Y = X · Wᵀ.
+        let w = matmul_rm(&a_mat, &b_mat, rows, cols, rank);
+        // Y_ref [m, rows] = X · Wᵀ.  W stored [rows, cols] → treat as "b [n=rows, k=cols]".
+        let y_ref = matmul_b_transposed(&x, &w, m, rows, cols);
+
+        // Chained form — mirrors default impl:
+        //   Step 1: scratch [m, rank] = X · Bᵀ, with B passed as [n=rank, k=cols].
+        let scratch = matmul_b_transposed(&x, &b_mat, m, rank, cols);
+        //   Step 2: Y [m, rows] = scratch · Aᵀ, with A passed as [n=rows, k=rank].
+        let y_chained = matmul_b_transposed(&scratch, &a_mat, m, rows, rank);
+
+        assert_eq!(y_ref.len(), y_chained.len());
+        for (i, (r, c)) in y_ref.iter().zip(y_chained.iter()).enumerate() {
+            let diff = (r - c).abs();
+            assert!(
+                diff < 1e-4,
+                "m={m} idx={i} ref={r} chained={c} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn svd_chained_matches_reconstructed_m1() { run_case(1); }
+
+    #[test]
+    fn svd_chained_matches_reconstructed_m4() { run_case(4); }
+
+    #[test]
+    fn svd_chained_matches_reconstructed_m16() { run_case(16); }
 }

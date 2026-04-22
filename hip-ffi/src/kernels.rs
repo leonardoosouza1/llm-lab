@@ -90,6 +90,7 @@ pub struct GpuKernels {
     fn_gemv_q4k_f32_w32: hipFunction_t,
     fn_gemv_q6k_f32_w32: hipFunction_t,
     fn_gemv_bf16_f32_multi: hipFunction_t,
+    fn_gemv_svd_bf16_fused: hipFunction_t,
     fn_fused_rms_qkv_q4k_f32: hipFunction_t,
     fn_fused_rms_gate_up_silu_q4k_f32: hipFunction_t,
     fn_fused_rms_qkv_q4_f32: hipFunction_t,
@@ -190,6 +191,7 @@ impl GpuKernels {
         let fn_gemv_q4k_f32_w32 = get_fn!("gemv_q4k_f32_w32");
         let fn_gemv_q6k_f32_w32 = get_fn!("gemv_q6k_f32_w32");
         let fn_gemv_bf16_f32_multi = get_fn!("gemv_bf16_f32_multi");
+        let fn_gemv_svd_bf16_fused = get_fn!("gemv_svd_bf16_fused");
         let fn_fused_rms_qkv_q4k_f32 = get_fn!("fused_rms_qkv_q4k_f32");
         let fn_fused_rms_gate_up_silu_q4k_f32 = get_fn!("fused_rms_gate_up_silu_q4k_f32");
         let fn_fused_rms_qkv_q4_f32 = get_fn!("fused_rms_qkv_q4_f32");
@@ -275,6 +277,7 @@ impl GpuKernels {
             fn_gemv_q4k_f32_w32,
             fn_gemv_q6k_f32_w32,
             fn_gemv_bf16_f32_multi,
+            fn_gemv_svd_bf16_fused,
             fn_fused_rms_qkv_q4k_f32,
             fn_fused_rms_gate_up_silu_q4k_f32,
             fn_fused_rms_qkv_q4_f32,
@@ -1627,6 +1630,55 @@ impl GpuKernels {
                 &mut p_out as *mut *mut f32   as *mut std::ffi::c_void,
                 &mut p_n   as *mut i32        as *mut std::ffi::c_void,
                 &mut p_k   as *mut i32        as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gemv_svd_bf16_fused — SVD-factorized GEMV in a single launch
+    // Y = A [rows, rank] · (B [rank, cols] · X [cols]) with BF16 weights.
+    // Grid : (rows, 1, 1)  Block: (32, 8, 1)
+    // Shared: (cols + rank) * sizeof(float)
+    // ─────────────────────────────────────────────────────────────────────────
+    pub unsafe fn gemv_svd_bf16_fused(
+        &self,
+        a: *const u16,   // [rows, rank] BF16
+        b: *const u16,   // [rank, cols] BF16
+        x: *const f32,   // [cols] F32
+        y: *mut f32,     // [rows] F32
+        rows: i32,
+        cols: i32,
+        rank: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (rows as u32, 1, 1);
+        let block = (32u32, 8, 1);
+        let shared_bytes = ((cols + rank) as u32) * 4;
+
+        let mut p_a    = a;
+        let mut p_b    = b;
+        let mut p_x    = x;
+        let mut p_y    = y;
+        let mut p_rows = rows;
+        let mut p_cols = cols;
+        let mut p_rank = rank;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_gemv_svd_bf16_fused,
+            grid,
+            block,
+            shared_bytes,
+            self.stream,
+            &mut [
+                &mut p_a    as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_b    as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_x    as *mut *const f32 as *mut std::ffi::c_void,
+                &mut p_y    as *mut *mut f32   as *mut std::ffi::c_void,
+                &mut p_rows as *mut i32        as *mut std::ffi::c_void,
+                &mut p_cols as *mut i32        as *mut std::ffi::c_void,
+                &mut p_rank as *mut i32        as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32        as *mut std::ffi::c_void,
             ],
         )
     }
