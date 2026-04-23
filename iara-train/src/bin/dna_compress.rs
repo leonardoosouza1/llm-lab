@@ -16,6 +16,7 @@ use clap::Parser;
 use compute_core::dna_format::DnaWriter;
 use half::bf16;
 use log::{info, warn};
+use memmap2::Mmap;
 use safetensors::{tensor::TensorView, SafeTensors};
 
 use iara_train::distill::dna::{
@@ -52,15 +53,24 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let bytes = fs::read(&cli.input)?;
-    let st = SafeTensors::deserialize(&bytes).map_err(|e| anyhow::anyhow!("safetensors: {e}"))?;
+    // Zero-copy mmap input: safetensors views point into mmap'd pages on demand,
+    // so peak RAM is driven by the SVD on a single tensor, not the whole model.
+    let file = fs::File::open(&cli.input)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let st = SafeTensors::deserialize(&mmap).map_err(|e| anyhow::anyhow!("safetensors: {e}"))?;
     let policy = default_rank_policy(cli.rank);
 
     let mut writer = DnaWriter::create(&cli.output)?;
     let (mut n_svd, mut n_raw) = (0usize, 0usize);
     let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
 
-    for (name, view) in st.tensors() {
+    // Iterate tensor names only — materialize each view inside the loop so intermediate
+    // buffers (f32_data, HostBf16Matrix, nalgebra SVD scratch, factors) drop before next iter.
+    let names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
+    let total = names.len();
+
+    for (idx, name) in names.iter().enumerate() {
+        let view = st.tensor(name).map_err(|e| anyhow::anyhow!("tensor {name}: {e}"))?;
         let numel: usize = view.shape().iter().product();
         bytes_in += view.data().len() as u64;
 
@@ -68,20 +78,25 @@ fn main() -> anyhow::Result<()> {
         let small = numel < cli.min_numel_for_svd || view.shape().iter().any(|&d| d < 32);
 
         if !is_2d || small {
-            write_raw(&mut writer, &name, &view)?;
+            write_raw(&mut writer, name, &view)?;
             n_raw += 1;
             continue;
         }
 
         let rows = view.shape()[0];
         let cols = view.shape()[1];
-        let rank = policy.rank_for(&name).min(rows).min(cols);
+        let rank = policy.rank_for(name).min(rows).min(cols);
+
+        // Per-tensor peak RAM (F32): W_f32=rows*cols*4 + SVD workspace ≈ ~3-4x.
+        let est_mb = (rows * cols * 16) as f64 / 1e6;
+        info!("[{}/{}] {name} {rows}x{cols} rank={rank} (~{:.0} MB peak)", idx + 1, total, est_mb);
 
         let f32_data = view_to_f32(&view);
         let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
+        drop(f32_data);
 
         let mut factors = compress_tensor(&w, rank);
-        info!("{name}: {rows}x{cols} rank={rank} rmse={:.4e}", factors.residual_rmse);
+        info!("  rmse={:.4e}", factors.residual_rmse);
 
         if cli.polish_steps > 0 {
             let before = factors.residual_rmse;
@@ -90,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         writer.write_tsvd(
-            &name,
+            name,
             rows as u32,
             cols as u32,
             rank as u32,
@@ -99,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         n_svd += 1;
         bytes_out += 16 + (factors.a_bf16.len() as u64 + factors.b_bf16.len() as u64) * 2;
+        // factors, w, view drop here — memory reclaimed before next iter.
     }
 
     writer.finalize()?;

@@ -278,6 +278,31 @@ pub async fn models_handler(
             continue;
         }
 
+        // ── .dna files: SVD-factorized single-file bundles ──
+        if path.extension().and_then(|e| e.to_str()) == Some("dna") && path.is_file() {
+            let name = path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let size_mb = entry.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+            models.push(ModelInfo {
+                name: name.clone(),
+                path: path.to_string_lossy().to_string(),
+                hidden_size:       None,
+                num_layers:        None,
+                vocab_size:        None,
+                num_heads:         None,
+                num_kv_heads:      None,
+                head_dim:          None,
+                intermediate_size: None,
+                architecture:      Some(format!("DNA-SVD [{:.1} MB]", size_mb)),
+                torch_dtype:       Some("bf16-svd".to_string()),
+                model_kind:        "causal_lm".to_string(),
+                has_vision:        false,
+            });
+            continue;
+        }
+
         // ── Standard directory models: read from config.json ──
         if !path.is_dir() { continue; }
 
@@ -418,6 +443,19 @@ pub async fn load_model_handler(
     };
     let use_iara = iara_file.is_some();
 
+    // Check for .dna file: {name}.dna in models_dir, or sibling .dna of a model dir
+    let dna_file = if model_path.extension().and_then(|e| e.to_str()) == Some("dna") && model_path.exists() {
+        Some(model_path.clone())
+    } else {
+        let candidate = state.models_dir.join(format!("{}.dna", &req.name));
+        if candidate.exists() { Some(candidate) }
+        else {
+            let sibling = model_path.with_extension("dna");
+            if sibling.exists() { Some(sibling) } else { None }
+        }
+    };
+    let use_dna = dna_file.is_some();
+
     // For .iara standalone files, config.json may be in a base model dir
     // e.g., qwen2.5-1.5b-fp8.iara → look for config.json in qwen2.5-1.5b/
     let config_dir = if model_path.is_dir() {
@@ -426,7 +464,7 @@ pub async fn load_model_handler(
         // Try to find a related model directory (strip suffixes like -fp8, -q4, -q4km, -ptt)
         let name_str = req.name.as_str();
         // Strip .gguf extension if present in name
-        let name_clean = name_str.trim_end_matches(".gguf").trim_end_matches(".iara");
+        let name_clean = name_str.trim_end_matches(".gguf").trim_end_matches(".iara").trim_end_matches(".dna");
         let base_names = [
             name_clean.to_string(),
             name_clean.rsplitn(2, '-').last().unwrap_or(name_clean).to_string(),
@@ -443,7 +481,7 @@ pub async fn load_model_handler(
     };
 
     let use_gguf = gguf_file.is_some();
-    if !use_iara && !use_gguf && !config_dir.join("config.json").exists() {
+    if !use_iara && !use_gguf && !use_dna && !config_dir.join("config.json").exists() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Modelo '{}' não encontrado (nem .gguf, .iara nem config.json)", req.name) })),
@@ -583,6 +621,7 @@ pub async fn load_model_handler(
     let enable_cfc    = state.enable_cfc;
     let resolved_iara_file = iara_file.clone();
     let resolved_gguf_file = gguf_file.clone();
+    let resolved_dna_file  = dna_file.clone();
     let resolved_config_dir = config_dir.clone();
 
     tokio::spawn(async move {
@@ -721,6 +760,41 @@ pub async fn load_model_handler(
             };
 
             CausalLM::load_from_iara(iara_path, cfg, arch, backend)
+        } else if let Some(ref dna_path) = resolved_dna_file {
+            log::info!("📦 Detectado arquivo .dna (SVD-factorized): {}", dna_path.display());
+            let _ = frame_tx.send(serde_json::json!({
+                "type": "status",
+                "message": format!("Carregando '{}' do formato .dna (SVD direto para VRAM)...", model_name)
+            }).to_string());
+
+            let config_path = resolved_config_dir.join("config.json");
+            let cfg = match ModelCfg::from_config_json(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("❌ Falha ao ler config.json para .dna: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO config para .dna '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let arch = match ModelArchitecture::from_config_json(&config_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("❌ Falha ao detectar arquitetura para .dna: {}", e);
+                    let _ = frame_tx.send(serde_json::json!({
+                        "type": "status",
+                        "message": format!("ERRO arquitetura para .dna '{}': {}", model_name, e)
+                    }).to_string());
+                    model_loading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            CausalLM::load_dna(dna_path, cfg, arch, backend)
         } else {
             // Load from safetensors (traditional path)
             let config_path = model_path.join("config.json");

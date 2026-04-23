@@ -130,10 +130,12 @@ fn write_tiny_dna(path: &std::path::Path) {
         &zeros((rank_mlp * inter) as usize),
     ).unwrap();
 
-    // Norms — TRAW BF16 (loader accepts BF16 from take_full; final_norm requires AnyTensor)
-    w.write_traw_bf16("model.layers.0.input_layernorm.weight", &[h], &zeros(h as usize)).unwrap();
-    w.write_traw_bf16("model.layers.0.post_attention_layernorm.weight", &[h], &zeros(h as usize)).unwrap();
-    w.write_traw_bf16("model.norm.weight", &[h], &zeros(h as usize)).unwrap();
+    // Norms — TRAW F32 (forward expects F32 device buffers for RMSNorm weights).
+    // Use ones to avoid divide-by-zero weirdness in RMSNorm when x is all zero.
+    let ones_f32 = |n: usize| -> Vec<f32> { vec![1.0f32; n] };
+    w.write_traw_f32("model.layers.0.input_layernorm.weight", &[h], &ones_f32(h as usize)).unwrap();
+    w.write_traw_f32("model.layers.0.post_attention_layernorm.weight", &[h], &ones_f32(h as usize)).unwrap();
+    w.write_traw_f32("model.norm.weight", &[h], &ones_f32(h as usize)).unwrap();
 
     // lm_head [vocab, h] TRAW BF16 (not tied)
     w.write_traw_bf16("lm_head.weight", &[vocab, h], &zeros((vocab * h) as usize)).unwrap();
@@ -153,7 +155,7 @@ fn load_dna_roundtrip_tiny() {
     let cfg = tiny_cfg();
     let arch = tiny_arch();
 
-    let model = CausalLM::load_dna(&dna_path, cfg.clone(), arch, backend)
+    let mut model = CausalLM::load_dna(&dna_path, cfg.clone(), arch, backend)
         .expect("load_dna should succeed");
 
     // Structural checks
@@ -181,4 +183,14 @@ fn load_dna_roundtrip_tiny() {
         LayerWeight::Bf16(t) => assert_eq!(t.numel(), cfg.vocab_size * cfg.hidden_size),
         _ => panic!("lm_head should be Bf16 (Full)"),
     }
+
+    // End-to-end forward on a single token. All weights are zero here, so logits
+    // should be well-defined (RMSNorm(0)=0, zero attn, zero MLP, zero logits) —
+    // but critically: the SVD dispatch path (gemv_svd_bf16) must execute on every
+    // projection without crashing, NaN, or shape mismatch.
+    model.reset_cache();
+    let (logits, _traces) = model.forward(&[1u32], None)
+        .expect("forward through DNA model should not error");
+    assert_eq!(logits.len(), cfg.vocab_size, "logits vocab size");
+    assert!(logits.iter().all(|x: &f32| x.is_finite()), "logits must be finite (no NaN/Inf)");
 }
