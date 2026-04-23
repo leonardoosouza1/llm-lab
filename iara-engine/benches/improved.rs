@@ -632,11 +632,11 @@ fn benchmark_ck_cpu_fallback(c: &mut Criterion) {
     group.sample_size(5);
 
     // CPU GEMM+SiLU fused (512×512)
-    group.bench_function("gemm_silu_fused_512x512", |b| {
+    group.bench_function("gemm_silu_fused_512x512", |bench| {
         let a: Vec<f32> = (0..512 * 512).map(|i| i as f32 * 0.001).collect();
         let b: Vec<f32> = (0..512 * 512).map(|i| i as f32 * 0.001).collect();
 
-        b.iter(|| {
+        bench.iter(|| {
             let mut c = vec![0.0f32; 512 * 512];
             // Simplified fused GEMM+SiLU
             for i in 0..512 {
@@ -654,11 +654,11 @@ fn benchmark_ck_cpu_fallback(c: &mut Criterion) {
     });
 
     // CPU GEMM+GELU fused (512×512)
-    group.bench_function("gemm_gelu_fused_512x512", |b| {
+    group.bench_function("gemm_gelu_fused_512x512", |bench| {
         let a: Vec<f32> = (0..512 * 512).map(|i| i as f32 * 0.001).collect();
         let b: Vec<f32> = (0..512 * 512).map(|i| i as f32 * 0.001).collect();
 
-        b.iter(|| {
+        bench.iter(|| {
             let mut c = vec![0.0f32; 512 * 512];
             // Simplified fused GEMM+GELU
             for i in 0..512 {
