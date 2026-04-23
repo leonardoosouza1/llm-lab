@@ -526,7 +526,9 @@ pub async fn load_model_handler(
 
     // ── GGUF + llama.cpp fast path ──────────────────────────────────────
     // IARA_NO_LLAMA=1 forces native IARA backend even for GGUF files (for benchmarking)
-    let use_llama_cpp = !state.ternary_on_load && std::env::var("IARA_NO_LLAMA").map(|v| v != "1").unwrap_or(true);
+    // .dna files take precedence over GGUF — native SVD path is the explicit artifact.
+    let use_llama_cpp = !use_dna && !state.ternary_on_load
+        && std::env::var("IARA_NO_LLAMA").map(|v| v != "1").unwrap_or(true);
     if use_llama_cpp { if let Some(ref gguf_path) = gguf_file {
         let llama_arc = state.llama_engine.clone();
         let batch_arc = state.batch_handle.clone();
