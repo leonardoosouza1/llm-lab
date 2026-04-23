@@ -1,27 +1,36 @@
 //! dna_compress — convert a safetensors model to `.dna` V4 via Thin SVD.
 //!
+//! Parallel worker pool (rayon) computes factors for independent tensors
+//! concurrently. A dedicated writer thread serializes output so the .dna
+//! file is written in a safe, deterministic order.
+//!
 //! Usage:
 //!   dna_compress --input model.safetensors --output model.dna --rank 64 \
-//!                [--polish-steps 50] [--polish-lr 0.01]
+//!                [--polish-steps 50] [--polish-lr 0.01] [--threads N]
 //!
 //! Per-tensor rank selection:
 //!   - Default rank from --rank
 //!   - Suffix overrides: embed/lm_head = max(rank, 256); q/k/v_proj = max(rank, 128)
 //!   - Small tensors (< 2D or any dim < 32) stored as TRAW (no SVD)
+//!   - embed_tokens / lm_head always Full (SVD breaks row-select semantics)
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Instant;
 
 use clap::Parser;
 use compute_core::dna_format::DnaWriter;
+use compute_core::ComputeBackend;
 use half::bf16;
 use log::{info, warn};
 use memmap2::Mmap;
+use rayon::prelude::*;
 use safetensors::{tensor::TensorView, SafeTensors};
 
 use iara_train::distill::dna::{
-    compress_tensor, compress_tensor_randomized, default_rank_policy, polish_svd,
-    HostBf16Matrix, RankPolicy,
+    compress_tensor, compress_tensor_randomized, compress_tensor_rsvd_gpu_raw,
+    default_rank_policy, polish_svd, HostBf16Matrix, RankPolicy,
 };
 
 #[derive(Parser, Debug)]
@@ -49,111 +58,288 @@ struct Cli {
     #[arg(long, default_value_t = 1024)]
     min_numel_for_svd: usize,
 
-    /// Use randomized SVD (Halko) for tensors above this numel threshold. Full SVD
-    /// below. Default 1M ≈ ~1024² — full SVD fine; above, randomized is 10-100× faster.
+    /// Use randomized SVD (Halko) for tensors above this numel threshold.
     #[arg(long, default_value_t = 1_000_000)]
     randomized_threshold: usize,
 
-    /// Randomized SVD oversampling (extra samples past rank for subspace quality).
+    /// Randomized SVD oversampling.
     #[arg(long, default_value_t = 10)]
     rsvd_oversample: usize,
 
-    /// Power iterations for randomized SVD (more = better tail accuracy, slower).
+    /// Power iterations for randomized SVD.
     #[arg(long, default_value_t = 2)]
     rsvd_power_iters: usize,
 
     /// Force full (deterministic) SVD for all tensors regardless of size.
     #[arg(long)]
     force_full_svd: bool,
+
+    /// Worker threads for parallel compression (0 = rayon default = num CPUs).
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// Disable GPU probing and force CPU-only compression.
+    #[arg(long)]
+    cpu_only: bool,
+
+    /// Numel threshold above which to prefer GPU rsvd (when available).
+    /// Small tensors stay on CPU (rayon-parallel) to amortize GPU dispatch cost.
+    #[arg(long, default_value_t = 100_000)]
+    gpu_threshold: usize,
+}
+
+/// Message sent from compute workers to the writer thread.
+enum WriteMsg {
+    Tsvd {
+        name: String,
+        rows: u32,
+        cols: u32,
+        rank: u32,
+        a_bf16: Vec<u16>,
+        b_bf16: Vec<u16>,
+    },
+    TrawBf16 {
+        name: String,
+        shape: Vec<u32>,
+        data: Vec<u16>,
+    },
+    TrawF32 {
+        name: String,
+        shape: Vec<u32>,
+        data: Vec<f32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
-    // Zero-copy mmap input: safetensors views point into mmap'd pages on demand,
-    // so peak RAM is driven by the SVD on a single tensor, not the whole model.
+    if cli.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.threads)
+            .build_global()
+            .ok(); // may already be initialized — ignore
+    }
+    let nthreads = rayon::current_num_threads();
+    info!("Parallel compression with {} worker threads", nthreads);
+
+    // Probe GPU backend for full-GPU rsvd path. Falls back to CPU rayon if absent.
+    // why: hipBLAS/hipSOLVER handles are single-queue per context. Wrap in a mutex
+    //      so rayon workers serialize the GPU section while still parallelizing
+    //      the bf16→f32 conversion and I/O build before/after.
+    let gpu_backend: Option<std::sync::Arc<std::sync::Mutex<rocm_backend::RocmBackend>>> =
+        if cli.cpu_only {
+            info!("--cpu-only set; skipping GPU probe");
+            None
+        } else {
+            match rocm_backend::RocmBackend::probe() {
+                Ok(b) => {
+                    info!("ROCm GPU detected — using full-GPU rsvd for tensors with numel ≥ {}", cli.gpu_threshold);
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(b)))
+                }
+                Err(e) => {
+                    warn!("No ROCm GPU ({e}). Falling back to CPU rsvd.");
+                    None
+                }
+            }
+        };
+
     let file = fs::File::open(&cli.input)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap).map_err(|e| anyhow::anyhow!("safetensors: {e}"))?;
+
+    // Detect tied word embeddings from sibling config.json. If tied and the
+    // safetensors lacks an explicit lm_head, duplicate embed bytes under
+    // "lm_head.weight" in the .dna so the engine loader doesn't need a tie
+    // resolver. Disk cost: one extra TRAW for a ~500MB embed.
+    let config_path = cli.input.parent()
+        .map(|p| p.join("config.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("config.json"));
+    let tied_embeddings = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("tie_word_embeddings").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    let safetensors_has_lm_head = st.names().iter().any(|n|
+        *n == "lm_head.weight" || n.ends_with(".lm_head.weight"));
+    let synth_lm_head = tied_embeddings && !safetensors_has_lm_head;
+    if synth_lm_head {
+        info!("Tied embeddings detected; will write lm_head.weight as a duplicate of embed_tokens.");
+    }
     let policy = default_rank_policy(cli.rank);
 
-    let mut writer = DnaWriter::create(&cli.output)?;
-    let (mut n_svd, mut n_raw) = (0usize, 0usize);
-    let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
-
-    // Iterate tensor names only — materialize each view inside the loop so intermediate
-    // buffers (f32_data, HostBf16Matrix, nalgebra SVD scratch, factors) drop before next iter.
     let names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
     let total = names.len();
+    info!("Found {} tensors in {}", total, cli.input.display());
 
-    for (idx, name) in names.iter().enumerate() {
-        let view = st.tensor(name).map_err(|e| anyhow::anyhow!("tensor {name}: {e}"))?;
+    // ── Writer thread: single producer of file writes ─────────────────────
+    let output_path = cli.output.clone();
+    let (tx, rx) = mpsc::channel::<WriteMsg>();
+    let writer_handle = std::thread::spawn(move || -> anyhow::Result<(usize, usize, u64)> {
+        let mut writer = DnaWriter::create(&output_path)?;
+        let (mut n_svd, mut n_raw, mut bytes_out) = (0usize, 0usize, 0u64);
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                WriteMsg::Tsvd { name, rows, cols, rank, a_bf16, b_bf16 } => {
+                    bytes_out += 16 + (a_bf16.len() as u64 + b_bf16.len() as u64) * 2;
+                    writer.write_tsvd(&name, rows, cols, rank, &a_bf16, &b_bf16)?;
+                    n_svd += 1;
+                }
+                WriteMsg::TrawBf16 { name, shape, data } => {
+                    bytes_out += 12 + data.len() as u64 * 2;
+                    writer.write_traw_bf16(&name, &shape, &data)?;
+                    n_raw += 1;
+                }
+                WriteMsg::TrawF32 { name, shape, data } => {
+                    bytes_out += 12 + data.len() as u64 * 4;
+                    writer.write_traw_f32(&name, &shape, &data)?;
+                    n_raw += 1;
+                }
+            }
+        }
+        writer.finalize()?;
+        Ok((n_svd, n_raw, bytes_out))
+    });
+
+    // ── Parallel compute: factor each tensor on a worker ──────────────────
+    let t0 = Instant::now();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let bytes_in = std::sync::atomic::AtomicU64::new(0);
+
+    // Closure per tensor: parse → factor (GPU if available) → send to writer.
+    // Raw/non-SVD tensors go through rayon (CPU-bound byte shuffling).
+    // SVD candidates go through sequential GPU loop below (single hipBLAS/hipSOLVER queue).
+    let process_raw = |name: &String, tx: &mpsc::Sender<WriteMsg>| -> Option<(usize, usize, usize)> {
+        let view = match st.tensor(name) {
+            Ok(v) => v,
+            Err(e) => { warn!("tensor '{name}' parse error: {e}"); return None; }
+        };
+        let shape: Vec<u32> = view.shape().iter().map(|&d| d as u32).collect();
         let numel: usize = view.shape().iter().product();
-        bytes_in += view.data().len() as u64;
+        bytes_in.fetch_add(view.data().len() as u64, std::sync::atomic::Ordering::Relaxed);
 
         let is_2d = view.shape().len() == 2;
         let small = numel < cli.min_numel_for_svd || view.shape().iter().any(|&d| d < 32);
+        let force_full = name.ends_with(".embed_tokens.weight")
+                       || name.ends_with("lm_head.weight")
+                       || name == "embed_tokens.weight";
+        let is_raw = !is_2d || small || force_full;
 
-        if !is_2d || small {
-            write_raw(&mut writer, name, &view)?;
-            n_raw += 1;
-            continue;
+        if is_raw {
+            if let Some(msg) = build_raw_msg(name, &shape, &view) { tx.send(msg).ok(); }
+            let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if done % 25 == 0 || done == total {
+                info!("progress {done}/{total} ({:.0}s elapsed)", t0.elapsed().as_secs_f32());
+            }
+            return None;
         }
+        Some((view.shape()[0], view.shape()[1], numel))
+    };
 
+    // Partition: raw in rayon (parallel), SVD candidates collected for sequential GPU pass.
+    let svd_candidates: Vec<&String> = names.par_iter().filter_map({
+        let tx = tx.clone();
+        move |name| {
+            match process_raw(name, &tx) {
+                None => None,
+                Some(_) => Some(name),
+            }
+        }
+    }).collect();
+    info!("Raw tensors done; {} SVD candidates pending GPU pass", svd_candidates.len());
+
+    let backend = gpu_backend.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("GPU required for SVD pass — pass --cpu-only to disable SVD entirely"))?
+        .clone();
+
+    for name in svd_candidates {
+        let view = st.tensor(name).map_err(|e| anyhow::anyhow!("tensor parse {name}: {e}"))?;
         let rows = view.shape()[0];
         let cols = view.shape()[1];
+        let numel = rows * cols;
         let rank = policy.rank_for(name).min(rows).min(cols);
 
-        // Per-tensor peak RAM (F32): W_f32=rows*cols*4 + SVD workspace ≈ ~3-4x.
-        let est_mb = (rows * cols * 16) as f64 / 1e6;
-        info!("[{}/{}] {name} {rows}x{cols} rank={rank} (~{:.0} MB peak)", idx + 1, total, est_mb);
+        let seed = name.bytes().fold(0u64, |h, b| h.wrapping_mul(1315423911).wrapping_add(b as u64));
+        let t_tensor = Instant::now();
+        let use_gpu = numel >= cli.gpu_threshold && !cli.force_full_svd
+                     && view.dtype() == safetensors::Dtype::BF16;
 
-        let f32_data = view_to_f32(&view);
-        let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
-        drop(f32_data);
-
-        let use_randomized = !cli.force_full_svd && numel > cli.randomized_threshold;
-        let t0 = std::time::Instant::now();
-        let mut factors = if use_randomized {
-            // Seed from a hash of the tensor name → deterministic but unique per tensor
-            let seed = name.bytes().fold(0u64, |h, b| h.wrapping_mul(1315423911).wrapping_add(b as u64));
-            compress_tensor_randomized(&w, rank, cli.rsvd_oversample, cli.rsvd_power_iters, seed)
+        let mut factors = if use_gpu {
+            // Zero-copy path: reinterpret mmap bytes as &[u16] and upload directly.
+            // bf16 is little-endian on all supported targets; bytes align to 2.
+            let bytes = view.data();
+            debug_assert_eq!(bytes.len(), numel * 2);
+            let bf16_slice: &[u16] = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const u16, numel)
+            };
+            let guard = backend.lock().expect("gpu backend mutex");
+            let r = compress_tensor_rsvd_gpu_raw(&*guard, bf16_slice, rows, cols, rank, cli.rsvd_oversample, seed)
+                .map_err(|e| anyhow::anyhow!("{name}: GPU rsvd failed: {e:?}"))?;
+            guard.sync().ok();
+            r
         } else {
-            compress_tensor(&w, rank)
+            let f32_data = view_to_f32(&view);
+            let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
+            drop(f32_data);
+            if cli.force_full_svd {
+                compress_tensor(&w, rank)
+            } else {
+                compress_tensor_randomized(&w, rank, cli.rsvd_oversample, cli.rsvd_power_iters, seed)
+            }
         };
-        let method = if use_randomized { "rsvd" } else { "full" };
-        info!("  [{method}] rmse={:.4e} in {:.1}s", factors.residual_rmse, t0.elapsed().as_secs_f32());
+        let method = if use_gpu { "gpu-rsvd" } else if cli.force_full_svd { "full" } else { "rsvd" };
+        log::debug!("{name} {rows}x{cols} rank={rank} [{method}] rmse={:.4e} in {:.2}s",
+            factors.residual_rmse, t_tensor.elapsed().as_secs_f32());
 
         if cli.polish_steps > 0 {
-            let before = factors.residual_rmse;
-            let after = polish_svd(&mut factors, &w, cli.polish_steps, cli.polish_lr);
-            info!("  polish: {:.4e} → {:.4e}", before, after);
+            let f32_data = view_to_f32(&view);
+            let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
+            drop(f32_data);
+            polish_svd(&mut factors, &w, cli.polish_steps, cli.polish_lr);
         }
 
-        writer.write_tsvd(
-            name,
-            rows as u32,
-            cols as u32,
-            rank as u32,
-            &factors.a_bf16,
-            &factors.b_bf16,
-        )?;
-        n_svd += 1;
-        bytes_out += 16 + (factors.a_bf16.len() as u64 + factors.b_bf16.len() as u64) * 2;
-        // factors, w, view drop here — memory reclaimed before next iter.
+        tx.send(WriteMsg::Tsvd {
+            name: name.to_string(),
+            rows: rows as u32, cols: cols as u32, rank: rank as u32,
+            a_bf16: factors.a_bf16, b_bf16: factors.b_bf16,
+        }).ok();
+
+        let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if done % 25 == 0 || done == total {
+            info!("progress {done}/{total} ({:.0}s elapsed)", t0.elapsed().as_secs_f32());
+        }
     }
 
-    writer.finalize()?;
+    // Synthetic lm_head duplicate for tied embeddings.
+    if synth_lm_head {
+        let embed_name = names.iter().find(|n|
+            n.ends_with(".embed_tokens.weight") || *n == "embed_tokens.weight"
+        ).cloned();
+        if let Some(en) = embed_name {
+            let view = st.tensor(&en).map_err(|e| anyhow::anyhow!("re-read embed for lm_head: {e}"))?;
+            let shape: Vec<u32> = view.shape().iter().map(|&d| d as u32).collect();
+            if let Some(msg) = build_raw_msg("lm_head.weight", &shape, &view) {
+                tx.send(msg).ok();
+                info!("Wrote synthetic lm_head.weight (tied to {en})");
+            }
+        } else {
+            warn!("tie_word_embeddings=true but no embed_tokens found in safetensors");
+        }
+    }
 
+    // Drop remaining tx so the writer thread's recv loop exits.
+    drop(tx);
+    let (n_svd, n_raw, bytes_out) = writer_handle.join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+
+    let bytes_in = bytes_in.load(std::sync::atomic::Ordering::Relaxed);
     let meta = fs::metadata(&cli.output)?;
     let ratio = (bytes_out as f64) / (bytes_in.max(1) as f64);
     info!(
-        "wrote {} ({} tensors: {} SVD + {} raw). compression: {:.1}% of original ({:.2} MB → {:.2} MB)",
+        "wrote {} ({} tensors: {} SVD + {} raw) in {:.1}s. compression: {:.1}% of original ({:.2} MB → {:.2} MB)",
         cli.output.display(),
-        n_svd + n_raw,
-        n_svd,
-        n_raw,
+        n_svd + n_raw, n_svd, n_raw,
+        t0.elapsed().as_secs_f32(),
         ratio * 100.0,
         bytes_in as f64 / 1024.0 / 1024.0,
         meta.len() as f64 / 1024.0 / 1024.0,
@@ -161,28 +347,39 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_raw(w: &mut DnaWriter, name: &str, view: &TensorView) -> anyhow::Result<()> {
-    let shape: Vec<u32> = view.shape().iter().map(|&d| d as u32).collect();
-    let dtype = view.dtype();
+fn build_raw_msg(name: &str, shape: &[u32], view: &TensorView) -> Option<WriteMsg> {
     let data = view.data();
-    match dtype {
+    // why: the inference engine loads 1D tensors (norms, biases) as F32 on device
+    //      and panics with "expected F32 DeviceBuffer" if we hand it BF16. Widen
+    //      here; they're tiny (hidden-size scale), so cost is negligible.
+    let widen_to_f32 = shape.len() == 1;
+    match view.dtype() {
+        safetensors::Dtype::BF16 | safetensors::Dtype::F16 if widen_to_f32 => {
+            let is_bf16 = view.dtype() == safetensors::Dtype::BF16;
+            let f32s: Vec<f32> = data.chunks_exact(2).map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                if is_bf16 { f32::from_bits((bits as u32) << 16) }
+                else { half::f16::from_bits(bits).to_f32() }
+            }).collect();
+            Some(WriteMsg::TrawF32 { name: name.into(), shape: shape.to_vec(), data: f32s })
+        }
         safetensors::Dtype::BF16 | safetensors::Dtype::F16 => {
-            let u16s: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            w.write_traw_bf16(name, &shape, &u16s)?;
+            let u16s: Vec<u16> = data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            Some(WriteMsg::TrawBf16 { name: name.into(), shape: shape.to_vec(), data: u16s })
         }
         safetensors::Dtype::F32 => {
             let f32s: Vec<f32> = data.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            w.write_traw_f32(name, &shape, &f32s)?;
+            Some(WriteMsg::TrawF32 { name: name.into(), shape: shape.to_vec(), data: f32s })
         }
         other => {
             warn!("{name}: unsupported dtype {:?}, storing as raw BF16 zeros (placeholder)", other);
             let numel: usize = view.shape().iter().product();
             let zeros = vec![0u16; numel];
-            w.write_traw_bf16(name, &shape, &zeros)?;
+            Some(WriteMsg::TrawBf16 { name: name.into(), shape: shape.to_vec(), data: zeros })
         }
     }
-    Ok(())
 }
 
 fn view_to_f32(view: &TensorView) -> Vec<f32> {
@@ -198,6 +395,5 @@ fn view_to_f32(view: &TensorView) -> Vec<f32> {
     }
 }
 
-// Suppress unused-import warning on `RankPolicy` — kept for API clarity.
 #[allow(dead_code)]
 fn _ensure_policy_api_exposed() { let _ = std::any::type_name::<RankPolicy>(); }

@@ -310,6 +310,274 @@ pub fn polish_svd(
     last_rmse
 }
 
+/// GPU-accelerated polish: same semantics as `polish_svd` but all GEMMs run on
+/// the provided `ComputeBackend` via `sgemm`. Does NOT depend on hipSOLVER —
+/// only sgemm + `add_tensors_inplace` + `copy_f32_d2d` (the last with a
+/// CPU-reupload fallback for backends that don't override it).
+///
+/// Loss: ½·‖A·B − W‖²_F. Gradients:
+///   dL/dA = (A·B − W)·Bᵀ · (1/n)
+///   dL/dB = Aᵀ·(A·B − W)  · (1/n)
+///
+/// Returns the final RMSE (pre-last-update) and writes back BF16 factors.
+pub fn polish_svd_gpu(
+    backend: &dyn compute_core::ComputeBackend,
+    factors: &mut SvdFactors,
+    w_target: &HostBf16Matrix,
+    steps: usize,
+    lr: f32,
+) -> f32 {
+    use compute_core::SgemmParams;
+
+    assert_eq!(factors.rows, w_target.rows);
+    assert_eq!(factors.cols, w_target.cols);
+    let (rows, cols, rank) = (factors.rows, factors.cols, factors.rank);
+
+    // Host-side F32 conversions (single shot).
+    let w_host: Vec<f32> = w_target.to_f32();
+    let mut a_host: Vec<f32> = factors.a_bf16.iter()
+        .map(|&b| bf16::from_bits(b).to_f32()).collect();
+    let mut b_host: Vec<f32> = factors.b_bf16.iter()
+        .map(|&b| bf16::from_bits(b).to_f32()).collect();
+
+    // Device buffers.
+    let w_dev = backend.upload_f32(&w_host, &[rows, cols]);
+    let a_dev = backend.upload_f32(&a_host, &[rows, rank]);
+    let b_dev = backend.upload_f32(&b_host, &[rank, cols]);
+    let diff_dev = backend.alloc_f32(&[rows, cols]);
+    let grad_a_dev = backend.alloc_f32(&[rows, rank]);
+    let grad_b_dev = backend.alloc_f32(&[rank, cols]);
+
+    let n = (rows * cols) as f32;
+    let inv_n = 1.0 / n;
+    let mut last_rmse = f32::INFINITY;
+
+    // why: this routine needs device-to-device copy to prefill diff_dev with W
+    //      each step (for the sgemm beta=-1 trick). The trait default returns
+    //      NotImplemented, so we probe once and bail early if the backend lacks
+    //      it — the CPU `polish_svd` already covers that case.
+    // TODO: drop this requirement once a device axpy/fill kernel is on the trait.
+    if backend.copy_f32_d2d(&w_dev, &diff_dev, rows * cols).is_err() {
+        log::warn!("polish_svd_gpu: backend lacks copy_f32_d2d; falling back to CPU polish");
+        // Discard device state; delegate to CPU path.
+        drop((w_dev, a_dev, b_dev, diff_dev, grad_a_dev, grad_b_dev));
+        return polish_svd(factors, w_target, steps, lr);
+    }
+
+    for step in 0..steps {
+        // Prefill diff with W so sgemm below yields A·B − W.
+        backend
+            .copy_f32_d2d(&w_dev, &diff_dev, rows * cols)
+            .expect("copy_f32_d2d after probe succeeded should not fail");
+
+        // diff = A·B − W.  Row-major C[rows,cols] = A[rows,rank] · B[rank,cols].
+        backend.sgemm(&SgemmParams {
+            trans_a: false, trans_b: false,
+            m: rows, n: cols, k: rank,
+            alpha: 1.0, beta: -1.0,
+            a: &a_dev, lda: rank, a_offset: 0,
+            b: &b_dev, ldb: cols, b_offset: 0,
+            c: &diff_dev, ldc: cols, c_offset: 0,
+        }).expect("sgemm A·B - W");
+
+        // why: measure RMSE before the weight update (matches CPU polish_svd).
+        //      One device→host transfer per step; dominated by sgemm cost for
+        //      reasonable shapes.
+        let diff_host = backend.download_f32(&diff_dev);
+        let ss: f64 = diff_host.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        last_rmse = ((ss as f32) * inv_n).sqrt();
+
+        // gradA [rows, rank] = diff[rows,cols] · B[rank,cols]ᵀ · inv_n.
+        // Row-major with trans_b=true: lda=cols, ldb=cols (stride of B rows
+        // before transpose), ldc=rank.
+        backend.sgemm(&SgemmParams {
+            trans_a: false, trans_b: true,
+            m: rows, n: rank, k: cols,
+            alpha: inv_n, beta: 0.0,
+            a: &diff_dev, lda: cols, a_offset: 0,
+            b: &b_dev, ldb: cols, b_offset: 0,
+            c: &grad_a_dev, ldc: rank, c_offset: 0,
+        }).expect("sgemm gradA");
+
+        // gradB [rank, cols] = A[rows,rank]ᵀ · diff[rows,cols] · inv_n.
+        // Row-major with trans_a=true: lda=rank (pre-transpose stride of A).
+        backend.sgemm(&SgemmParams {
+            trans_a: true, trans_b: false,
+            m: rank, n: cols, k: rows,
+            alpha: inv_n, beta: 0.0,
+            a: &a_dev, lda: rank, a_offset: 0,
+            b: &diff_dev, ldb: cols, b_offset: 0,
+            c: &grad_b_dev, ldc: cols, c_offset: 0,
+        }).expect("sgemm gradB");
+
+        // A -= lr · gradA ;  B -= lr · gradB. axpy via add_tensors_inplace.
+        backend
+            .add_tensors_inplace(&a_dev, &grad_a_dev, rows * rank, -lr)
+            .expect("axpy A");
+        backend
+            .add_tensors_inplace(&b_dev, &grad_b_dev, rank * cols, -lr)
+            .expect("axpy B");
+
+        if step % 10 == 0 {
+            log::debug!("polish_gpu step {step}: rmse={last_rmse:.6e}");
+        }
+    }
+
+    // Download A, B → BF16 write-back.
+    a_host = backend.download_f32(&a_dev);
+    b_host = backend.download_f32(&b_dev);
+    for i in 0..rows {
+        for k in 0..rank {
+            factors.a_bf16[i * rank + k] = bf16::from_f32(a_host[i * rank + k]).to_bits();
+        }
+    }
+    for k in 0..rank {
+        for j in 0..cols {
+            factors.b_bf16[k * cols + j] = bf16::from_f32(b_host[k * cols + j]).to_bits();
+        }
+    }
+    factors.residual_rmse = last_rmse;
+    last_rmse
+}
+
+/// Full-GPU randomized SVD (Halko-Martinsson-Tropp). Uses hipSOLVER QR + SVD
+/// for the orthogonalization and small-SVD steps; hipBLAS sgemm for the
+/// two big matmuls. W is uploaded once as F32; factors come back host-side BF16.
+///
+/// Requires a backend that implements `qr_f32` and `svd_f32`. Caller should
+/// probe and fall back to `compress_tensor_randomized` (CPU) if unavailable.
+///
+/// Residual RMSE is estimated via Eckart-Young: ‖W−AB‖²_F ≈ Σ_{i≥rank} σᵢ².
+/// This approximates the true residual (rsvd singular values aren't exact).
+pub fn compress_tensor_rsvd_gpu(
+    backend: &dyn compute_core::ComputeBackend,
+    w: &HostBf16Matrix,
+    rank: usize,
+    oversample: usize,
+    seed: u64,
+) -> Result<SvdFactors, compute_core::BackendError> {
+    compress_tensor_rsvd_gpu_raw(backend, &w.data, w.rows, w.cols, rank, oversample, seed)
+}
+
+/// Zero-copy variant: takes BF16 bits as a raw slice (e.g., reinterpreted from
+/// a safetensors mmap). Avoids the `HostBf16Matrix` host-side allocation.
+pub fn compress_tensor_rsvd_gpu_raw(
+    backend: &dyn compute_core::ComputeBackend,
+    w_bf16: &[u16],
+    rows: usize,
+    cols: usize,
+    rank: usize,
+    oversample: usize,
+    seed: u64,
+) -> Result<SvdFactors, compute_core::BackendError> {
+    use compute_core::SgemmParams;
+
+    assert_eq!(w_bf16.len(), rows * cols, "w_bf16 len mismatch");
+    assert!(rank > 0 && rank <= rows.min(cols), "rank out of range");
+    let k = (rank + oversample).min(rows.min(cols));
+
+    // 1. Upload W as BF16 (half the bytes of F32). Widen to F32 on device,
+    //    dropping the BF16 buffer afterwards. No host-side bf16→f32 pass.
+    let w_bf16_dev = backend.upload_bf16(w_bf16, &[rows, cols]);
+    let w_dev = backend.alloc_f32(&[rows, cols]);
+    backend.widen_bf16_f32(&w_bf16_dev, &w_dev, rows * cols)?;
+    drop(w_bf16_dev);
+
+    // 2. Generate Ω ~ N(0,1) row-major [cols, k], upload.
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut omega_host = vec![0.0f32; cols * k];
+    for v in omega_host.iter_mut() {
+        let u1: f32 = rng.gen_range(1e-9..1.0);
+        let u2: f32 = rng.gen();
+        *v = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+    }
+    let omega_dev = backend.upload_f32(&omega_host, &[cols, k]);
+    drop(omega_host);
+
+    // 3. y_trans bytes row-major [k, rows] ≡ col-major [rows, k] = Y = W·Ω.
+    //    Computed as Yᵀ_rm = Ωᵀ·Wᵀ.
+    let y_trans_dev = backend.alloc_f32(&[k, rows]);
+    backend.sgemm(&SgemmParams {
+        trans_a: true, trans_b: true,
+        m: k, n: rows, k: cols,
+        alpha: 1.0, beta: 0.0,
+        a: &omega_dev, lda: k, a_offset: 0,
+        b: &w_dev,     ldb: cols, b_offset: 0,
+        c: &y_trans_dev, ldc: rows, c_offset: 0,
+    })?;
+
+    // 4. QR of Y col-major [rows, k]. q_dev bytes = col-major Q [rows, k] = row-major [k, rows] = Qᵀ.
+    let q_dev = backend.alloc_f32(&[rows, k]);
+    backend.qr_f32(&y_trans_dev, &q_dev, rows, k)?;
+
+    // 5. B_trans bytes row-major [cols, k] ≡ col-major [k, cols] = B = Qᵀ·W.
+    //    Computed as Bᵀ_rm = Wᵀ·Q.
+    let b_trans_dev = backend.alloc_f32(&[cols, k]);
+    backend.sgemm(&SgemmParams {
+        trans_a: true, trans_b: true,
+        m: cols, n: k, k: rows,
+        alpha: 1.0, beta: 0.0,
+        a: &w_dev, lda: cols, a_offset: 0,
+        b: &q_dev, ldb: rows, b_offset: 0,
+        c: &b_trans_dev, ldc: k, c_offset: 0,
+    })?;
+
+    // 6. SVD of B col-major [k, cols] → U [k,k], S [k], Vt [k, cols] (all col-major).
+    let u_dev  = backend.alloc_f32(&[k, k]);
+    let s_dev  = backend.alloc_f32(&[k]);
+    let vt_dev = backend.alloc_f32(&[k, cols]);
+    backend.svd_f32(&b_trans_dev, &u_dev, &s_dev, &vt_dev, k, cols)?;
+
+    // 7. Download S, U (small), Vt (medium).
+    let s_host  = backend.download_f32(&s_dev);   // len = k
+    let u_host  = backend.download_f32(&u_dev);   // col-major [k, k]
+    let vt_host = backend.download_f32(&vt_dev);  // col-major [k, cols]
+
+    // 8. Build U_scaled col-major [k, rank] absorbing Σ into U. Host-side, tiny.
+    let mut u_scaled = vec![0.0f32; k * rank];
+    for j in 0..rank {
+        let sigma = s_host[j];
+        for i in 0..k {
+            u_scaled[j * k + i] = u_host[j * k + i] * sigma;
+        }
+    }
+    // Re-upload as row-major [rank, k] (same bytes as col-major [k, rank]).
+    let u_scaled_dev = backend.upload_f32(&u_scaled, &[rank, k]);
+    drop(u_scaled);
+
+    // 9. A_factor row-major [rows, rank] = Q · U_scaled.
+    //    Q bytes = row-major [k, rows] → trans_a=true yields Q [rows, k].
+    //    U_scaled bytes = row-major [rank, k] → trans_b=true yields [k, rank].
+    let a_factor_dev = backend.alloc_f32(&[rows, rank]);
+    backend.sgemm(&SgemmParams {
+        trans_a: true, trans_b: true,
+        m: rows, n: rank, k,
+        alpha: 1.0, beta: 0.0,
+        a: &q_dev, lda: rows, a_offset: 0,
+        b: &u_scaled_dev, ldb: k, b_offset: 0,
+        c: &a_factor_dev, ldc: rank, c_offset: 0,
+    })?;
+
+    // 10. Download A (row-major) and synthesize B row-major [rank, cols] from Vt col-major.
+    let a_factor = backend.download_f32(&a_factor_dev);
+    let mut b_factor = vec![0.0f32; rank * cols];
+    for i in 0..rank {
+        for j in 0..cols {
+            b_factor[i * cols + j] = vt_host[j * k + i];
+        }
+    }
+
+    // 11. Quantize to BF16.
+    let a_bf16: Vec<u16> = a_factor.iter().map(|&v| bf16::from_f32(v).to_bits()).collect();
+    let b_bf16: Vec<u16> = b_factor.iter().map(|&v| bf16::from_f32(v).to_bits()).collect();
+
+    // 12. Residual estimate (Eckart-Young lower bound).
+    let residual_sq: f32 = s_host.iter().skip(rank).map(|&s| s * s).sum();
+    let residual_rmse = (residual_sq / (rows * cols) as f32).sqrt();
+
+    Ok(SvdFactors { a_bf16, b_bf16, rows, cols, rank, residual_rmse })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +676,94 @@ mod tests {
         assert_eq!(factors.a_bf16.len(), rows * 16);
         assert_eq!(factors.b_bf16.len(), 16 * cols);
         assert!(factors.residual_rmse.is_finite());
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn polish_gpu_reduces_rmse() {
+        let backend = match rocm_backend::RocmBackend::probe() {
+            Ok(b) => b,
+            Err(_) => return, // no GPU available at test time — skip
+        };
+
+        // 64×64 matrix, compress to rank 8, perturb A, polish on GPU.
+        let rows = 64;
+        let cols = 64;
+        let rank = 8;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 17 + 3) % 31) as f32 * 0.1)
+            .collect();
+        let w = HostBf16Matrix::from_f32(&data, rows, cols);
+        let mut factors = compress_tensor(&w, rank);
+
+        // Perturb A with +10% noise.
+        for bits in factors.a_bf16.iter_mut() {
+            let v = bf16::from_bits(*bits).to_f32() * 1.1;
+            *bits = bf16::from_f32(v).to_bits();
+        }
+
+        // Measure RMSE of perturbed approximation.
+        let perturbed_rmse = {
+            let a = DMatrix::<f32>::from_fn(rows, rank, |i, k| {
+                bf16::from_bits(factors.a_bf16[i * rank + k]).to_f32()
+            });
+            let b = DMatrix::<f32>::from_fn(rank, cols, |k, j| {
+                bf16::from_bits(factors.b_bf16[k * cols + j]).to_f32()
+            });
+            let m = &a * &b;
+            let recon_data: Vec<f32> = (0..rows * cols)
+                .map(|i| m[(i / cols, i % cols)])
+                .collect();
+            let w_approx = HostBf16Matrix::from_f32(&recon_data, rows, cols);
+            w.rmse(&w_approx)
+        };
+
+        let after = polish_svd_gpu(&backend, &mut factors, &w, 50, 1.0);
+        assert!(
+            after < perturbed_rmse,
+            "GPU polish failed to recover: perturbed={} final={}",
+            perturbed_rmse, after
+        );
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rsvd_gpu_matches_cpu_on_low_rank() {
+        let backend = match rocm_backend::RocmBackend::probe() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let rows = 128;
+        let cols = 256;
+        let mut data = vec![0.0f32; rows * cols];
+        for r in 0..3 {
+            let u: Vec<f32> = (0..rows).map(|i| ((i + r * 7) % 13) as f32 * 0.1).collect();
+            let v: Vec<f32> = (0..cols).map(|j| ((j + r * 11) % 17) as f32 * 0.1).collect();
+            for i in 0..rows {
+                for j in 0..cols {
+                    data[i * cols + j] += u[i] * v[j];
+                }
+            }
+        }
+        let w = HostBf16Matrix::from_f32(&data, rows, cols);
+        let gpu = compress_tensor_rsvd_gpu(&backend, &w, 3, 10, 42)
+            .expect("rsvd_gpu");
+        // Reconstruct on CPU, compare to ground truth.
+        let mut recon = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for jj in 0..cols {
+                let mut s = 0.0f32;
+                for kk in 0..3 {
+                    let a = bf16::from_bits(gpu.a_bf16[i * 3 + kk]).to_f32();
+                    let b = bf16::from_bits(gpu.b_bf16[kk * cols + jj]).to_f32();
+                    s += a * b;
+                }
+                recon[i * cols + jj] = s;
+            }
+        }
+        let sse: f32 = recon.iter().zip(&data).map(|(a, b)| (a - b).powi(2)).sum();
+        let rmse = (sse / (rows * cols) as f32).sqrt();
+        assert!(rmse < 5e-2, "gpu rsvd recon rmse too large: {}", rmse);
     }
 
     #[test]

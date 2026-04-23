@@ -25,6 +25,7 @@ anyhow = "1"
 # DNA V4 SVD compression
 nalgebra = "0.33"
 safetensors = "0.7"
+rayon = "1.10"
 
 [features]
 default = ["rocm"]

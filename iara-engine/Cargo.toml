@@ -63,6 +63,7 @@ log = "0.4"
 
 # Error handling
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 
 # HTTP framework (API handlers)
@@ -96,6 +97,11 @@ tempfile = "3"
 [[bin]]
 name = "stress_test"
 path = "src/bin/stress_test.rs"
+
+[[bin]]
+name = "dna_smoke"
+path = "src/bin/dna_smoke.rs"
+required-features = ["rocm"]
 
 [[bench]]
 name = "baseline"
