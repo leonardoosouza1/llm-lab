@@ -31,7 +31,7 @@ struct BaselineReport {
 fn get_backend() -> Option<Arc<dyn compute_core::ComputeBackend>> {
     #[cfg(feature = "rocm")]
     {
-        match rocm_backend::RocmBackend::new() {
+        match rocm_backend::RocmBackend::probe() {
             Ok(b) => {
                 eprintln!("ROCm backend initialized successfully");
                 return Some(Arc::new(b));

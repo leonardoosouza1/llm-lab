@@ -20,7 +20,8 @@ use memmap2::Mmap;
 use safetensors::{tensor::TensorView, SafeTensors};
 
 use iara_train::distill::dna::{
-    compress_tensor, default_rank_policy, polish_svd, HostBf16Matrix, RankPolicy,
+    compress_tensor, compress_tensor_randomized, default_rank_policy, polish_svd,
+    HostBf16Matrix, RankPolicy,
 };
 
 #[derive(Parser, Debug)]
@@ -47,6 +48,23 @@ struct Cli {
     /// Skip tensors smaller than this many elements (store as TRAW).
     #[arg(long, default_value_t = 1024)]
     min_numel_for_svd: usize,
+
+    /// Use randomized SVD (Halko) for tensors above this numel threshold. Full SVD
+    /// below. Default 1M ≈ ~1024² — full SVD fine; above, randomized is 10-100× faster.
+    #[arg(long, default_value_t = 1_000_000)]
+    randomized_threshold: usize,
+
+    /// Randomized SVD oversampling (extra samples past rank for subspace quality).
+    #[arg(long, default_value_t = 10)]
+    rsvd_oversample: usize,
+
+    /// Power iterations for randomized SVD (more = better tail accuracy, slower).
+    #[arg(long, default_value_t = 2)]
+    rsvd_power_iters: usize,
+
+    /// Force full (deterministic) SVD for all tensors regardless of size.
+    #[arg(long)]
+    force_full_svd: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -95,8 +113,17 @@ fn main() -> anyhow::Result<()> {
         let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
         drop(f32_data);
 
-        let mut factors = compress_tensor(&w, rank);
-        info!("  rmse={:.4e}", factors.residual_rmse);
+        let use_randomized = !cli.force_full_svd && numel > cli.randomized_threshold;
+        let t0 = std::time::Instant::now();
+        let mut factors = if use_randomized {
+            // Seed from a hash of the tensor name → deterministic but unique per tensor
+            let seed = name.bytes().fold(0u64, |h, b| h.wrapping_mul(1315423911).wrapping_add(b as u64));
+            compress_tensor_randomized(&w, rank, cli.rsvd_oversample, cli.rsvd_power_iters, seed)
+        } else {
+            compress_tensor(&w, rank)
+        };
+        let method = if use_randomized { "rsvd" } else { "full" };
+        info!("  [{method}] rmse={:.4e} in {:.1}s", factors.residual_rmse, t0.elapsed().as_secs_f32());
 
         if cli.polish_steps > 0 {
             let before = factors.residual_rmse;

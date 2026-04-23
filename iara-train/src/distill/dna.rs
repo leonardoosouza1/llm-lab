@@ -9,6 +9,8 @@
 
 use half::bf16;
 use nalgebra::DMatrix;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 
 /// BF16 tensor residing on host. Shape: [rows, cols] row-major.
 pub struct HostBf16Matrix {
@@ -94,6 +96,98 @@ pub fn compress_tensor(w: &HostBf16Matrix, rank: usize) -> SvdFactors {
     for k in 0..rank {
         for j in 0..cols {
             b_bf16.push(bf16::from_f32(b[(k, j)]).to_bits());
+        }
+    }
+
+    SvdFactors { a_bf16, b_bf16, rows, cols, rank, residual_rmse }
+}
+
+/// Randomized SVD (Halko-Martinsson-Tropp 2009) — O(m·n·(r+p)) instead of O(m·n·min(m,n)).
+///
+/// For rank ≪ min(rows, cols) this is orders of magnitude faster than full SVD.
+/// Quality: with `oversample=10` and `power_iters=2` the approximation is within
+/// a factor ~(1+ε) of the best rank-r in spectral norm — indistinguishable from
+/// truncated full SVD for typical LLM weight spectra.
+///
+/// Returns factors absorbing Σ into A (A = U·Σ, B = Vᵀ).
+pub fn compress_tensor_randomized(
+    w: &HostBf16Matrix,
+    rank: usize,
+    oversample: usize,
+    power_iters: usize,
+    seed: u64,
+) -> SvdFactors {
+    let (rows, cols) = (w.rows, w.cols);
+    assert!(rank > 0 && rank <= rows.min(cols), "rank out of range");
+    let k = (rank + oversample).min(rows.min(cols));
+
+    let f32_data = w.to_f32();
+    let a_mat = DMatrix::<f32>::from_fn(rows, cols, |i, j| f32_data[i * cols + j]);
+    drop(f32_data);
+
+    // Ω ~ N(0,1) [cols, k]
+    let mut rng = StdRng::seed_from_u64(seed);
+    let omega = DMatrix::<f32>::from_fn(cols, k, |_, _| {
+        // Box-Muller via rand's f32 uniform — good enough for subspace seeding
+        let u1: f32 = rng.gen_range(1e-9..1.0);
+        let u2: f32 = rng.gen();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    });
+
+    // Y = A · Ω  [rows, k]
+    let mut y = &a_mat * &omega;
+
+    // Power iterations: Y ← A · (Aᵀ · Y). Re-orthogonalize between iters to fight roundoff.
+    let at = a_mat.transpose();
+    for _ in 0..power_iters {
+        let z = &at * &y;            // [cols, k]
+        y = &a_mat * &z;             // [rows, k]
+        // Orthonormalize (thin QR) to stabilize
+        let qr = y.clone().qr();
+        y = qr.q();
+    }
+
+    // Q, _ = QR(Y). Q [rows, k].
+    let qr = y.qr();
+    let q = qr.q();
+
+    // B = Qᵀ · A  [k, cols]
+    let b_small = q.transpose() * &a_mat;
+
+    // SVD of the small B [k × cols] — cheap since k ≪ rows.
+    let svd = b_small.clone().svd(true, true);
+    let u_tilde = svd.u.expect("rsvd U");
+    let s = svd.singular_values;
+    let vt = svd.v_t.expect("rsvd Vt");
+
+    // U = Q · U_tilde  [rows, k]
+    let u_full = &q * &u_tilde;
+
+    // Truncate to rank r, absorb Σ into A.
+    let mut a_out = DMatrix::<f32>::zeros(rows, rank);
+    let mut b_out = DMatrix::<f32>::zeros(rank, cols);
+    for kk in 0..rank {
+        let sigma = s[kk];
+        for i in 0..rows { a_out[(i, kk)] = u_full[(i, kk)] * sigma; }
+        for j in 0..cols { b_out[(kk, j)] = vt[(kk, j)]; }
+    }
+
+    // Residual in F32 domain
+    let approx = &a_out * &b_out;
+    let residual = &a_mat - &approx;
+    let residual_rmse = (residual.norm_squared() / (rows * cols) as f32).sqrt();
+
+    // BF16 dump (row-major)
+    let mut a_bf16 = Vec::with_capacity(rows * rank);
+    for i in 0..rows {
+        for kk in 0..rank {
+            a_bf16.push(bf16::from_f32(a_out[(i, kk)]).to_bits());
+        }
+    }
+    let mut b_bf16 = Vec::with_capacity(rank * cols);
+    for kk in 0..rank {
+        for j in 0..cols {
+            b_bf16.push(bf16::from_f32(b_out[(kk, j)]).to_bits());
         }
     }
 
@@ -281,6 +375,39 @@ mod tests {
             "polish failed to recover: perturbed={} final={}",
             perturbed_rmse, after
         );
+    }
+
+    #[test]
+    fn randomized_svd_matches_full_on_low_rank() {
+        // Known rank-3 matrix (outer products). Randomized SVD with rank=3 should recover near-exact.
+        let rows = 64;
+        let cols = 128;
+        let mut data = vec![0.0f32; rows * cols];
+        for r in 0..3 {
+            let u: Vec<f32> = (0..rows).map(|i| ((i + r * 7) % 13) as f32 * 0.1).collect();
+            let v: Vec<f32> = (0..cols).map(|j| ((j + r * 11) % 17) as f32 * 0.1).collect();
+            for i in 0..rows {
+                for j in 0..cols {
+                    data[i * cols + j] += u[i] * v[j];
+                }
+            }
+        }
+        let w = HostBf16Matrix::from_f32(&data, rows, cols);
+        let rsvd = compress_tensor_randomized(&w, 3, 10, 2, 42);
+        assert!(rsvd.residual_rmse < 5e-2, "rsvd residual too large: {}", rsvd.residual_rmse);
+    }
+
+    #[test]
+    fn randomized_svd_faster_path_produces_valid_factors() {
+        // Arbitrary 256×512 matrix, rank=16. Just verify it runs and residual is finite.
+        let rows = 256;
+        let cols = 512;
+        let data: Vec<f32> = (0..rows * cols).map(|i| ((i * 37 + 11) % 97) as f32 * 0.01).collect();
+        let w = HostBf16Matrix::from_f32(&data, rows, cols);
+        let factors = compress_tensor_randomized(&w, 16, 10, 2, 7);
+        assert_eq!(factors.a_bf16.len(), rows * 16);
+        assert_eq!(factors.b_bf16.len(), 16 * cols);
+        assert!(factors.residual_rmse.is_finite());
     }
 
     #[test]
