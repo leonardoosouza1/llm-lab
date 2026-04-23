@@ -15,9 +15,11 @@ pub mod raw {
 pub mod safe;
 pub mod tensor;
 pub mod blas;
+pub mod solver;
 pub mod kernels;
 
 pub use safe::*;
 pub use tensor::{GpuTensor, GpuTensorBF16};
 pub use blas::{BlasHandle, gemm_bf16_f32, sgemm_strided, sgemm_strided_batched};
+pub use solver::{SolverHandle, qr_f32, svd_f32};
 pub use kernels::GpuKernels;

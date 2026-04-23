@@ -306,6 +306,12 @@ pub trait ComputeBackend: Send + Sync + 'static {
         Err(BackendError::NotImplemented("copy_f32_d2d".into()))
     }
 
+    /// Widen BF16 (u16 bits) → F32 on device. Used to avoid host-side conversion
+    /// when only the widened form is needed device-side (e.g., dna_compress).
+    fn widen_bf16_f32(&self, _src_bf16: &AnyTensor, _dst_f32: &AnyTensor, _n: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("widen_bf16_f32".into()))
+    }
+
     // ── Graph capture (HIP graphs / CUDA graphs) ──────────────────────────────
 
     /// Begin capturing kernel launches into a graph (instead of executing them).
@@ -315,6 +321,38 @@ pub trait ComputeBackend: Send + Sync + 'static {
     /// End graph capture, instantiate/update executable, and launch the graph.
     /// Returns false if graph capture was not active.
     fn end_graph_capture_and_launch(&self) -> bool { false }
+
+    // ── Dense linear algebra (hipSOLVER / future LAPACK-like) ─────────────────
+
+    /// QR factorisation of an F32 matrix: A = Q · R, producing Q explicitly.
+    ///
+    /// **Layout**: the input is expected in **column-major** (LAPACK convention).
+    /// `a` is `rows × cols` with leading dimension = rows. `q_out` must have
+    /// capacity for `rows * cols` floats; on return it holds the orthonormal Q.
+    /// `a` may be clobbered.
+    fn qr_f32(&self, _a: &AnyTensor, _q_out: &AnyTensor, _rows: usize, _cols: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("qr_f32".into()))
+    }
+
+    /// Thin SVD of an F32 matrix: A = U · diag(S) · Vᵀ.
+    ///
+    /// **Layout**: the input is expected in **column-major**. For an input of
+    /// shape `rows × cols` with `k = min(rows, cols)`:
+    /// - `u`  : column-major `rows × k`
+    /// - `s`  : `k` singular values (non-increasing)
+    /// - `vt` : column-major `k × cols`
+    /// `a` is destroyed in-place.
+    fn svd_f32(
+        &self,
+        _a: &AnyTensor,
+        _u: &AnyTensor,
+        _s: &AnyTensor,
+        _vt: &AnyTensor,
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("svd_f32".into()))
+    }
 
     // ── Sync e informações ───────────────────────────────────────────────────
 

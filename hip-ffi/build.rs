@@ -7,6 +7,7 @@ fn main() {
     // Link libamdhip64
     println!("cargo:rustc-link-search=native={}/lib", rocm);
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=hipsolver");
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
@@ -105,6 +106,19 @@ fn main() {
         .allowlist_var("hipErrorOutOfMemory")
         .allowlist_var("hipErrorInvalidValue")
         .allowlist_var("hipErrorNotInitialized")
+        // hipSOLVER dense linear algebra (QR, SVD)
+        .allowlist_function("hipsolverDnCreate")
+        .allowlist_function("hipsolverDnDestroy")
+        .allowlist_function("hipsolverDnSetStream")
+        .allowlist_function("hipsolverDnSgeqrf_bufferSize")
+        .allowlist_function("hipsolverDnSgeqrf")
+        .allowlist_function("hipsolverDnSorgqr_bufferSize")
+        .allowlist_function("hipsolverDnSorgqr")
+        .allowlist_function("hipsolverDnSgesvd_bufferSize")
+        .allowlist_function("hipsolverDnSgesvd")
+        .allowlist_type("hipsolverHandle_t")
+        .allowlist_type("hipsolverStatus_t")
+        .allowlist_var("HIPSOLVER_STATUS_.*")
         .layout_tests(false)
         // Evita constantes duplicadas do math.h
         .blocklist_item("FP_.*")

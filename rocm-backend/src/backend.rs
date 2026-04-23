@@ -93,6 +93,9 @@ fn u8_mut_ptr(t: &AnyTensor) -> *mut u8 {
 
 pub struct RocmBackend {
     blas: hip_ffi::BlasHandle,
+    // Lazy-init: only constructed when QR/SVD are first requested (avoids
+    // paying hipSOLVER init cost for inference-only workloads).
+    solver: std::sync::OnceLock<hip_ffi::SolverHandle>,
     kernels: hip_ffi::GpuKernels,
     tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
     act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
@@ -158,6 +161,7 @@ impl RocmBackend {
 
         Ok(Self {
             blas,
+            solver: std::sync::OnceLock::new(),
             kernels,
             tok_buf: std::sync::Mutex::new(tok_buf),
             act_bf16: std::sync::Mutex::new(act_bf16),
@@ -169,6 +173,20 @@ impl RocmBackend {
             use_flash_attn,
             use_v2,
         })
+    }
+
+    /// Lazily create (and cache) a hipSOLVER handle bound to the backend stream.
+    fn solver_handle(&self) -> Result<&hip_ffi::SolverHandle, BackendError> {
+        if let Some(h) = self.solver.get() {
+            return Ok(h);
+        }
+        let h = hip_ffi::SolverHandle::new()
+            .map_err(|e| BackendError::NotAvailable(format!("hipSOLVER: {e}")))?;
+        h.set_stream(self.stream)
+            .map_err(|e| BackendError::NotAvailable(format!("hipSOLVER set_stream: {e}")))?;
+        // Tolerate a race: if another thread set it, discard ours.
+        let _ = self.solver.set(h);
+        Ok(self.solver.get().unwrap())
     }
 }
 
@@ -1094,6 +1112,17 @@ impl ComputeBackend for RocmBackend {
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
+    fn widen_bf16_f32(&self, src_bf16: &AnyTensor, dst_f32: &AnyTensor, n: usize) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.widen_bf16_f32(
+                u16_ptr(src_bf16),
+                f32_mut_ptr(dst_f32),
+                n as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
     // ── HIP Graph capture (trait override) ────────────────────────────────────
 
     fn begin_graph_capture(&self) -> bool {
@@ -1190,6 +1219,42 @@ impl ComputeBackend for RocmBackend {
 
             launch_ok
         }
+    }
+
+    // ── Dense linear algebra (hipSOLVER) ──────────────────────────────────────
+
+    fn qr_f32(&self, a: &AnyTensor, q_out: &AnyTensor, rows: usize, cols: usize) -> Result<(), BackendError> {
+        let handle = self.solver_handle()?;
+        hip_ffi::qr_f32(
+            handle,
+            rows as i32,
+            cols as i32,
+            f32_mut_ptr(a),
+            f32_mut_ptr(q_out),
+        )
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn svd_f32(
+        &self,
+        a: &AnyTensor,
+        u: &AnyTensor,
+        s: &AnyTensor,
+        vt: &AnyTensor,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let handle = self.solver_handle()?;
+        hip_ffi::svd_f32(
+            handle,
+            rows as i32,
+            cols as i32,
+            f32_mut_ptr(a),
+            f32_mut_ptr(u),
+            f32_mut_ptr(s),
+            f32_mut_ptr(vt),
+        )
+        .map_err(|e| BackendError::Kernel(e.to_string()))
     }
 
     // ── Sync and info ─────────────────────────────────────────────────────────

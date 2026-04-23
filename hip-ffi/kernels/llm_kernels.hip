@@ -496,6 +496,24 @@ extern "C" __global__ void f32_to_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel 8b: widen_bf16_f32 — BF16 bits → F32 (tensor-wide).
+// Inverse of f32_to_bf16. Used by dna_compress to widen uploaded bf16 weights
+// in place on device, avoiding a host-side conversion pass.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void widen_bf16_f32(
+    const unsigned short* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int bits = ((unsigned int)src[idx]) << 16;
+    float out;
+    __builtin_memcpy(&out, &bits, sizeof(float));
+    dst[idx] = out;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: FP16 (stored as uint16_t) → float
 // Uses hardware v_cvt_f32_f16 instruction on RDNA2 (1 cycle, no branches).
 // ---------------------------------------------------------------------------

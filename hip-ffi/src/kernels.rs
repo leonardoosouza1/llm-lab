@@ -56,6 +56,7 @@ pub struct GpuKernels {
     fn_softmax_rows_causal: hipFunction_t,
     fn_copy_kv_cache: hipFunction_t,
     fn_f32_to_bf16: hipFunction_t,
+    fn_widen_bf16_f32: hipFunction_t,
     fn_dequant_gemv_q4: hipFunction_t,
     fn_dequant_gemv_q4_naive: hipFunction_t,
     use_naive_gemv: bool,
@@ -154,6 +155,7 @@ impl GpuKernels {
         let fn_softmax_rows_causal = get_fn!("softmax_rows_causal");
         let fn_copy_kv_cache = get_fn!("copy_to_kv_cache");
         let fn_f32_to_bf16 = get_fn!("f32_to_bf16");
+        let fn_widen_bf16_f32 = get_fn!("widen_bf16_f32");
         let fn_dequant_gemv_q4 = get_fn!("dequant_gemv_q4");
         let fn_dequant_gemv_q4_naive = get_fn!("dequant_gemv_q4_naive");
         let use_naive_gemv = std::env::var("IARA_NAIVE_GEMV").map(|v| v == "1").unwrap_or(false);
@@ -243,6 +245,7 @@ impl GpuKernels {
             fn_softmax_rows_causal,
             fn_copy_kv_cache,
             fn_f32_to_bf16,
+            fn_widen_bf16_f32,
             fn_dequant_gemv_q4,
             fn_dequant_gemv_q4_naive,
             use_naive_gemv,
@@ -767,6 +770,34 @@ impl GpuKernels {
             &mut [
                 &mut p_src as *mut *const f32 as *mut std::ffi::c_void,
                 &mut p_dst as *mut *mut u16 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Widen BF16 (stored as u16) → F32. Inverse of `f32_to_bf16`.
+    pub unsafe fn widen_bf16_f32(
+        &self,
+        src: *const u16,
+        dst: *mut f32,
+        n: i32,
+    ) -> Result<(), HipError> {
+        let block_x = block_size(n as u32, 256);
+        let grid_x = ceil_div(n as u32, block_x);
+
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_n = n;
+
+        hip_launch_kernel(
+            self.fn_widen_bf16_f32,
+            (grid_x, 1, 1),
+            (block_x, 1, 1),
+            0,
+            self.stream,
+            &mut [
+                &mut p_src as *mut *const u16 as *mut std::ffi::c_void,
+                &mut p_dst as *mut *mut f32 as *mut std::ffi::c_void,
                 &mut p_n as *mut i32 as *mut std::ffi::c_void,
             ],
         )
