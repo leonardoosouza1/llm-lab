@@ -668,7 +668,7 @@ pub async fn load_model_handler(
 
         // Check format priority: GGUF > .iara > safetensors
         // (but ternary mode forces safetensors path — needs raw BF16 weights for quantization)
-        let load_result = if !ternary_on_load { if let Some(ref gguf_path) = resolved_gguf_file {
+        let load_result = if !ternary_on_load && resolved_gguf_file.is_some() { if let Some(ref gguf_path) = resolved_gguf_file {
             log::info!("📦 Detectado arquivo GGUF: {}", gguf_path.display());
             let _ = frame_tx.send(serde_json::json!({
                 "type": "status",
