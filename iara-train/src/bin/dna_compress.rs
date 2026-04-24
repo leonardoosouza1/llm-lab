@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use clap::Parser;
-use compute_core::dna_format::DnaWriter;
+use compute_core::dna_format::{quantize_q4_0, DnaWriter, Q4_0_BLOCK};
 use compute_core::ComputeBackend;
 use half::bf16;
 use log::{info, warn};
@@ -86,6 +86,11 @@ struct Cli {
     /// Small tensors stay on CPU (rayon-parallel) to amortize GPU dispatch cost.
     #[arg(long, default_value_t = 100_000)]
     gpu_threshold: usize,
+
+    /// Storage dtype for SVD factors. "bf16" (default) or "q4_0".
+    /// q4_0: block=32, fp16 scale + 16 nibbles → 4.5 bpw (~3.5× smaller than bf16).
+    #[arg(long, default_value = "bf16")]
+    dtype: String,
 }
 
 /// Message sent from compute workers to the writer thread.
@@ -97,6 +102,14 @@ enum WriteMsg {
         rank: u32,
         a_bf16: Vec<u16>,
         b_bf16: Vec<u16>,
+    },
+    TsvdQ4 {
+        name: String,
+        rows: u32,
+        cols: u32,
+        rank: u32,
+        a_q4: Vec<u8>,
+        b_q4: Vec<u8>,
     },
     TrawBf16 {
         name: String,
@@ -122,6 +135,15 @@ fn main() -> anyhow::Result<()> {
     }
     let nthreads = rayon::current_num_threads();
     info!("Parallel compression with {} worker threads", nthreads);
+
+    let use_q4 = match cli.dtype.as_str() {
+        "bf16" => false,
+        "q4_0" | "q4" | "Q4_0" => true,
+        other => anyhow::bail!("--dtype must be 'bf16' or 'q4_0', got '{other}'"),
+    };
+    if use_q4 {
+        info!("Storage dtype: Q4_0 (block=32, fp16 scale + 16 nibbles = 4.5 bpw)");
+    }
 
     // Probe GPU backend for full-GPU rsvd path. Falls back to CPU rayon if absent.
     // why: hipBLAS/hipSOLVER handles are single-queue per context. Wrap in a mutex
@@ -183,6 +205,11 @@ fn main() -> anyhow::Result<()> {
                 WriteMsg::Tsvd { name, rows, cols, rank, a_bf16, b_bf16 } => {
                     bytes_out += 16 + (a_bf16.len() as u64 + b_bf16.len() as u64) * 2;
                     writer.write_tsvd(&name, rows, cols, rank, &a_bf16, &b_bf16)?;
+                    n_svd += 1;
+                }
+                WriteMsg::TsvdQ4 { name, rows, cols, rank, a_q4, b_q4 } => {
+                    bytes_out += 16 + a_q4.len() as u64 + b_q4.len() as u64;
+                    writer.write_tsvd_q4(&name, rows, cols, rank, &a_q4, &b_q4)?;
                     n_svd += 1;
                 }
                 WriteMsg::TrawBf16 { name, shape, data } => {
@@ -298,11 +325,38 @@ fn main() -> anyhow::Result<()> {
             polish_svd(&mut factors, &w, cli.polish_steps, cli.polish_lr);
         }
 
-        tx.send(WriteMsg::Tsvd {
-            name: name.to_string(),
-            rows: rows as u32, cols: cols as u32, rank: rank as u32,
-            a_bf16: factors.a_bf16, b_bf16: factors.b_bf16,
-        }).ok();
+        if use_q4 {
+            // bf16 factors → f32 → q4_0. Q4 block=32; enforce elem counts divide 32.
+            let a_numel = rows * rank;
+            let b_numel = rank * cols;
+            if a_numel % Q4_0_BLOCK != 0 || b_numel % Q4_0_BLOCK != 0 {
+                warn!("{name}: elem counts not multiples of 32 (rows*rank={a_numel}, rank*cols={b_numel}); \
+                       falling back to bf16 for this tensor");
+                tx.send(WriteMsg::Tsvd {
+                    name: name.to_string(),
+                    rows: rows as u32, cols: cols as u32, rank: rank as u32,
+                    a_bf16: factors.a_bf16, b_bf16: factors.b_bf16,
+                }).ok();
+            } else {
+                let a_f32: Vec<f32> = factors.a_bf16.iter()
+                    .map(|&b| bf16::from_bits(b).to_f32()).collect();
+                let b_f32: Vec<f32> = factors.b_bf16.iter()
+                    .map(|&b| bf16::from_bits(b).to_f32()).collect();
+                let a_q4 = quantize_q4_0(&a_f32);
+                let b_q4 = quantize_q4_0(&b_f32);
+                tx.send(WriteMsg::TsvdQ4 {
+                    name: name.to_string(),
+                    rows: rows as u32, cols: cols as u32, rank: rank as u32,
+                    a_q4, b_q4,
+                }).ok();
+            }
+        } else {
+            tx.send(WriteMsg::Tsvd {
+                name: name.to_string(),
+                rows: rows as u32, cols: cols as u32, rank: rank as u32,
+                a_bf16: factors.a_bf16, b_bf16: factors.b_bf16,
+            }).ok();
+        }
 
         let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if done % 25 == 0 || done == total {

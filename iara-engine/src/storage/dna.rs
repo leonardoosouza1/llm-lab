@@ -37,9 +37,11 @@ use std::sync::Arc;
 use compute_core::{AnyTensor, ComputeBackend};
 use compute_core::dna_format::{
     DNA_MAGIC, CHUNK_TSVD, CHUNK_TRAW,
-    DTYPE_BF16,
+    DTYPE_BF16, DTYPE_Q4_0, Q4_0_BLOCK, Q4_0_BYTES_PER_BLOCK,
+    dequantize_q4_0,
     read_magic, read_u32, read_u64, read_name, read_u16_vec, read_f32_vec,
 };
+use std::io::Read;
 
 // Re-export writer so callers can build `.dna` files without reaching into compute-core.
 pub use compute_core::dna_format::DnaWriter;
@@ -167,29 +169,58 @@ fn parse_tsvd(
     let cols = read_u32(f)? as usize;
     let rank = read_u32(f)? as usize;
     let dtype = read_u32(f)?;
-    if dtype != DTYPE_BF16 {
-        return Err(DnaError::UnsupportedDtype(dtype));
-    }
-
     let header_bytes = 16;
-    let a_bytes = rows * rank * 2;
-    let b_bytes = rank * cols * 2;
-    let expected = header_bytes + a_bytes + b_bytes;
-    if expected != payload_len {
-        return Err(DnaError::Truncated {
-            name: name.into(),
-            expected: payload_len,
-            got: expected,
-        });
+
+    match dtype {
+        DTYPE_BF16 => {
+            let a_bytes = rows * rank * 2;
+            let b_bytes = rank * cols * 2;
+            let expected = header_bytes + a_bytes + b_bytes;
+            if expected != payload_len {
+                return Err(DnaError::Truncated {
+                    name: name.into(), expected: payload_len, got: expected,
+                });
+            }
+            let a_u16 = read_u16_vec(f, rows * rank)?;
+            let b_u16 = read_u16_vec(f, rank * cols)?;
+            let a = backend.upload_bf16(&a_u16, &[rows, rank]);
+            let b = backend.upload_bf16(&b_u16, &[rank, cols]);
+            Ok(DnaTensor::Svd { a, b, rows, cols, rank })
+        }
+        DTYPE_Q4_0 => {
+            // Dequant at load → bf16 → upload. Reuses existing gemv_bf16 path.
+            // File is ~3.5× smaller; VRAM matches bf16 SVD.
+            let a_elems = rows * rank;
+            let b_elems = rank * cols;
+            if a_elems % Q4_0_BLOCK != 0 || b_elems % Q4_0_BLOCK != 0 {
+                return Err(DnaError::Truncated {
+                    name: name.into(), expected: payload_len,
+                    got: 0,
+                });
+            }
+            let a_q_bytes = a_elems / Q4_0_BLOCK * Q4_0_BYTES_PER_BLOCK;
+            let b_q_bytes = b_elems / Q4_0_BLOCK * Q4_0_BYTES_PER_BLOCK;
+            let expected = header_bytes + a_q_bytes + b_q_bytes;
+            if expected != payload_len {
+                return Err(DnaError::Truncated {
+                    name: name.into(), expected: payload_len, got: expected,
+                });
+            }
+            let mut a_buf = vec![0u8; a_q_bytes];
+            f.read_exact(&mut a_buf)?;
+            let mut b_buf = vec![0u8; b_q_bytes];
+            f.read_exact(&mut b_buf)?;
+            let a_f32 = dequantize_q4_0(&a_buf, a_elems);
+            let b_f32 = dequantize_q4_0(&b_buf, b_elems);
+            // f32 → bf16 (top 16 bits of ieee754 binary32 with round-to-nearest-even).
+            let a_u16: Vec<u16> = a_f32.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+            let b_u16: Vec<u16> = b_f32.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+            let a = backend.upload_bf16(&a_u16, &[rows, rank]);
+            let b = backend.upload_bf16(&b_u16, &[rank, cols]);
+            Ok(DnaTensor::Svd { a, b, rows, cols, rank })
+        }
+        _ => Err(DnaError::UnsupportedDtype(dtype)),
     }
-
-    let a_u16 = read_u16_vec(f, rows * rank)?;
-    let b_u16 = read_u16_vec(f, rank * cols)?;
-
-    let a = backend.upload_bf16(&a_u16, &[rows, rank]);
-    let b = backend.upload_bf16(&b_u16, &[rank, cols]);
-
-    Ok(DnaTensor::Svd { a, b, rows, cols, rank })
 }
 
 fn parse_traw(
