@@ -33,6 +33,9 @@ static KERNEL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/llm_kerne
 /// memory bandwidth on RDNA2. Used for the decode hot path.
 static KERNEL_W64_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_w64.hsaco"));
 
+/// Q4_K × Q8_1 GEMV kernel ported from llama.cpp (MIT). Wave32 RDNA2.
+static KERNEL_MMVQ_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mmvq_llama.hsaco"));
+
 // ---------------------------------------------------------------------------
 // GpuKernels — loaded module with cached function handles
 // ---------------------------------------------------------------------------
@@ -125,6 +128,9 @@ pub struct GpuKernels {
     fn_gemv_q4k_q8_v2: hipFunction_t,
     fn_fused_gate_up_silu_q4k_v2: hipFunction_t,
     fn_gemv_q6k_q8_v2: hipFunction_t,
+    // llama.cpp-ported Q4K kernel (MIT), wave32, separate module
+    module_mmvq: hipModule_t,
+    fn_mmvq_q4k_llama: hipFunction_t,
 }
 
 // SAFETY: hipModule_t / hipFunction_t are opaque pointers; HIP guarantees
@@ -233,6 +239,10 @@ impl GpuKernels {
         let fn_fused_gate_up_silu_q4k_v2 = get_fn!("fused_gate_up_silu_q4k_v2");
         let fn_gemv_q6k_q8_v2 = get_fn!("gemv_q6k_q8_v2");
 
+        // llama.cpp-ported mmvq kernel
+        let module_mmvq = hip_module_load_data(KERNEL_MMVQ_BYTES)?;
+        let fn_mmvq_q4k_llama = hip_module_get_function(module_mmvq, "mmvq_q4k_llama")?;
+
         Ok(Self {
             module,
             stream: ptr::null_mut(), // default stream; call set_stream() to change
@@ -306,6 +316,8 @@ impl GpuKernels {
             fn_gemv_q4k_q8_v2,
             fn_fused_gate_up_silu_q4k_v2,
             fn_gemv_q6k_q8_v2,
+            module_mmvq,
+            fn_mmvq_q4k_llama,
         })
     }
 
@@ -3090,6 +3102,47 @@ impl GpuKernels {
 
         hip_launch_kernel(
             self.fn_gemv_q4k_q8_w64,
+            grid,
+            block,
+            0,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Q4_K × Q8_1 GEMV, ported from llama.cpp (MIT). Wave32 RDNA2, 1 row per block.
+    /// Drop-in replacement for `gemv_q4k_q8_w64`.
+    pub unsafe fn mmvq_q4k_llama(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_mmvq_q4k_llama,
             grid,
             block,
             0,

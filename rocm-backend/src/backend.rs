@@ -106,6 +106,7 @@ pub struct RocmBackend {
     capturing: std::sync::atomic::AtomicBool,
     /// Use Wave64 GEMV kernels (IARA_WAVE64=1) for better RDNA2 bandwidth utilization
     use_wave64: bool,
+    use_mmvq_llama: bool,
     /// Use Flash Attention 2 kernel (IARA_FLASH_ATTN=1) instead of original fused decode
     use_flash_attn: bool,
     /// Use V2 kernels (IARA_V2=1): wave32 + dp4a + multi-row + no LDS
@@ -151,8 +152,10 @@ impl RocmBackend {
         let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
 
-        let use_v2 = std::env::var("IARA_V2").map(|v| v != "0").unwrap_or(true);
-        let use_wave64 = !use_v2 && std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
+        // MMVQ (llama.cpp-ported Q4K kernel) takes precedence when enabled.
+        let use_mmvq_llama = std::env::var("IARA_MMVQ").map(|v| v == "1").unwrap_or(false);
+        let use_v2 = !use_mmvq_llama && std::env::var("IARA_V2").map(|v| v != "0").unwrap_or(true);
+        let use_wave64 = !use_mmvq_llama && !use_v2 && std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
         let use_flash_attn = std::env::var("IARA_FLASH_ATTN").map(|v| v != "0").unwrap_or(true);
         eprintln!("ROCm backend: using dedicated HIP stream + graph capture support{}{}{}",
             if use_v2 { " + V2 GEMV (wave32/dp4a/no-LDS)" } else if use_wave64 { " + Wave64 GEMV" } else { "" },
@@ -172,6 +175,7 @@ impl RocmBackend {
             use_wave64,
             use_flash_attn,
             use_v2,
+            use_mmvq_llama,
         })
     }
 
@@ -558,7 +562,12 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q4k_q8(&self, p: &GemvQ4KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            if self.use_v2 {
+            if self.use_mmvq_llama {
+                self.kernels.mmvq_q4k_llama(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else if self.use_v2 {
                 self.kernels.gemv_q4k_q8_v2(
                     u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                     p.m as i32, p.n as i32, p.k as i32, p.beta,

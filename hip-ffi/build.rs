@@ -226,4 +226,28 @@ fn main() {
     if !w64_status.success() {
         panic!("hipcc failed to compile gemv_w64.hip (exit: {})", w64_status);
     }
+
+    // ── Compile mmvq_llama kernel (ported from llama.cpp, MIT) ──────────────
+    // Q4_K × Q8_1 GEMV, wave32 RDNA2, drop-in replacement for gemv_q4k_q8_w64.
+    let mmvq_src = format!("{}/kernels/mmvq_llama.hip", manifest_dir);
+    let mmvq_out = out.join("mmvq_llama.hsaco");
+
+    println!("cargo:rerun-if-changed=kernels/mmvq_llama.hip");
+
+    let mmvq_status = std::process::Command::new(&hipcc)
+        .args(&[
+            "--offload-arch=gfx1030",
+            "-O3",
+            "-ffast-math",
+            "-mno-wavefrontsize64",
+            "--genco",
+            "-o", mmvq_out.to_str().unwrap(),
+            &mmvq_src,
+        ])
+        .status()
+        .expect("hipcc not found — ensure ROCM_PATH is set");
+
+    if !mmvq_status.success() {
+        panic!("hipcc failed to compile mmvq_llama.hip (exit: {})", mmvq_status);
+    }
 }

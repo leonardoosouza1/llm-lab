@@ -4329,6 +4329,10 @@ impl CausalLM {
         // Enable with IARA_GRAPH=1. For decode (n=1), the kernel topology is fixed
         // (same launches every token, only scalar args change). Graph update handles this.
         // Works for both ternary and GGUF Q4K/Q6K models.
+        // HIP Graph opt-in. Measured WORSE than direct dispatch on RX 6750 XT (RDNA2)
+        // because current impl re-captures every token — update+launch avg 880µs/tok vs
+        // 570µs direct dispatch. For win: capture ONCE, replay many; needs rework.
+        // Enable with IARA_GRAPH=1 for experimentation.
         let use_graph = n == 1
             && std::env::var("IARA_GRAPH").map(|v| v == "1").unwrap_or(false);
 
