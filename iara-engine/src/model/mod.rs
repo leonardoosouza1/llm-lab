@@ -4336,7 +4336,14 @@ impl CausalLM {
         let h = self.cfg.hidden_size;
         let count = GREEDY_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // ALWAYS do embed_lookup BEFORE graph capture (host pointer unstable in graph)
+        // HSA boundary sync: drain HIP stream once at forward entry so subsequent
+        // HSA queue dispatches see all prior HIP-written state. With per-call
+        // sync gated off (IARA_HSA_NOSYNC=1), this is the only cross-queue sync.
+        #[cfg(feature = "rocm")]
+        if std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false) {
+            self.backend.device_sync();
+        }
+
         self.backend.embed_lookup(&EmbedParams {
             token_ids,
             vocab: &self.embed,

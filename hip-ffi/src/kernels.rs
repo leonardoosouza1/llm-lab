@@ -454,7 +454,23 @@ impl GpuKernels {
         let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
 
-        // Mutable copies so we can take &mut for the args array.
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("embed_lookup") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_e = (embed_bf16 as u64).to_le_bytes();
+                let p_t = (token_ids as u64).to_le_bytes();
+                let p_o = (out as u64).to_le_bytes();
+                let b_h = hidden.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_e, &p_t, &p_o, &b_h], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
+
         let mut p_embed = embed_bf16;
         let mut p_token_ids = token_ids;
         let mut p_out = out;
@@ -503,6 +519,24 @@ impl GpuKernels {
 
         let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("rms_norm") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_o = (out as u64).to_le_bytes();
+                let p_x = (x as u64).to_le_bytes();
+                let p_w = (w as u64).to_le_bytes();
+                let b_h = hidden.to_le_bytes();
+                let b_e = eps.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_o, &p_x, &p_w, &b_h, &b_e], grid, block16, shared_bytes)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_out = out;
         let mut p_x = x;
@@ -1967,6 +2001,28 @@ impl GpuKernels {
         let block = (32u32, 8, 1);
         let shared_bytes = (k * 4) as u32;
 
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("fused_rms_gate_up_silu_q4k_f32") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let bx = (x as u64).to_le_bytes();
+                let bnw = (norm_w as u64).to_le_bytes();
+                let bg = (gate_data as u64).to_le_bytes();
+                let bu = (up_data as u64).to_le_bytes();
+                let bo = (out as u64).to_le_bytes();
+                let bn = n.to_le_bytes();
+                let bk = k.to_le_bytes();
+                let beps = eps.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&bx, &bnw, &bg, &bu, &bo, &bn, &bk, &beps],
+                    grid, block16, shared_bytes)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
+
         let mut p_x    = x;
         let mut p_nw   = norm_w;
         let mut p_gate = gate_data;
@@ -2225,6 +2281,32 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = ((n_heads + n_kv_heads) as u32, 1, 1);
         let block = (head_dim as u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("fused_rope_kv_copy") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let pq = (q as u64).to_le_bytes();
+                let pk = (k as u64).to_le_bytes();
+                let pv = (v as u64).to_le_bytes();
+                let pkk = (kv_k_cache as u64).to_le_bytes();
+                let pkv = (kv_v_cache as u64).to_le_bytes();
+                let bnh = n_heads.to_le_bytes();
+                let bnk = n_kv_heads.to_le_bytes();
+                let bhd = head_dim.to_le_bytes();
+                let bps = pos_start.to_le_bytes();
+                let bth = theta.to_le_bytes();
+                let bkd = kv_dim.to_le_bytes();
+                let bms = max_seq.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&pq, &pk, &pv, &pkk, &pkv, &bnh, &bnk, &bhd, &bps, &bth, &bkd, &bms],
+                    grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_q = q;
         let mut p_k = k;
@@ -2868,8 +2950,30 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = (n_heads as u32, 1, 1);
         let block = (256u32, 1, 1);
-        // Dynamic shared memory: seq_len floats for attention scores
         let shared_bytes = (seq_len as u32) * 4;
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("fused_attention_decode") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let pq = (q as u64).to_le_bytes();
+                let pk = (k_cache as u64).to_le_bytes();
+                let pv = (v_cache as u64).to_le_bytes();
+                let po = (out as u64).to_le_bytes();
+                let bs = seq_len.to_le_bytes();
+                let bh = head_dim.to_le_bytes();
+                let bn = n_heads.to_le_bytes();
+                let bk = n_kv_heads.to_le_bytes();
+                let bsc = scale.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&pq, &pk, &pv, &po, &bs, &bh, &bn, &bk, &bsc],
+                    grid, block16, shared_bytes)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_q = q;
         let mut p_k = k_cache;
@@ -2923,6 +3027,23 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = (1u32, 1, 1);
         let block = (1024u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("argmax_f32") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_x = (x as u64).to_le_bytes();
+                let p_d = (dst as u64).to_le_bytes();
+                let p_v = (dst_val as u64).to_le_bytes();
+                let b_n = ncols.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_x, &p_d, &p_v, &b_n], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_x = x;
         let mut p_dst = dst;
@@ -3663,6 +3784,37 @@ impl GpuKernels {
         let grid = (((total + 7) / 8) as u32, 1, 1);
         let block = (32u32, 8, 1);
         let shared_bytes = (k * 4) as u32;
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("fused_rms_qkv_q4k_q6k_f32") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let bx = (x as u64).to_le_bytes();
+                let bnw = (norm_w as u64).to_le_bytes();
+                let bwq = (wq_data as u64).to_le_bytes();
+                let bwk = (wk_data as u64).to_le_bytes();
+                let bwv = (wv_data as u64).to_le_bytes();
+                let boq = (out_q as u64).to_le_bytes();
+                let bok = (out_k as u64).to_le_bytes();
+                let bov = (out_v as u64).to_le_bytes();
+                let bbq = (bias_q as u64).to_le_bytes();
+                let bbk = (bias_k as u64).to_le_bytes();
+                let bbv = (bias_v as u64).to_le_bytes();
+                let bnq = nq.to_le_bytes();
+                let bnk = nk.to_le_bytes();
+                let bnv = nv.to_le_bytes();
+                let bk = k.to_le_bytes();
+                let beps = eps.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&bx, &bnw, &bwq, &bwk, &bwv, &boq, &bok, &bov, &bbq, &bbk, &bbv,
+                      &bnq, &bnk, &bnv, &bk, &beps],
+                    grid, block16, shared_bytes)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_x   = x;
         let mut p_nw  = norm_w;
