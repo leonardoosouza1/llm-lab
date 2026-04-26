@@ -3535,7 +3535,23 @@ impl GpuKernels {
         beta: f32,
     ) -> Result<(), HipError> {
         let grid = (n as u32, m.max(1) as u32, 1);
-        let block = (64u32, 1, 1);  // wave64: one full wavefront per row
+        let block = (64u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pd = (data as u64).to_le_bytes();
+            let px = (x_q8 as u64).to_le_bytes();
+            let po = (out as u64).to_le_bytes();
+            let bm = m.to_le_bytes(); let bn = n.to_le_bytes();
+            let bk = k.to_le_bytes(); let bb = beta.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("gemv_q4k_q8_w64",
+                [&pd as &[u8], &px, &po, &bm, &bn, &bk, &bb], grid, block16, 0)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_data = data;
         let mut p_x_q8 = x_q8;
