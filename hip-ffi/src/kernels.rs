@@ -1102,10 +1102,22 @@ impl GpuKernels {
         let grid = ((n_blocks as u32 + 7) / 8, 1, 1);
         let block = (256u32, 1, 1);
 
-        // HSA path disabled for HIP-compiled kernels (kernarg_size=280 includes
-        // hidden ABI block/grid args that need non-zero values; hangs without).
-        // mmvq_q4k_llama works because compiled standalone via OpenCL hipcc with
-        // no hidden args (kernarg_size=40).
+        // HSA path with hidden-arg auto-fill (BlockCount/GroupSize/etc populated).
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("quantize_f32_q8_1") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_x = (x as u64).to_le_bytes();
+                let p_out = (out as u64).to_le_bytes();
+                let b_k = k.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_x, &p_out, &b_k], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_x = x;
         let mut p_out = out;

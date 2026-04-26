@@ -202,7 +202,17 @@ def main():
         "use std::collections::HashMap;",
         "",
         "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
-        "pub enum ArgKind { Pointer, Scalar, Hidden }",
+        "pub enum HiddenKind {",
+        "    BlockCountX, BlockCountY, BlockCountZ,",
+        "    GroupSizeX, GroupSizeY, GroupSizeZ,",
+        "    RemainderX, RemainderY, RemainderZ,",
+        "    GridDims,",
+        "    DynamicLdsSize,",
+        "    Zero,",
+        "}",
+        "",
+        "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
+        "pub enum ArgKind { Pointer, Scalar, Hidden(HiddenKind) }",
         "",
         "#[derive(Clone, Copy, Debug)]",
         "pub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }",
@@ -218,7 +228,9 @@ def main():
     for name in sorted(layouts.keys()):
         args = layouts[name]
         ksize = kernarg_size_total.get(name, 0)
-        # Filter: emit explicit args only (.value_kind in {global_buffer, by_value}); skip hidden.
+        # Emit explicit args (Pointer/Scalar) AND hidden args (with their kind tag).
+        # Hidden args must be populated at dispatch time with runtime values for
+        # HIP-compiled kernels to work via raw AQL.
         rs_slots = []
         for a in args:
             if "offset" not in a or "size" not in a:
@@ -228,8 +240,37 @@ def main():
                 rk = "ArgKind::Pointer"
             elif kind == "by_value":
                 rk = "ArgKind::Scalar"
+            elif kind.startswith("hidden_"):
+                # Map hidden kind to a tag the runtime can fill.
+                tag = {
+                    "hidden_block_count_x": "HiddenKind::BlockCountX",
+                    "hidden_block_count_y": "HiddenKind::BlockCountY",
+                    "hidden_block_count_z": "HiddenKind::BlockCountZ",
+                    "hidden_group_size_x": "HiddenKind::GroupSizeX",
+                    "hidden_group_size_y": "HiddenKind::GroupSizeY",
+                    "hidden_group_size_z": "HiddenKind::GroupSizeZ",
+                    "hidden_remainder_x": "HiddenKind::RemainderX",
+                    "hidden_remainder_y": "HiddenKind::RemainderY",
+                    "hidden_remainder_z": "HiddenKind::RemainderZ",
+                    "hidden_grid_dims": "HiddenKind::GridDims",
+                    "hidden_global_offset_x": "HiddenKind::Zero",
+                    "hidden_global_offset_y": "HiddenKind::Zero",
+                    "hidden_global_offset_z": "HiddenKind::Zero",
+                    "hidden_dynamic_lds_size": "HiddenKind::DynamicLdsSize",
+                    "hidden_default_queue": "HiddenKind::Zero",
+                    "hidden_completion_action": "HiddenKind::Zero",
+                    "hidden_multigrid_sync_arg": "HiddenKind::Zero",
+                    "hidden_private_base": "HiddenKind::Zero",
+                    "hidden_shared_base": "HiddenKind::Zero",
+                    "hidden_queue_ptr": "HiddenKind::Zero",
+                    "hidden_heap_v1": "HiddenKind::Zero",
+                    "hidden_hostcall_buffer": "HiddenKind::Zero",
+                    "hidden_printf_buffer": "HiddenKind::Zero",
+                    "hidden_none": "HiddenKind::Zero",
+                }.get(kind, "HiddenKind::Zero")
+                rs_slots.append(f"        ArgSlot {{ offset: {a['offset']}, size: {a['size']}, kind: ArgKind::Hidden({tag}) }},")
+                continue
             else:
-                # hidden_* -> skip in explicit list (caller zeros them via write_bytes)
                 continue
             rs_slots.append(f"        ArgSlot {{ offset: {a['offset']}, size: {a['size']}, kind: {rk} }},")
         slot_const = f"K_{name.upper()}"

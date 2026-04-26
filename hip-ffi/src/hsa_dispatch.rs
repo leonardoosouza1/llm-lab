@@ -556,13 +556,51 @@ impl HsaDispatcher {
         self.kernels.get(name)
     }
 
-    /// Universal dispatch: looks up build-time layout, packs raw arg bytes
-    /// according to AMD code object v5 metadata, dispatches sync.
-    /// `arg_bytes` must concatenate args in declaration order matching
-    /// the layout's Pointer/Scalar slots (Hidden slots are zero-filled
-    /// automatically). Pointer slots are 8 bytes each (little-endian u64).
-    /// Scalar slots are their declared size in declaration order.
-    /// SAFETY: caller responsible for matching bytes to kernel signature.
+    /// Pack explicit arg bytes into kernarg slot AND fill hidden ABI slots.
+    /// Caller passes one byte slice per non-hidden ArgSlot in the layout.
+    unsafe fn pack_kernarg(
+        &self,
+        karg: *mut u8,
+        layout: &crate::kernel_layouts::KernelLayout,
+        arg_bytes: &[&[u8]],
+        grid_blocks: (u32, u32, u32),
+        block: (u16, u16, u16),
+        dynamic_lds: u32,
+    ) {
+        use crate::kernel_layouts::{ArgKind, HiddenKind};
+        let mut explicit_idx = 0;
+        for slot in layout.args {
+            let dst = karg.add(slot.offset as usize);
+            match slot.kind {
+                ArgKind::Pointer | ArgKind::Scalar => {
+                    let bytes = arg_bytes[explicit_idx];
+                    explicit_idx += 1;
+                    debug_assert!(bytes.len() == slot.size as usize);
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                }
+                ArgKind::Hidden(hk) => {
+                    let val: u64 = match hk {
+                        HiddenKind::BlockCountX => grid_blocks.0 as u64,
+                        HiddenKind::BlockCountY => grid_blocks.1 as u64,
+                        HiddenKind::BlockCountZ => grid_blocks.2 as u64,
+                        HiddenKind::GroupSizeX => block.0 as u64,
+                        HiddenKind::GroupSizeY => block.1 as u64,
+                        HiddenKind::GroupSizeZ => block.2 as u64,
+                        HiddenKind::RemainderX => 0,
+                        HiddenKind::RemainderY => 0,
+                        HiddenKind::RemainderZ => 0,
+                        HiddenKind::GridDims => 3,
+                        HiddenKind::DynamicLdsSize => dynamic_lds as u64,
+                        HiddenKind::Zero => 0,
+                    };
+                    let src = val.to_le_bytes();
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, slot.size as usize);
+                }
+            }
+        }
+    }
+
+    /// Universal sync dispatch with hidden-arg auto-fill.
     pub unsafe fn pack_and_dispatch_sync(
         &self,
         kernel_info: &KernelInfo,
@@ -573,12 +611,7 @@ impl HsaDispatcher {
         dynamic_lds: u32,
     ) -> Result<(), HsaError> {
         let karg = self.next_kernarg(kernel_info.kernarg_size as usize);
-        // next_kernarg already zeroed the slot.
-        for (slot, bytes) in layout.args.iter().zip(arg_bytes_per_slot.iter()) {
-            assert!(bytes.len() == slot.size as usize, "arg size mismatch: layout {} bytes vs caller {}",
-                slot.size, bytes.len());
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), karg.add(slot.offset as usize), bytes.len());
-        }
+        self.pack_kernarg(karg, layout, arg_bytes_per_slot, grid_blocks, block, dynamic_lds);
         let grid_wi = (
             grid_blocks.0 * block.0 as u32,
             grid_blocks.1 * block.1 as u32,
@@ -599,10 +632,7 @@ impl HsaDispatcher {
         dynamic_lds: u32,
     ) -> Result<(), HsaError> {
         let karg = self.next_kernarg(kernel_info.kernarg_size as usize);
-        for (slot, bytes) in layout.args.iter().zip(arg_bytes_per_slot.iter()) {
-            assert!(bytes.len() == slot.size as usize);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), karg.add(slot.offset as usize), bytes.len());
-        }
+        self.pack_kernarg(karg, layout, arg_bytes_per_slot, grid_blocks, block, dynamic_lds);
         let grid_wi = (
             grid_blocks.0 * block.0 as u32,
             grid_blocks.1 * block.1 as u32,

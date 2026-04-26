@@ -358,11 +358,11 @@ fn main() {
         Ok(s) if s.success() => {}
         Ok(s) => {
             eprintln!("⚠️  extract_layouts.py exited {} — HSA fast path will be unavailable", s);
-            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
+            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum HiddenKind { BlockCountX, BlockCountY, BlockCountZ, GroupSizeX, GroupSizeY, GroupSizeZ, RemainderX, RemainderY, RemainderZ, GridDims, DynamicLdsSize, Zero }\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden(HiddenKind) }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
         }
         Err(e) => {
             eprintln!("⚠️  python3 not found ({}); HSA fast path disabled", e);
-            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
+            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum HiddenKind { BlockCountX, BlockCountY, BlockCountZ, GroupSizeX, GroupSizeY, GroupSizeZ, RemainderX, RemainderY, RemainderZ, GridDims, DynamicLdsSize, Zero }\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden(HiddenKind) }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
         }
     }
 }
