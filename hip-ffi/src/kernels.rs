@@ -584,6 +584,22 @@ impl GpuKernels {
         let grid = (n_tokens as u32, 1, 1);
         let block = (bsz, 1, 1);
 
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("add_bias_inplace") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_x = (x as u64).to_le_bytes();
+                let p_b = (bias as u64).to_le_bytes();
+                let b_d = dim.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_x, &p_b, &b_d], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
+
         let mut p_x = x;
         let mut p_bias = bias;
         let mut p_dim = dim;
@@ -628,6 +644,24 @@ impl GpuKernels {
         let half = (head_dim / 2) as u32;
         let grid = (n_tokens as u32, n_heads as u32, 1);
         let block = (half, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("rope_inplace") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_x = (x as u64).to_le_bytes();
+                let bnh = n_heads.to_le_bytes();
+                let bhd = head_dim.to_le_bytes();
+                let bps = pos_start.to_le_bytes();
+                let bth = theta.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_x, &bnh, &bhd, &bps, &bth], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_x = x;
         let mut p_n_heads = n_heads;
@@ -820,6 +854,24 @@ impl GpuKernels {
         let block_x = total.min(1024);
         let grid = (1, 1, 1);
         let block = (block_x, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("copy_to_kv_cache") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let pc = (cache as u64).to_le_bytes();
+                let pn = (new_kv as u64).to_le_bytes();
+                let bnt = n_tokens.to_le_bytes();
+                let bkd = kv_dim.to_le_bytes();
+                let bcl = current_len.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&pc, &pn, &bnt, &bkd, &bcl], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_cache = cache;
         let mut p_new_kv = new_kv;
