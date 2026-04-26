@@ -544,6 +544,61 @@ impl HsaDispatcher {
         self.kernels.get(name)
     }
 
+    /// Universal dispatch: looks up build-time layout, packs raw arg bytes
+    /// according to AMD code object v5 metadata, dispatches sync.
+    /// `arg_bytes` must concatenate args in declaration order matching
+    /// the layout's Pointer/Scalar slots (Hidden slots are zero-filled
+    /// automatically). Pointer slots are 8 bytes each (little-endian u64).
+    /// Scalar slots are their declared size in declaration order.
+    /// SAFETY: caller responsible for matching bytes to kernel signature.
+    pub unsafe fn pack_and_dispatch_sync(
+        &self,
+        kernel_info: &KernelInfo,
+        layout: &crate::kernel_layouts::KernelLayout,
+        arg_bytes_per_slot: &[&[u8]],
+        grid_blocks: (u32, u32, u32),
+        block: (u16, u16, u16),
+        dynamic_lds: u32,
+    ) -> Result<(), HsaError> {
+        let karg = self.next_kernarg(kernel_info.kernarg_size as usize);
+        // next_kernarg already zeroed the slot.
+        for (slot, bytes) in layout.args.iter().zip(arg_bytes_per_slot.iter()) {
+            assert!(bytes.len() == slot.size as usize, "arg size mismatch: layout {} bytes vs caller {}",
+                slot.size, bytes.len());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), karg.add(slot.offset as usize), bytes.len());
+        }
+        let grid_wi = (
+            grid_blocks.0 * block.0 as u32,
+            grid_blocks.1 * block.1 as u32,
+            grid_blocks.2 * block.2 as u32,
+        );
+        self.ctx.dispatch_sync(kernel_info, karg, grid_wi, block, dynamic_lds)
+    }
+
+    /// Async variant — caller must call `wait_completion()` (or barrier+wait)
+    /// before reading outputs. SAFETY same as `pack_and_dispatch_sync`.
+    pub unsafe fn pack_and_dispatch_async(
+        &self,
+        kernel_info: &KernelInfo,
+        layout: &crate::kernel_layouts::KernelLayout,
+        arg_bytes_per_slot: &[&[u8]],
+        grid_blocks: (u32, u32, u32),
+        block: (u16, u16, u16),
+        dynamic_lds: u32,
+    ) -> Result<(), HsaError> {
+        let karg = self.next_kernarg(kernel_info.kernarg_size as usize);
+        for (slot, bytes) in layout.args.iter().zip(arg_bytes_per_slot.iter()) {
+            assert!(bytes.len() == slot.size as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), karg.add(slot.offset as usize), bytes.len());
+        }
+        let grid_wi = (
+            grid_blocks.0 * block.0 as u32,
+            grid_blocks.1 * block.1 as u32,
+            grid_blocks.2 * block.2 as u32,
+        );
+        self.ctx.dispatch_async(kernel_info, karg, grid_wi, block, dynamic_lds)
+    }
+
     /// `grid` is in BLOCKS (HIP convention); converted to workitems internally.
     pub fn dispatch_async(&self, kernel: &KernelInfo, kernarg: *mut u8, grid_blocks: (u32, u32, u32), block: (u16, u16, u16), smem: u32) -> Result<(), HsaError> {
         let grid_workitems = (

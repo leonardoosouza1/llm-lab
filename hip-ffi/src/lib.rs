@@ -16,6 +16,11 @@ pub mod hsa_raw {
     include!(concat!(env!("OUT_DIR"), "/hsa_bindings.rs"));
 }
 
+/// Auto-generated kernel argument layouts (from .note.AMDGPU msgpack).
+pub mod kernel_layouts {
+    include!(concat!(env!("OUT_DIR"), "/kernel_layouts.rs"));
+}
+
 pub mod safe;
 pub mod tensor;
 pub mod blas;

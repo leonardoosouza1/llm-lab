@@ -268,6 +268,9 @@ fn main() {
         .write_to_file(out.join("hsa_bindings.rs"))
         .expect("Failed to write hsa_bindings.rs");
 
+    // ── Generate kernel layouts (after .hsaco files exist; deferred to end) ──
+    println!("cargo:rerun-if-changed=scripts/extract_layouts.py");
+
     // ── Compile HIP kernels to .hsaco ─────────────────────────────────────────
     let hipcc = format!("{}/bin/hipcc", rocm);
     let kernel_src = format!("{}/kernels/llm_kernels.hip", manifest_dir);
@@ -339,5 +342,27 @@ fn main() {
 
     if !mmvq_status.success() {
         panic!("hipcc failed to compile mmvq_llama.hip (exit: {})", mmvq_status);
+    }
+
+    // ── Extract kernarg layouts from all .hsaco files (compile-time table) ──
+    let layouts_rs = out.join("kernel_layouts.rs");
+    let py = std::process::Command::new("python3")
+        .arg(format!("{}/scripts/extract_layouts.py", manifest_dir))
+        .arg(&layouts_rs)
+        .arg(&kernel_out)
+        .arg(&w64_out)
+        .arg(&mmvq_out)
+        .env("ROCM_PATH", &rocm)
+        .status();
+    match py {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("⚠️  extract_layouts.py exited {} — HSA fast path will be unavailable", s);
+            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
+        }
+        Err(e) => {
+            eprintln!("⚠️  python3 not found ({}); HSA fast path disabled", e);
+            std::fs::write(&layouts_rs, "use std::collections::HashMap;\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum ArgKind { Pointer, Scalar, Hidden }\n#[derive(Clone, Copy, Debug)]\npub struct ArgSlot { pub offset: u32, pub size: u32, pub kind: ArgKind }\n#[derive(Clone, Debug)]\npub struct KernelLayout { pub kernarg_size: u32, pub args: &'static [ArgSlot] }\npub fn all_layouts() -> HashMap<&'static str, KernelLayout> { HashMap::new() }\n").unwrap();
+        }
     }
 }

@@ -337,23 +337,29 @@ impl GpuKernels {
         })
     }
 
-    /// Initialize the optional HSA AQL dispatcher and pre-register hot-path kernels.
-    /// Called from RocmBackend probe when env IARA_HSA=1 set.
+    /// Initialize the optional HSA AQL dispatcher and pre-register all kernels
+    /// whose layouts were extracted at build time. Called from RocmBackend
+    /// probe when env IARA_HSA=1 set.
     pub fn enable_hsa(&mut self) -> Result<(), String> {
         let mut disp = crate::hsa_dispatch::HsaDispatcher::new(
             &[KERNEL_BYTES, KERNEL_W64_BYTES, KERNEL_MMVQ_BYTES],
-            512,    // largest kernarg slot expected
-            1024,   // ring depth
+            512,
+            4096,  // ring depth — must exceed launches/tok (~395) so async batch fits
         ).map_err(|e| e.0)?;
-        // Pre-register hot kernels. Add more here as call sites get HSA paths.
-        for name in &[
-            "mmvq_q4k_llama",
-            "quantize_f32_q8_1",
-            "fused_attention_decode",
-        ] {
-            let _ = disp.register(name).map_err(|e| format!("register {name}: {}", e.0))?;
+
+        let layouts = crate::kernel_layouts::all_layouts();
+        let mut registered = 0usize;
+        let mut missing = Vec::new();
+        for name in layouts.keys() {
+            match disp.register(name) {
+                Ok(_) => registered += 1,
+                Err(_) => missing.push(name.to_string()),
+            }
         }
-        eprintln!("HSA AQL dispatcher: enabled, {} kernels registered", disp.kernels.len());
+        eprintln!(
+            "HSA AQL dispatcher: enabled, {}/{} kernels registered ({} missing in modules)",
+            registered, layouts.len(), missing.len(),
+        );
         self.hsa = Some(disp);
         Ok(())
     }
@@ -3170,38 +3176,30 @@ impl GpuKernels {
         let grid = (n as u32, m.max(1) as u32, 1);
         let block = (32u32, 1, 1);
 
-        // ── HSA AQL fast path (sync — drain HIP stream first to preserve order) ──
+        // ── HSA AQL fast path via universal helper (build-time layout) ──
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some(kinfo) = hsa.get("mmvq_q4k_llama") {
-                static LAYOUT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !LAYOUT_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("HSA mmvq: kernarg_size={} align={} group={} private={}",
-                        kinfo.kernarg_size, kinfo.kernarg_align,
-                        kinfo.group_segment_size, kinfo.private_segment_size);
+                let layouts = crate::kernel_layouts::all_layouts();
+                if let Some(layout) = layouts.get("mmvq_q4k_llama") {
+                    if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                        use crate::raw::hipStreamSynchronize;
+                        let _ = hipStreamSynchronize(self.stream);
+                    }
+                    let p_data = (data as u64).to_le_bytes();
+                    let p_xq8  = (x_q8 as u64).to_le_bytes();
+                    let p_out  = (out as u64).to_le_bytes();
+                    let b_m    = m.to_le_bytes();
+                    let b_n    = n.to_le_bytes();
+                    let b_k    = k.to_le_bytes();
+                    let b_beta = beta.to_le_bytes();
+                    let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                    hsa.pack_and_dispatch_sync(
+                        kinfo, layout,
+                        &[&p_data, &p_xq8, &p_out, &b_m, &b_n, &b_k, &b_beta],
+                        grid, block16, 0,
+                    ).map_err(|e| HipError::Hip { code: 0, msg: e.0 })?;
+                    return Ok(());
                 }
-                // EXPERIMENTAL: skip cross-stream sync to measure pure-HSA overhead.
-                // Correctness-risky — relies on serialized device dispatch ordering.
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
-                    use crate::raw::hipStreamSynchronize;
-                    let _ = hipStreamSynchronize(self.stream);
-                }
-                let karg = hsa.next_kernarg(kinfo.kernarg_size as usize);
-                let p = karg as *mut u64;
-                *p.offset(0) = data as u64;
-                *p.offset(1) = x_q8 as u64;
-                *p.offset(2) = out as u64;
-                let pi = karg.add(24) as *mut i32;
-                *pi.offset(0) = m;
-                *pi.offset(1) = n;
-                *pi.offset(2) = k;
-                let pf = karg.add(36) as *mut f32;
-                *pf = beta;
-                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
-                // HSA grid is in workitems, HIP grid is in blocks. Convert.
-                let grid_wi = (grid.0 * block.0, grid.1 * block.1, grid.2 * block.2);
-                hsa.ctx.dispatch_sync(kinfo, karg, grid_wi, block16, 0)
-                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 })?;
-                return Ok(());
             }
         }
 
