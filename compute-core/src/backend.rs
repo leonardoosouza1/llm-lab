@@ -351,6 +351,10 @@ pub trait ComputeBackend: Send + Sync + 'static {
     /// Destroy any cached graph exec — call when KV cache or model state resets.
     fn invalidate_graph(&self) {}
 
+    /// HSA-only: drain the AQL queue (single barrier+wait at end of forward).
+    /// No-op for backends without HSA. Returns true if a drain happened.
+    fn hsa_barrier_and_wait(&self) -> bool { false }
+
     fn begin_graph_capture(&self) -> bool { false }
 
     /// End graph capture, instantiate/update executable, and launch the graph.

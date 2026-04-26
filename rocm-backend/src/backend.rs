@@ -1168,6 +1168,15 @@ impl ComputeBackend for RocmBackend {
         }
     }
 
+    fn hsa_barrier_and_wait(&self) -> bool {
+        if let Some(hsa) = self.kernels.hsa.as_ref() {
+            let _ = hsa.submit_barrier_and_wait();
+            true
+        } else {
+            false
+        }
+    }
+
     fn begin_graph_capture(&self) -> bool {
         unsafe {
             match hip_ffi::hip_stream_begin_capture(self.stream, hip_ffi::CAPTURE_MODE_RELAXED) {

@@ -4336,12 +4336,15 @@ impl CausalLM {
         let h = self.cfg.hidden_size;
         let count = GREEDY_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // HSA boundary sync: drain HIP stream once at forward entry so subsequent
-        // HSA queue dispatches see all prior HIP-written state. With per-call
-        // sync gated off (IARA_HSA_NOSYNC=1), this is the only cross-queue sync.
+        // HSA boundary sync at entry: drain HIP stream so HSA dispatches see
+        // all prior HIP-written state. Active in NOSYNC and FAST modes.
         #[cfg(feature = "rocm")]
-        if std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false) {
-            self.backend.device_sync();
+        {
+            let nosync = std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false);
+            let fast   = std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false);
+            if nosync || fast {
+                self.backend.device_sync();
+            }
         }
 
         self.backend.embed_lookup(&EmbedParams {
@@ -4421,6 +4424,12 @@ impl CausalLM {
             } else if graph_ok && count < 3 {
                 log::warn!("HIP Graph CAPTURE: {}µs ({} launches collapsed)", graph_us, launches_this_token);
             }
+        }
+
+        // FAST mode: drain HSA queue once before reading results.
+        #[cfg(feature = "rocm")]
+        if std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false) {
+            self.backend.hsa_barrier_and_wait();
         }
 
         // GPU argmax runs on same stream (ordered after graph/direct kernels)

@@ -292,8 +292,11 @@ impl HsaContext {
                 std::mem::size_of::<hsa_kernel_dispatch_packet_t>(),
             );
 
-            // Header without barrier (allow concurrent execution where deps allow).
+            // Header WITH barrier bit: packet must finish before next runs.
+            // Required for in-order execution on HSA_QUEUE_TYPE_MULTI; without
+            // it kernels may race even if dispatched sequentially.
             let header: u16 = (PACKET_TYPE_KERNEL_DISPATCH << PACKET_HEADER_TYPE)
+                | (1u16 << PACKET_HEADER_BARRIER)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
             let setup: u16 = 3u16 << KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
@@ -617,13 +620,16 @@ impl HsaDispatcher {
             grid_blocks.1 * block.1 as u32,
             grid_blocks.2 * block.2 as u32,
         );
-        self.ctx.dispatch_sync(kernel_info, karg, grid_wi, block, dynamic_lds)
+        // FAST mode: async dispatch (no per-call wait). Engine drains via
+        // submit_barrier_and_wait at end of forward.
+        if std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false) {
+            self.ctx.dispatch_async(kernel_info, karg, grid_wi, block, dynamic_lds)
+        } else {
+            self.ctx.dispatch_sync(kernel_info, karg, grid_wi, block, dynamic_lds)
+        }
     }
 
     /// Convenience: dispatch with typed args via slices of byte arrays.
-    /// Caller builds slices via `.to_le_bytes()` for scalars and
-    /// `(ptr as u64).to_le_bytes()` for pointers, then passes a fixed-size
-    /// array of slices. No heap allocation in the hot path.
     pub unsafe fn dispatch_typed_sync<const N: usize>(
         &self,
         name: &'static str,
@@ -634,6 +640,32 @@ impl HsaDispatcher {
     ) -> Result<(), HsaError> {
         let (kinfo, layout) = self.lookup(name).ok_or_else(|| HsaError(format!("unknown kernel {}", name)))?;
         self.pack_and_dispatch_sync(kinfo, layout, &args, grid_blocks, block, dynamic_lds)
+    }
+
+    /// Async variant of dispatch_typed_sync. Caller MUST call
+    /// `submit_barrier_and_wait()` (or equivalent) before reading any output
+    /// produced by these dispatches. No per-call signal wait — kernel runs
+    /// async on the HSA queue. Multiple async dispatches are serialized by
+    /// the queue itself (in-order), so no HSA-side race.
+    pub unsafe fn dispatch_typed_async<const N: usize>(
+        &self,
+        name: &'static str,
+        args: [&[u8]; N],
+        grid_blocks: (u32, u32, u32),
+        block: (u16, u16, u16),
+        dynamic_lds: u32,
+    ) -> Result<(), HsaError> {
+        let (kinfo, layout) = self.lookup(name).ok_or_else(|| HsaError(format!("unknown kernel {}", name)))?;
+        self.pack_and_dispatch_async(kinfo, layout, &args, grid_blocks, block, dynamic_lds)
+    }
+
+    /// End-of-batch drain: queue a barrier_and packet that signals
+    /// completion_signal, then host waits until the GPU has finished all
+    /// prior async dispatches. Replaces N per-call signal waits with one.
+    pub fn submit_barrier_and_wait(&self) -> Result<(), HsaError> {
+        self.submit_barrier()?;
+        self.wait_completion();
+        Ok(())
     }
 
     /// Async variant — caller must call `wait_completion()` (or barrier+wait)
