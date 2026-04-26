@@ -2003,15 +2003,30 @@ impl GpuKernels {
     // ─────────────────────────────────────────────────────────────────────────
     pub unsafe fn gemv_bf16_f32_w64(
         &self,
-        w: *const u16,   // [N, K] BF16 weights (u16 storage)
-        x: *const f32,   // [K] F32 activations
-        out: *mut f32,   // [N] F32 output
+        w: *const u16,
+        x: *const f32,
+        out: *mut f32,
         n: i32,
         k: i32,
     ) -> Result<(), HipError> {
         let grid = (((n + 3) / 4) as u32, 1, 1);
         let block = (64u32, 4, 1);
-        let shared_bytes = (k * 4) as u32;  // K floats in shared memory
+        let shared_bytes = (k * 4) as u32;
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pw = (w as u64).to_le_bytes();
+            let px = (x as u64).to_le_bytes();
+            let po = (out as u64).to_le_bytes();
+            let bn = n.to_le_bytes(); let bk = k.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("gemv_bf16_f32_w64",
+                [&pw as &[u8], &px, &po, &bn, &bk], grid, block16, shared_bytes)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_w   = w;
         let mut p_x   = x;
@@ -3454,8 +3469,27 @@ impl GpuKernels {
         scale: f32,
     ) -> Result<(), HipError> {
         let grid = (n_heads as u32, 1, 1);
-        let block = (32u32, 1, 1);  // 1 warp per block
+        let block = (32u32, 1, 1);
         let shared_bytes = 0u32;
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pq = (q as u64).to_le_bytes();
+            let pk = (k_cache as u64).to_le_bytes();
+            let pv = (v_cache as u64).to_le_bytes();
+            let po = (out as u64).to_le_bytes();
+            let bs = seq_len.to_le_bytes(); let bh = head_dim.to_le_bytes();
+            let bn = n_heads.to_le_bytes(); let bk = n_kv_heads.to_le_bytes();
+            let bsc = scale.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("flash_attention_decode_v2",
+                [&pq as &[u8], &pk, &pv, &po, &bs, &bh, &bn, &bk, &bsc],
+                grid, block16, shared_bytes)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_q = q;
         let mut p_k = k_cache;
