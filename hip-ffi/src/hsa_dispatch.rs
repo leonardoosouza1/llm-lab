@@ -544,8 +544,14 @@ impl HsaDispatcher {
         self.kernels.get(name)
     }
 
-    pub fn dispatch_async(&self, kernel: &KernelInfo, kernarg: *mut u8, grid: (u32, u32, u32), block: (u16, u16, u16), smem: u32) -> Result<(), HsaError> {
-        self.ctx.dispatch_async(kernel, kernarg, grid, block, smem)
+    /// `grid` is in BLOCKS (HIP convention); converted to workitems internally.
+    pub fn dispatch_async(&self, kernel: &KernelInfo, kernarg: *mut u8, grid_blocks: (u32, u32, u32), block: (u16, u16, u16), smem: u32) -> Result<(), HsaError> {
+        let grid_workitems = (
+            grid_blocks.0 * block.0 as u32,
+            grid_blocks.1 * block.1 as u32,
+            grid_blocks.2 * block.2 as u32,
+        );
+        self.ctx.dispatch_async(kernel, kernarg, grid_workitems, block, smem)
     }
 
     pub fn submit_barrier(&self) -> Result<(), HsaError> { self.ctx.submit_barrier() }

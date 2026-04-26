@@ -3170,15 +3170,34 @@ impl GpuKernels {
         let grid = (n as u32, m.max(1) as u32, 1);
         let block = (32u32, 1, 1);
 
-        // ── HSA AQL fast path (DISABLED — kernarg layout needs ROCm metadata
-        // parsing to extract per-kernel hidden-arg offsets. Empirical layout
-        // tested below produces garbage output; proper impl requires reading
-        // the kernel's msgpack metadata from the ELF. Tracked in hsa_aql_path.md).
-        if false {
-            if let Some(hsa) = self.hsa.as_ref() {
-                if let Some(kinfo) = hsa.get("mmvq_q4k_llama") {
-                    let _ = (hsa, kinfo); // placeholder
+        // ── HSA AQL fast path (sync — drain HIP stream first to preserve order) ──
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some(kinfo) = hsa.get("mmvq_q4k_llama") {
+                static LAYOUT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LAYOUT_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("HSA mmvq: kernarg_size={} align={} group={} private={}",
+                        kinfo.kernarg_size, kinfo.kernarg_align,
+                        kinfo.group_segment_size, kinfo.private_segment_size);
                 }
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+                let karg = hsa.next_kernarg(kinfo.kernarg_size as usize);
+                let p = karg as *mut u64;
+                *p.offset(0) = data as u64;
+                *p.offset(1) = x_q8 as u64;
+                *p.offset(2) = out as u64;
+                let pi = karg.add(24) as *mut i32;
+                *pi.offset(0) = m;
+                *pi.offset(1) = n;
+                *pi.offset(2) = k;
+                let pf = karg.add(36) as *mut f32;
+                *pf = beta;
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                // HSA grid is in workitems, HIP grid is in blocks. Convert.
+                let grid_wi = (grid.0 * block.0, grid.1 * block.1, grid.2 * block.2);
+                hsa.ctx.dispatch_sync(kinfo, karg, grid_wi, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 })?;
+                return Ok(());
             }
         }
 
