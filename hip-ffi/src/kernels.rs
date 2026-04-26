@@ -711,6 +711,20 @@ impl GpuKernels {
         let grid = (ceil_div(total, block_x), 1, 1);
         let block = (block_x, 1, 1);
 
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pg = (gate as u64).to_le_bytes();
+            let pu = (up as u64).to_le_bytes();
+            let bt = (n_tokens * inter).to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("silu_mul_inplace",
+                [&pg as &[u8], &pu, &bt], grid, block16, 0)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
+
         let mut p_gate = gate;
         let mut p_up = up;
         let mut p_total = (n_tokens * inter) as i32;
@@ -751,7 +765,6 @@ impl GpuKernels {
         n_rows: i32,
         seq_len: i32,
     ) -> Result<(), HipError> {
-        // Choose block size = next power-of-two >= seq_len, capped at 1024.
         let bsz = {
             let mut b = 64u32;
             while b < (seq_len as u32).min(1024) {
@@ -763,6 +776,19 @@ impl GpuKernels {
 
         let grid = (n_rows as u32, 1, 1);
         let block = (bsz, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let ps = (scores as u64).to_le_bytes();
+            let bs = seq_len.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("softmax_rows",
+                [&ps as &[u8], &bs], grid, block16, shared_bytes)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_scores = scores;
         let mut p_seq_len = seq_len;
@@ -803,6 +829,21 @@ impl GpuKernels {
 
         let grid = (n_rows as u32, 1, 1);
         let block = (bsz, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let ps = (scores as u64).to_le_bytes();
+            let bs = seq_len.to_le_bytes();
+            let bn = n_tokens.to_le_bytes();
+            let bq = query_offset.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("softmax_rows_causal",
+                [&ps as &[u8], &bs, &bn, &bq], grid, block16, shared_bytes)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_scores = scores;
         let mut p_seq_len = seq_len;
@@ -1242,7 +1283,23 @@ impl GpuKernels {
         beta: f32,
     ) -> Result<(), HipError> {
         let grid = (n as u32, m.max(1) as u32, 1);
-        let block = (32u32, 1, 1);  // single warp (wave32)
+        let block = (32u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pd = (data as u64).to_le_bytes();
+            let px = (x_q8 as u64).to_le_bytes();
+            let po = (out as u64).to_le_bytes();
+            let bm = m.to_le_bytes(); let bn = n.to_le_bytes();
+            let bk = k.to_le_bytes(); let bb = beta.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("gemv_q4k_q8",
+                [&pd as &[u8], &px, &po, &bm, &bn, &bk, &bb], grid, block16, 0)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_data = data;
         let mut p_x_q8 = x_q8;
@@ -1554,6 +1611,22 @@ impl GpuKernels {
     ) -> Result<(), HipError> {
         let grid = (n as u32, 1, 1);
         let block = (32u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pg = (gate_data as u64).to_le_bytes();
+            let pu = (up_data as u64).to_le_bytes();
+            let px = (x_q8 as u64).to_le_bytes();
+            let po = (out as u64).to_le_bytes();
+            let bn = n.to_le_bytes(); let bk = k.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("fused_gate_up_silu_q4k",
+                [&pg as &[u8], &pu, &px, &po, &bn, &bk], grid, block16, 0)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_gate = gate_data;
         let mut p_up = up_data;
@@ -2609,6 +2682,21 @@ impl GpuKernels {
         let grid_x = ceil_div(n as u32, block_x);
         let grid = (grid_x, 1, 1);
         let block = (block_x, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                use crate::raw::hipStreamSynchronize;
+                let _ = hipStreamSynchronize(self.stream);
+            }
+            let pa = (a as u64).to_le_bytes();
+            let pb = (b as u64).to_le_bytes();
+            let bn = n.to_le_bytes();
+            let ba = alpha.to_le_bytes();
+            let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+            return hsa.dispatch_typed_sync("add_tensors_inplace",
+                [&pa as &[u8], &pb, &bn, &ba], grid, block16, 0)
+                .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+        }
 
         let mut p_a = a;
         let mut p_b = b;
