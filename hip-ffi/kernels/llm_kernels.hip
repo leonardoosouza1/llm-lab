@@ -5221,3 +5221,189 @@ extern "C" __global__ void gemv_svd_bf16_fused(
 }
 #undef GEMV_SVD_BLOCK
 
+
+// ===========================================================================
+// HIP Graph capture-once-replay support: device-pointer scalar variants
+//
+// These kernels read seq_pos / seq_len from device memory, allowing graph
+// to be captured once and replayed every token after updating one int via
+// hipMemcpyAsync. Eliminates kernel-launch overhead of direct dispatch
+// (~6.5ms/tok) while avoiding stream-recapture cost of hipStreamEndCapture.
+// ===========================================================================
+
+// Dynamic-pos variant of fused_rope_kv_copy.
+// Reads pos_start from *pos_dptr once per block.
+extern "C" __global__ void fused_rope_kv_copy_dyn(
+    float*       __restrict__ q,
+    float*       __restrict__ k,
+    const float* __restrict__ v,
+    float*       __restrict__ kv_k_cache,
+    float*       __restrict__ kv_v_cache,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int*   __restrict__ pos_dptr,
+    float theta,
+    int kv_dim,
+    int max_seq
+) {
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int half_dim = head_dim / 2;
+    const int pos_start = *pos_dptr;
+
+    if (bid < n_heads) {
+        if (tid < half_dim) {
+            const int head = bid;
+            size_t base = (size_t)head * head_dim;
+            float freq = 1.0f / powf(theta, (2.0f * (float)tid) / (float)head_dim);
+            float angle = (float)pos_start * freq;
+            float c = cosf(angle);
+            float s = sinf(angle);
+            float x0 = q[base + tid];
+            float x1 = q[base + half_dim + tid];
+            q[base + tid]            = x0 * c - x1 * s;
+            q[base + half_dim + tid] = x0 * s + x1 * c;
+        }
+    } else {
+        const int kv_head = bid - n_heads;
+        if (kv_head >= n_kv_heads) return;
+
+        size_t k_base = (size_t)kv_head * head_dim;
+
+        if (tid < half_dim) {
+            float freq = 1.0f / powf(theta, (2.0f * (float)tid) / (float)head_dim);
+            float angle = (float)pos_start * freq;
+            float c = cosf(angle);
+            float s = sinf(angle);
+            float x0 = k[k_base + tid];
+            float x1 = k[k_base + half_dim + tid];
+            k[k_base + tid]            = x0 * c - x1 * s;
+            k[k_base + half_dim + tid] = x0 * s + x1 * c;
+        }
+        __syncthreads();
+
+        if (tid < head_dim) {
+            size_t cache_idx = (size_t)pos_start * kv_dim + kv_head * head_dim + tid;
+            kv_k_cache[cache_idx] = k[k_base + tid];
+            kv_v_cache[cache_idx] = v[k_base + tid];
+        }
+    }
+}
+
+// Dynamic-pos variant of copy_to_kv_cache.
+// Reads current_len from *pos_dptr.
+__launch_bounds__(1024)
+extern "C" __global__ void copy_to_kv_cache_dyn(
+    float*       __restrict__ cache,
+    const float* __restrict__ new_kv,
+    int n_tokens,
+    int kv_dim,
+    const int*   __restrict__ pos_dptr
+) {
+    const int current_len = *pos_dptr;
+    int tid   = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = n_tokens * kv_dim;
+
+    for (int idx = tid; idx < total; idx += (int)(blockDim.x * gridDim.x)) {
+        int tok = idx / kv_dim;
+        int dim = idx % kv_dim;
+        cache[(size_t)(current_len + tok) * kv_dim + dim] = new_kv[(size_t)tok * kv_dim + dim];
+    }
+}
+
+// Dynamic-seq_len variant of fused_attention_decode.
+// Reads seq_len from *seq_dptr once per block.
+__launch_bounds__(256, 4)
+extern "C" __global__ void fused_attention_decode_dyn(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float*       __restrict__ out,
+    const int*   __restrict__ seq_dptr,
+    int head_dim,
+    int n_heads,
+    int n_kv_heads,
+    float scale
+) {
+    extern __shared__ float smem[];
+
+    // seq_dptr holds the pre-write KV position (same buffer used by copy_to_kv_cache_dyn);
+    // attention sees the just-written slot too, so seq_len = *seq_dptr + 1 for decode (n=1).
+    const int seq_len = *seq_dptr + 1;
+    const int head = blockIdx.x;
+    if (head >= n_heads) return;
+    const int tid = threadIdx.x;
+
+    const int heads_per_group = n_heads / n_kv_heads;
+    const int kv_head = head / heads_per_group;
+
+    const float* q_head = q + head * head_dim;
+    const float* k_head_base = k_cache + kv_head * head_dim;
+    const float* v_head_base = v_cache + kv_head * head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+
+    for (int s = tid; s < seq_len; s += blockDim.x) {
+        const float* k_vec = k_head_base + s * kv_stride;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot = __fmaf_rn(q_head[d], k_vec[d], dot);
+        }
+        smem[s] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int s = tid; s < seq_len; s += blockDim.x) {
+        local_max = fmaxf(local_max, smem[s]);
+    }
+    for (int off = 16; off >= 1; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+    __shared__ float warp_max[8];
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) warp_max[warp_id] = local_max;
+    __syncthreads();
+    if (tid < 8) {
+        float val = warp_max[tid];
+        for (int off = 4; off >= 1; off >>= 1)
+            val = fmaxf(val, __shfl_down(val, off));
+        if (tid == 0) warp_max[0] = val;
+    }
+    __syncthreads();
+    float global_max = warp_max[0];
+
+    float local_sum = 0.0f;
+    for (int s = tid; s < seq_len; s += blockDim.x) {
+        float e = __expf(smem[s] - global_max);
+        smem[s] = e;
+        local_sum += e;
+    }
+    for (int off = 16; off >= 1; off >>= 1)
+        local_sum += __shfl_xor(local_sum, off);
+    __shared__ float warp_sum[8];
+    if (lane == 0) warp_sum[warp_id] = local_sum;
+    __syncthreads();
+    if (tid < 8) {
+        float val = warp_sum[tid];
+        for (int off = 4; off >= 1; off >>= 1)
+            val += __shfl_down(val, off);
+        if (tid == 0) warp_sum[0] = val;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / warp_sum[0];
+
+    for (int s = tid; s < seq_len; s += blockDim.x) {
+        smem[s] *= inv_sum;
+    }
+    __syncthreads();
+
+    float* out_head = out + head * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < seq_len; s++) {
+            acc = __fmaf_rn(smem[s], v_head_base[s * kv_stride + d], acc);
+        }
+        out_head[d] = acc;
+    }
+}

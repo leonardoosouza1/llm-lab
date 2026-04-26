@@ -100,6 +100,9 @@ pub struct RocmBackend {
     tok_buf: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u32>>,
     act_bf16: std::sync::Mutex<hip_ffi::safe::DeviceBuffer<u16>>,
     argmax_buf: hip_ffi::safe::DeviceBuffer<i32>,
+    /// Device-resident scalar (i32, 1 elem) for HIP graph replay: holds seq_pos / current_len.
+    /// Updated via hipMemcpyAsync per token so kernels read latest value during graph replay.
+    pos_dev: hip_ffi::safe::DeviceBuffer<i32>,
     // HIP stream + graph capture state
     stream: hip_ffi::raw::hipStream_t,
     graph_exec: std::sync::Mutex<Option<hip_ffi::raw::hipGraphExec_t>>,
@@ -143,6 +146,13 @@ impl RocmBackend {
         // Route kernel launches through our stream
         kernels.set_stream(stream);
 
+        // Optional HSA AQL fast path (IARA_HSA=1).
+        if std::env::var("IARA_HSA").map(|v| v == "1").unwrap_or(false) {
+            if let Err(e) = kernels.enable_hsa() {
+                eprintln!("⚠️  HSA dispatcher failed to init: {}", e);
+            }
+        }
+
         let tok_buf = hip_ffi::safe::DeviceBuffer::<u32>::alloc(4096)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc: {e}")))?;
 
@@ -151,6 +161,9 @@ impl RocmBackend {
 
         let argmax_buf = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc argmax: {e}")))?;
+
+        let pos_dev = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
+            .map_err(|e| BackendError::NotAvailable(format!("HIP alloc pos_dev: {e}")))?;
 
         // MMVQ (llama.cpp-ported Q4K kernel) takes precedence when enabled.
         let use_mmvq_llama = std::env::var("IARA_MMVQ").map(|v| v == "1").unwrap_or(false);
@@ -169,6 +182,7 @@ impl RocmBackend {
             tok_buf: std::sync::Mutex::new(tok_buf),
             act_bf16: std::sync::Mutex::new(act_bf16),
             argmax_buf,
+            pos_dev,
             stream,
             graph_exec: std::sync::Mutex::new(None),
             capturing: std::sync::atomic::AtomicBool::new(false),
@@ -1134,6 +1148,26 @@ impl ComputeBackend for RocmBackend {
 
     // ── HIP Graph capture (trait override) ────────────────────────────────────
 
+    /// Capture-once-replay: if exec already instantiated, just launch it.
+    /// Returns true if replay succeeded (skip dispatch); false if caller must dispatch+capture.
+    fn try_replay_graph(&self) -> bool {
+        let exec_guard = self.graph_exec.lock().unwrap();
+        if let Some(exec) = exec_guard.as_ref() {
+            unsafe {
+                hip_ffi::hip_graph_launch(*exec, self.stream).is_ok()
+            }
+        } else {
+            false
+        }
+    }
+
+    fn invalidate_graph(&self) {
+        let mut exec_guard = self.graph_exec.lock().unwrap();
+        if let Some(exec) = exec_guard.take() {
+            unsafe { let _ = hip_ffi::hip_graph_exec_destroy(exec); }
+        }
+    }
+
     fn begin_graph_capture(&self) -> bool {
         unsafe {
             match hip_ffi::hip_stream_begin_capture(self.stream, hip_ffi::CAPTURE_MODE_RELAXED) {
@@ -1420,6 +1454,68 @@ impl ComputeBackend for RocmBackend {
                     p.n as i32, p.k as i32,
                 )
             }
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn set_seq_pos(&self, value: i32) -> Result<(), BackendError> {
+        // Sync H2D: 4 bytes, negligible latency. Async with stack-borne &[value]
+        // is unsafe because hipMemcpyAsync may read src after function returns.
+        let buf = [value];
+        unsafe {
+            hip_ffi::safe::hip_h2d(self.pos_dev.as_ptr() as *mut i32, &buf)
+        }
+        .map_err(|e| BackendError::Kernel(format!("set_seq_pos h2d: {e}")))
+    }
+
+    fn fused_rope_kv_copy_dyn(&self, p: &FusedRopeKvCopyParams) -> Result<(), BackendError> {
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        unsafe {
+            self.kernels.fused_rope_kv_copy_dyn(
+                f32_mut_ptr(p.q),
+                f32_mut_ptr(p.k),
+                f32_ptr(p.v),
+                f32_mut_ptr(p.kv_k_cache),
+                f32_mut_ptr(p.kv_v_cache),
+                p.n_heads as i32,
+                p.n_kv_heads as i32,
+                p.head_dim as i32,
+                self.pos_dev.as_ptr(),
+                p.theta,
+                kv_dim as i32,
+                p.max_seq as i32,
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn copy_to_kv_cache_dyn(&self, p: &KvCacheParams) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.copy_to_kv_cache_dyn(
+                f32_mut_ptr(p.cache),
+                f32_ptr(p.new_kv),
+                p.n_new_tokens as i32,
+                p.kv_dim as i32,
+                self.pos_dev.as_ptr(),
+            )
+        }
+        .map_err(|e| BackendError::Kernel(e.to_string()))
+    }
+
+    fn fused_attention_decode_dyn(&self, p: &FusedAttentionDecodeParams, max_seq_for_smem: usize) -> Result<(), BackendError> {
+        unsafe {
+            self.kernels.fused_attention_decode_dyn(
+                f32_ptr(p.q),
+                f32_ptr(p.k_cache),
+                f32_ptr(p.v_cache),
+                f32_mut_ptr(p.out),
+                self.pos_dev.as_ptr(),
+                p.head_dim as i32,
+                p.n_heads as i32,
+                p.n_kv_heads as i32,
+                p.scale,
+                max_seq_for_smem as i32,
+            )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))
     }

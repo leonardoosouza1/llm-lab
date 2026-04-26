@@ -228,6 +228,34 @@ pub trait ComputeBackend: Send + Sync + 'static {
         Err(BackendError::NotImplemented("fused_attention_decode".into()))
     }
 
+    // ── HIP graph capture-once-replay support ────────────────────────────────
+    //
+    // These dyn variants read seq_pos / current_len from a device-resident i32
+    // buffer, allowing the entire decode forward to be captured into a single
+    // graph and replayed every token (only updating one int via async memcpy).
+
+    /// Update the device-resident seq_pos buffer (1× hipMemcpyAsync).
+    /// Backends without graph support are free to no-op.
+    fn set_seq_pos(&self, _value: i32) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("set_seq_pos".into()))
+    }
+
+    /// Dynamic-pos variant of `fused_rope_kv_copy`. Reads pos_start from device.
+    fn fused_rope_kv_copy_dyn(&self, _p: &FusedRopeKvCopyParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_rope_kv_copy_dyn".into()))
+    }
+
+    /// Dynamic-current_len variant of `copy_to_kv_cache`. Reads current_len from device.
+    fn copy_to_kv_cache_dyn(&self, _p: &KvCacheParams) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("copy_to_kv_cache_dyn".into()))
+    }
+
+    /// Dynamic-seq_len variant of `fused_attention_decode`. Reads seq_len from device.
+    /// `max_seq_for_smem` is used to size dynamic shared memory at launch.
+    fn fused_attention_decode_dyn(&self, _p: &FusedAttentionDecodeParams, _max_seq_for_smem: usize) -> Result<(), BackendError> {
+        Err(BackendError::NotImplemented("fused_attention_decode_dyn".into()))
+    }
+
     /// Soma dois tensores F32 in-place: a[i] += alpha * b[i]
     /// Usado para aplicar CfC correction ao hidden state.
     fn add_tensors_inplace(&self, a: &AnyTensor, b: &AnyTensor, n_elems: usize, alpha: f32) -> Result<(), BackendError>;
@@ -316,6 +344,13 @@ pub trait ComputeBackend: Send + Sync + 'static {
 
     /// Begin capturing kernel launches into a graph (instead of executing them).
     /// Returns false if graph capture is not supported by this backend.
+    /// Capture-once-replay: try launching previously-instantiated graph exec.
+    /// Returns true if launch succeeded (skip regular dispatch); false otherwise.
+    fn try_replay_graph(&self) -> bool { false }
+
+    /// Destroy any cached graph exec — call when KV cache or model state resets.
+    fn invalidate_graph(&self) {}
+
     fn begin_graph_capture(&self) -> bool { false }
 
     /// End graph capture, instantiate/update executable, and launch the graph.

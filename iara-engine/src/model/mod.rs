@@ -653,6 +653,10 @@ pub struct CausalLM {
     /// Online adaptive layer skip router (IARA_ROUTER=1).
     /// Measures BI per layer in real-time and dynamically skips low-BI layers.
     pub layer_router: OnlineLayerRouter,
+    /// HIP graph capture-once-replay mode active (IARA_GRAPH=2).
+    /// When true, decode forward dispatches `_dyn` kernel variants reading
+    /// seq_pos from a device-resident i32 buffer.
+    pub graph_replay_mode: bool,
 }
 
 impl CausalLM {
@@ -1260,6 +1264,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -1303,15 +1308,17 @@ impl CausalLM {
         }
 
         // Helper: take any tensor by name and convert to LayerWeight.
-        // SVD → LayerWeight::Svd (com scratch [rank] F32); Full → LayerWeight::Bf16.
+        // SVD → LayerWeight::Svd (scratch [max_m * rank] F32 — must fit prefill batch).
+        // Full → LayerWeight::Bf16.
         fn take_layer_weight(
             dna: &mut crate::storage::dna::DnaModel,
             backend: &Arc<dyn ComputeBackend>,
             name: &str,
+            max_m: usize,
         ) -> ModelResult<LayerWeight> {
             match dna.tensors.remove(name) {
                 Some(DnaTensor::Svd { a, b, rows, cols, rank }) => {
-                    let scratch = backend.alloc_f32(&[rank]);
+                    let scratch = backend.alloc_f32(&[max_m * rank]);
                     Ok(LayerWeight::Svd { a, b, scratch, n: rows, k: cols, rank })
                 }
                 Some(DnaTensor::Full { tensor, .. }) => Ok(LayerWeight::Bf16(tensor)),
@@ -1336,6 +1343,9 @@ impl CausalLM {
         // ── Camadas ─────────────────────────────────────────────────────────
         let kv_dim  = cfg.num_kv_heads * cfg.head_dim;
         let max_seq = cfg.max_seq_len;
+        // SVD scratch sizing — cap prefill batch to 1024 to bound VRAM.
+        // gemv_svd_bf16 fallback writes [m * rank] F32 to scratch on prefill (m>1).
+        let svd_max_m = max_seq.min(1024);
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -1357,13 +1367,13 @@ impl CausalLM {
             let qnn = tmap.layer_tensor_opt(i, &tmap.q_norm);
             let knn = tmap.layer_tensor_opt(i, &tmap.k_norm);
 
-            let wq    = take_layer_weight(&mut dna, &backend, &wq_name)?;
-            let wk    = take_layer_weight(&mut dna, &backend, &wk_name)?;
-            let wv    = take_layer_weight(&mut dna, &backend, &wv_name)?;
-            let wo    = take_layer_weight(&mut dna, &backend, &wo_name)?;
-            let wgate = take_layer_weight(&mut dna, &backend, &wgate_name)?;
-            let wup   = take_layer_weight(&mut dna, &backend, &wup_name)?;
-            let wdown = take_layer_weight(&mut dna, &backend, &wdown_name)?;
+            let wq    = take_layer_weight(&mut dna, &backend, &wq_name, svd_max_m)?;
+            let wk    = take_layer_weight(&mut dna, &backend, &wk_name, svd_max_m)?;
+            let wv    = take_layer_weight(&mut dna, &backend, &wv_name, svd_max_m)?;
+            let wo    = take_layer_weight(&mut dna, &backend, &wo_name, svd_max_m)?;
+            let wgate = take_layer_weight(&mut dna, &backend, &wgate_name, svd_max_m)?;
+            let wup   = take_layer_weight(&mut dna, &backend, &wup_name, svd_max_m)?;
+            let wdown = take_layer_weight(&mut dna, &backend, &wdown_name, svd_max_m)?;
 
             let input_norm_w     = take_full(&mut dna, &in_norm)?;
             let post_attn_norm_w = take_full(&mut dna, &pa_norm)?;
@@ -1397,7 +1407,7 @@ impl CausalLM {
         // Tied weights path exige `lm_head` explícito no .dna (não reutilizamos `embed`
         // pois `AnyTensor` do device não é clonável). Writers devem gravar ambos.
         let lm_head = if dna.tensors.contains_key(&tmap.lm_head) {
-            take_layer_weight(&mut dna, &backend, &tmap.lm_head)?
+            take_layer_weight(&mut dna, &backend, &tmap.lm_head, svd_max_m)?
         } else if arch.tie_word_embeddings {
             return Err(ModelError::Model(
                 "tied word embeddings no .dna exige 'lm_head' presente como tensor separado. \
@@ -1449,6 +1459,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -1762,6 +1773,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -2122,6 +2134,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -2417,6 +2430,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -2783,6 +2797,7 @@ impl CausalLM {
             stimulus_tx: None,
             telemetry_enabled: false,
             layer_router,
+            graph_replay_mode: std::env::var("IARA_GRAPH").map(|v| v == "2").unwrap_or(false),
         })
     }
 
@@ -2799,6 +2814,8 @@ impl CausalLM {
         if let Some(gravity) = &mut self.gravity {
             gravity.reset();
         }
+        // Drop any captured HIP graph — pointers are stale after KV reset.
+        self.backend.invalidate_graph();
     }
 
     /// Forward pass via ComputeBackend with optional early exit via phase coherence.
@@ -3286,12 +3303,18 @@ impl CausalLM {
 
             // Try fused RoPE + KV copy (1 launch vs 4) for F32 KV decode
             let fused_rope_ok = if n == 1 && (!unfused || force_fuse_rope) && matches!(layer.kv_k.mode, kv_cache::KvCacheMode::F32) {
-                match self.backend.fused_rope_kv_copy(&compute_core::FusedRopeKvCopyParams {
+                let params = compute_core::FusedRopeKvCopyParams {
                     q: &self.scratch.q, k: &self.scratch.k, v: &self.scratch.v,
                     kv_k_cache: &layer.kv_k.data, kv_v_cache: &layer.kv_v.data,
                     n_heads: nh, n_kv_heads: nk, head_dim: hd,
                     pos_start, theta, kv_dim: kd, max_seq: self.cfg.max_seq_len,
-                }) {
+                };
+                let res = if self.graph_replay_mode {
+                    self.backend.fused_rope_kv_copy_dyn(&params)
+                } else {
+                    self.backend.fused_rope_kv_copy(&params)
+                };
+                match res {
                     Ok(()) => {
                         static FUSED_ROPE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                         if !FUSED_ROPE_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -3521,7 +3544,7 @@ impl CausalLM {
             if use_fused_decode {
                 // ── FUSED DECODE ATTENTION (n=1) ─────────────────────────────
                 log::trace!("layer {layer_idx}: attn FUSED DECODE seq={seq} nh={nh} nk={nk} hd={hd}");
-                match self.backend.fused_attention_decode(&FusedAttentionDecodeParams {
+                let attn_params = FusedAttentionDecodeParams {
                     q: &self.scratch.q,
                     k_cache: kv_k_use,
                     v_cache: kv_v_use,
@@ -3531,7 +3554,13 @@ impl CausalLM {
                     n_heads: nh,
                     n_kv_heads: nk,
                     scale,
-                }) {
+                };
+                let attn_res = if self.graph_replay_mode {
+                    self.backend.fused_attention_decode_dyn(&attn_params, self.cfg.max_seq_len)
+                } else {
+                    self.backend.fused_attention_decode(&attn_params)
+                };
+                match attn_res {
                     Ok(()) => {
                         static FUSED_ATTN_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                         if !FUSED_ATTN_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -4335,8 +4364,35 @@ impl CausalLM {
         // Enable with IARA_GRAPH=1 for experimentation.
         let use_graph = n == 1
             && std::env::var("IARA_GRAPH").map(|v| v == "1").unwrap_or(false);
+        let use_graph_replay = n == 1 && self.graph_replay_mode;
 
-        if use_graph {
+        if use_graph_replay {
+            // Pre-write KV position: kernels read from device buffer; attention adds +1 internally.
+            let pre_pos = self.layers[0].kv_k.current_len as i32;
+            let _ = self.backend.set_seq_pos(pre_pos);
+            // Allow disabling replay shortcut for diagnosis: IARA_GRAPH_REPLAY=0 forces re-capture every token.
+            let allow_replay = std::env::var("IARA_GRAPH_REPLAY").map(|v| v != "0").unwrap_or(true);
+            if allow_replay && self.backend.try_replay_graph() {
+                for layer in &mut self.layers {
+                    layer.kv_k.current_len += 1;
+                    layer.kv_v.current_len += 1;
+                }
+                let dispatch_us = greedy_t0.elapsed().as_micros();
+                #[cfg(feature = "rocm")]
+                let launches_this_token = hip_ffi::safe::get_launch_count();
+                #[cfg(not(feature = "rocm"))]
+                let launches_this_token = 0u64;
+                if count < 3 {
+                    log::warn!("HIP Graph REPLAY token {} (skip dispatch, {} launches recorded)", count, launches_this_token);
+                }
+                let _ = (dispatch_us, launches_this_token);
+                return self.backend.gpu_argmax(&self.scratch.logits, vocab)
+                    .map(|t| t as u32)
+                    .map_err(|e| ModelError::Model(format!("gpu_argmax: {}", e)));
+            }
+            // First decode token in replay mode: capture full forward_inner.
+            self.backend.begin_graph_capture();
+        } else if use_graph {
             self.backend.begin_graph_capture();
         }
 
@@ -4349,14 +4405,14 @@ impl CausalLM {
         let launches_this_token = 0u64;
 
         // End capture + launch graph (no-op if use_graph=false)
-        if use_graph {
+        if use_graph || use_graph_replay {
             let graph_t0 = std::time::Instant::now();
             let graph_ok = self.backend.end_graph_capture_and_launch();
             let graph_us = graph_t0.elapsed().as_micros();
             if !graph_ok && !GRAPH_LOGGED.swap(true, Ordering::Relaxed) {
-                log::warn!("HIP Graph capture/launch FAILED for ternary decode — falling back to direct dispatch");
+                log::warn!("HIP Graph capture/launch FAILED — falling back to direct dispatch");
             } else if graph_ok && count < 3 {
-                log::warn!("HIP Graph ternary decode: capture+update+launch took {}µs ({} kernel launches collapsed)", graph_us, launches_this_token);
+                log::warn!("HIP Graph CAPTURE: {}µs ({} launches collapsed)", graph_us, launches_this_token);
             }
         }
 
