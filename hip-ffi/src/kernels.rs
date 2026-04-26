@@ -3179,8 +3179,12 @@ impl GpuKernels {
                         kinfo.kernarg_size, kinfo.kernarg_align,
                         kinfo.group_segment_size, kinfo.private_segment_size);
                 }
-                use crate::raw::hipStreamSynchronize;
-                let _ = hipStreamSynchronize(self.stream);
+                // EXPERIMENTAL: skip cross-stream sync to measure pure-HSA overhead.
+                // Correctness-risky — relies on serialized device dispatch ordering.
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
                 let karg = hsa.next_kernarg(kinfo.kernarg_size as usize);
                 let p = karg as *mut u64;
                 *p.offset(0) = data as u64;
