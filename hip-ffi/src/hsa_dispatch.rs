@@ -620,6 +620,22 @@ impl HsaDispatcher {
         self.ctx.dispatch_sync(kernel_info, karg, grid_wi, block, dynamic_lds)
     }
 
+    /// Convenience: dispatch with typed args via slices of byte arrays.
+    /// Caller builds slices via `.to_le_bytes()` for scalars and
+    /// `(ptr as u64).to_le_bytes()` for pointers, then passes a fixed-size
+    /// array of slices. No heap allocation in the hot path.
+    pub unsafe fn dispatch_typed_sync<const N: usize>(
+        &self,
+        name: &'static str,
+        args: [&[u8]; N],
+        grid_blocks: (u32, u32, u32),
+        block: (u16, u16, u16),
+        dynamic_lds: u32,
+    ) -> Result<(), HsaError> {
+        let (kinfo, layout) = self.lookup(name).ok_or_else(|| HsaError(format!("unknown kernel {}", name)))?;
+        self.pack_and_dispatch_sync(kinfo, layout, &args, grid_blocks, block, dynamic_lds)
+    }
+
     /// Async variant — caller must call `wait_completion()` (or barrier+wait)
     /// before reading outputs. SAFETY same as `pack_and_dispatch_sync`.
     pub unsafe fn pack_and_dispatch_async(
