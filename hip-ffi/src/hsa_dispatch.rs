@@ -469,6 +469,9 @@ pub struct HsaDispatcher {
     pub ctx: HsaContext,
     pub modules: Vec<HsaModule>,
     pub kernels: std::collections::HashMap<String, KernelInfo>,
+    /// Build-time kernel layouts (offset/size per arg, kernarg_size). Cached
+    /// once at startup so dispatch hot path does no HashMap rebuild.
+    pub layouts: std::collections::HashMap<&'static str, crate::kernel_layouts::KernelLayout>,
     /// Kernarg ring buffer (host-mapped, GPU-accessible).
     karg_ring: *mut u8,
     karg_ring_size: usize,
@@ -497,17 +500,26 @@ impl HsaDispatcher {
         let karg_ring = ctx.alloc_kernarg(karg_ring_size)?;
         unsafe { std::ptr::write_bytes(karg_ring, 0, karg_ring_size); }
 
+        let layouts = crate::kernel_layouts::all_layouts();
         let mut me = Self {
             ctx,
             modules,
             kernels,
+            layouts,
             karg_ring,
             karg_ring_size,
             karg_slot_size,
             karg_cursor: std::cell::UnsafeCell::new(0),
         };
-        me.kernels = std::collections::HashMap::new();
         Ok(me)
+    }
+
+    /// Combined info: returns both `KernelInfo` (kernel_object + sizes) and the
+    /// build-time kernarg layout for a given kernel. None if either missing.
+    pub fn lookup(&self, name: &'static str) -> Option<(&KernelInfo, &crate::kernel_layouts::KernelLayout)> {
+        let info = self.kernels.get(name)?;
+        let layout = self.layouts.get(name)?;
+        Some((info, layout))
     }
 
     /// Look up a kernel name across loaded modules and cache its KernelInfo.

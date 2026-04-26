@@ -337,6 +337,13 @@ impl GpuKernels {
         })
     }
 
+    /// True when HSA dispatcher active and the named kernel is registered.
+    /// Hot path uses this to skip building byte slices when HIP is the path.
+    #[inline(always)]
+    pub fn hsa_has(&self, name: &'static str) -> bool {
+        self.hsa.as_ref().map_or(false, |h| h.kernels.contains_key(name))
+    }
+
     /// Initialize the optional HSA AQL dispatcher and pre-register all kernels
     /// whose layouts were extracted at build time. Called from RocmBackend
     /// probe when env IARA_HSA=1 set.
@@ -1092,9 +1099,24 @@ impl GpuKernels {
         k: i32,
     ) -> Result<(), HipError> {
         let n_blocks = k / 32;
-        // 8 warps per block (256 threads), each warp handles one Q8_1 block
         let grid = ((n_blocks as u32 + 7) / 8, 1, 1);
         let block = (256u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some((kinfo, layout)) = hsa.lookup("quantize_f32_q8_1") {
+                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    use crate::raw::hipStreamSynchronize;
+                    let _ = hipStreamSynchronize(self.stream);
+                }
+                let p_x = (x as u64).to_le_bytes();
+                let p_out = (out as u64).to_le_bytes();
+                let b_k = k.to_le_bytes();
+                let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                return hsa.pack_and_dispatch_sync(kinfo, layout,
+                    &[&p_x, &p_out, &b_k], grid, block16, 0)
+                    .map_err(|e| HipError::Hip { code: 0, msg: e.0 });
+            }
+        }
 
         let mut p_x = x;
         let mut p_out = out;
