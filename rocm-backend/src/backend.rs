@@ -390,9 +390,14 @@ impl ComputeBackend for RocmBackend {
         }
 
         // Upload token IDs (host slice) to the pre-allocated GPU buffer via our stream.
+        // Drain HIP stream right after so the upcoming HSA-side embed kernel sees
+        // the token bytes (HIP stream and HSA queue are independent).
         unsafe {
             hip_ffi::safe::hip_h2d_async(buf_guard.as_mut_ptr(), p.token_ids, self.stream)
                 .map_err(|e| BackendError::Transfer(e.to_string()))?;
+            if self.kernels.hsa.is_some() {
+                hip_ffi::raw::hipStreamSynchronize(self.stream);
+            }
         }
 
         unsafe {
