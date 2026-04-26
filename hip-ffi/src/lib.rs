@@ -12,11 +12,16 @@ pub mod raw {
     include!(concat!(env!("OUT_DIR"), "/hip_bindings.rs"));
 }
 
+pub mod hsa_raw {
+    include!(concat!(env!("OUT_DIR"), "/hsa_bindings.rs"));
+}
+
 pub mod safe;
 pub mod tensor;
 pub mod blas;
 pub mod solver;
 pub mod kernels;
+pub mod hsa_dispatch;
 
 pub use safe::*;
 pub use tensor::{GpuTensor, GpuTensorBF16};
