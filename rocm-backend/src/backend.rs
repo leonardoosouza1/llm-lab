@@ -165,8 +165,9 @@ impl RocmBackend {
         let pos_dev = hip_ffi::safe::DeviceBuffer::<i32>::alloc(1)
             .map_err(|e| BackendError::NotAvailable(format!("HIP alloc pos_dev: {e}")))?;
 
-        // MMVQ (llama.cpp-ported Q4K kernel) takes precedence when enabled.
-        let use_mmvq_llama = std::env::var("IARA_MMVQ").map(|v| v == "1").unwrap_or(false);
+        // MMVQ (llama.cpp-ported Q4K wave32 dp4a kernel) — fastest Q4K GEMV
+        // empirically. Default ON; opt-out via IARA_MMVQ=0.
+        let use_mmvq_llama = std::env::var("IARA_MMVQ").map(|v| v != "0").unwrap_or(true);
         let use_v2 = !use_mmvq_llama && std::env::var("IARA_V2").map(|v| v != "0").unwrap_or(true);
         let use_wave64 = !use_mmvq_llama && !use_v2 && std::env::var("IARA_WAVE64").map(|v| v != "0").unwrap_or(true);
         let use_flash_attn = std::env::var("IARA_FLASH_ATTN").map(|v| v != "0").unwrap_or(true);
