@@ -323,9 +323,7 @@ impl ComputeBackend for RocmBackend {
             c_ptr,
         )
         .map_err(|e| BackendError::Gemm(e.to_string()));
-        if self.kernels.hsa.is_some() {
-            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
-        }
+        // HSA drain disabled — caused regression in baseline
         r
     }
 
@@ -351,9 +349,7 @@ impl ComputeBackend for RocmBackend {
             p.ldc as i32,
         )
         .map_err(|e| BackendError::Gemm(e.to_string()));
-        if self.kernels.hsa.is_some() {
-            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
-        }
+        // HSA drain disabled — caused regression in baseline
         r
     }
 
@@ -383,9 +379,7 @@ impl ComputeBackend for RocmBackend {
             p.batch_count as i32,
         )
         .map_err(|e| BackendError::Gemm(e.to_string()));
-        if self.kernels.hsa.is_some() {
-            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
-        }
+        // HSA drain disabled — caused regression in baseline
         r
     }
 
