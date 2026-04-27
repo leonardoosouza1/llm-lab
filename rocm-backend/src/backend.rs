@@ -311,7 +311,7 @@ impl ComputeBackend for RocmBackend {
             // ~140 times per token, killing throughput.
         }
 
-        hip_ffi::gemm_bf16_f32(
+        let r = hip_ffi::gemm_bf16_f32(
             &self.blas,
             p.m as i32,
             p.n as i32,
@@ -322,7 +322,11 @@ impl ComputeBackend for RocmBackend {
             b_ptr,
             c_ptr,
         )
-        .map_err(|e| BackendError::Gemm(e.to_string()))
+        .map_err(|e| BackendError::Gemm(e.to_string()));
+        if self.kernels.hsa.is_some() {
+            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
+        }
+        r
     }
 
     fn sgemm(&self, p: &SgemmParams) -> Result<(), BackendError> {
@@ -330,7 +334,7 @@ impl ComputeBackend for RocmBackend {
         let b_ptr = unsafe { f32_ptr(p.b).add(p.b_offset) };
         let c_ptr = unsafe { f32_mut_ptr(p.c).add(p.c_offset) };
 
-        hip_ffi::sgemm_strided(
+        let r = hip_ffi::sgemm_strided(
             &self.blas,
             p.trans_a,
             p.trans_b,
@@ -346,7 +350,11 @@ impl ComputeBackend for RocmBackend {
             c_ptr,
             p.ldc as i32,
         )
-        .map_err(|e| BackendError::Gemm(e.to_string()))
+        .map_err(|e| BackendError::Gemm(e.to_string()));
+        if self.kernels.hsa.is_some() {
+            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
+        }
+        r
     }
 
     fn sgemm_strided_batched(&self, p: &SgemmStridedBatchedParams) -> Result<(), BackendError> {
@@ -354,7 +362,7 @@ impl ComputeBackend for RocmBackend {
         let b_ptr = unsafe { f32_ptr(p.b).add(p.b_offset) };
         let c_ptr = unsafe { f32_mut_ptr(p.c).add(p.c_offset) };
 
-        hip_ffi::sgemm_strided_batched(
+        let r = hip_ffi::sgemm_strided_batched(
             &self.blas,
             p.trans_a,
             p.trans_b,
@@ -374,7 +382,11 @@ impl ComputeBackend for RocmBackend {
             p.stride_c as i64,
             p.batch_count as i32,
         )
-        .map_err(|e| BackendError::Gemm(e.to_string()))
+        .map_err(|e| BackendError::Gemm(e.to_string()));
+        if self.kernels.hsa.is_some() {
+            unsafe { hip_ffi::raw::hipStreamSynchronize(self.stream); }
+        }
+        r
     }
 
     // ── Custom kernels ────────────────────────────────────────────────────────
@@ -1176,6 +1188,10 @@ impl ComputeBackend for RocmBackend {
     fn hsa_barrier_and_wait(&self) -> bool {
         if let Some(hsa) = self.kernels.hsa.as_ref() {
             let _ = hsa.submit_barrier_and_wait();
+            // Belt-and-suspenders: also drain via HIP runtime (covers any
+            // residual HIP-stream activity AND forces a system-wide GPU
+            // synchronization that the HSA barrier alone may not provide).
+            unsafe { hip_ffi::raw::hipDeviceSynchronize(); }
             true
         } else {
             false

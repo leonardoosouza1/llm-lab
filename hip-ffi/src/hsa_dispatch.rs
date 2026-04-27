@@ -11,6 +11,7 @@ const STATUS_INFO_BREAK: hsa_status_t = hsa_status_t_HSA_STATUS_INFO_BREAK;
 // Numeric values from HSA spec (stable; bindgen sometimes drops anonymous enums).
 const FENCE_SCOPE_SYSTEM: u16 = 2;
 const QUEUE_TYPE_MULTI: u32 = 0;
+const QUEUE_TYPE_SINGLE: u32 = 1;
 const DEVICE_TYPE_GPU: u32 = 1;
 const PACKET_TYPE_KERNEL_DISPATCH: u16 = 2;
 const PACKET_HEADER_TYPE: u16 = 0;
@@ -148,7 +149,7 @@ impl HsaContext {
                 hsa_queue_create(
                     agent,
                     1024,
-                    QUEUE_TYPE_MULTI,
+                    QUEUE_TYPE_SINGLE,
                     None,
                     ptr::null_mut(),
                     u32::MAX,
@@ -263,7 +264,7 @@ impl HsaContext {
             let q = &*self.queue;
             let queue_size = q.size as u64;
             let queue_mask = queue_size - 1;
-            let idx = hsa_queue_add_write_index_screlease(self.queue, 1);
+            let idx = hsa_queue_add_write_index_relaxed(self.queue, 1);
 
             while idx - hsa_queue_load_read_index_scacquire(self.queue) >= queue_size {
                 std::hint::spin_loop();
@@ -286,23 +287,22 @@ impl HsaContext {
             // NO completion signal — async path.
             pkt.completion_signal = hsa_signal_t { handle: 0 };
 
-            ptr::copy_nonoverlapping(
-                &pkt as *const _ as *const u8,
-                slot as *mut u8,
-                std::mem::size_of::<hsa_kernel_dispatch_packet_t>(),
-            );
+            let pkt_bytes = std::slice::from_raw_parts(&pkt as *const _ as *const u8, std::mem::size_of::<hsa_kernel_dispatch_packet_t>());
+            ptr::copy_nonoverlapping(pkt_bytes.as_ptr().add(4), (slot as *mut u8).add(4), pkt_bytes.len() - 4);
 
             // Header WITH barrier bit: packet must finish before next runs.
-            // Required for in-order execution on HSA_QUEUE_TYPE_MULTI; without
-            // it kernels may race even if dispatched sequentially.
             let header: u16 = (PACKET_TYPE_KERNEL_DISPATCH << PACKET_HEADER_TYPE)
                 | (1u16 << PACKET_HEADER_BARRIER)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
             let setup: u16 = 3u16 << KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
             let full: u32 = (header as u32) | ((setup as u32) << 16);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            (slot as *mut u32).write_volatile(full);
+            // Full memory fence before publishing header — ensures all
+            // prior writes to packet body AND kernarg buffer are visible
+            // to the GPU before it observes the valid header type.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            (&*(slot as *const std::sync::atomic::AtomicU32))
+                .store(full, std::sync::atomic::Ordering::Release);
 
             hsa_signal_store_screlease(q.doorbell_signal, idx as i64);
             Ok(())
@@ -316,7 +316,7 @@ impl HsaContext {
             let q = &*self.queue;
             let queue_size = q.size as u64;
             let queue_mask = queue_size - 1;
-            let idx = hsa_queue_add_write_index_screlease(self.queue, 1);
+            let idx = hsa_queue_add_write_index_relaxed(self.queue, 1);
             while idx - hsa_queue_load_read_index_scacquire(self.queue) >= queue_size {
                 std::hint::spin_loop();
             }
@@ -327,19 +327,15 @@ impl HsaContext {
 
             let mut pkt: hsa_barrier_and_packet_t = std::mem::zeroed();
             pkt.completion_signal = self.completion_signal;
-            ptr::copy_nonoverlapping(
-                &pkt as *const _ as *const u8,
-                slot as *mut u8,
-                std::mem::size_of::<hsa_barrier_and_packet_t>(),
-            );
-
+            let pkt_bytes_b = std::slice::from_raw_parts(&pkt as *const _ as *const u8, std::mem::size_of::<hsa_barrier_and_packet_t>());
+            ptr::copy_nonoverlapping(pkt_bytes_b.as_ptr().add(4), (slot as *mut u8).add(4), pkt_bytes_b.len() - 4);
             const PACKET_TYPE_BARRIER_AND: u16 = 3;
             let header: u16 = (PACKET_TYPE_BARRIER_AND << PACKET_HEADER_TYPE)
                 | (1u16 << PACKET_HEADER_BARRIER)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            (slot as *mut u32).write_volatile(header as u32);
+            (&*(slot as *const std::sync::atomic::AtomicU32))
+                .store(header as u32, std::sync::atomic::Ordering::Release);
             hsa_signal_store_screlease(q.doorbell_signal, idx as i64);
             Ok(())
         }
@@ -370,7 +366,7 @@ impl HsaContext {
             let q = &*self.queue;
             let queue_size = q.size as u64;
             let queue_mask = queue_size - 1;
-            let idx = hsa_queue_add_write_index_screlease(self.queue, 1);
+            let idx = hsa_queue_add_write_index_relaxed(self.queue, 1);
 
             while idx - hsa_queue_load_read_index_scacquire(self.queue) >= queue_size {
                 std::hint::spin_loop();
@@ -395,18 +391,24 @@ impl HsaContext {
             pkt.kernarg_address = kernarg_addr as *mut _;
             pkt.completion_signal = self.completion_signal;
 
-            // Write everything except header.
-            ptr::copy_nonoverlapping(&pkt as *const _ as *const u8, slot as *mut u8, std::mem::size_of::<hsa_kernel_dispatch_packet_t>());
+            // Write packet body SKIPPING first 4 bytes (header+setup) so GPU
+            // never sees a transient invalid header. Body starts at offset 4.
+            let pkt_bytes = std::slice::from_raw_parts(&pkt as *const _ as *const u8, std::mem::size_of::<hsa_kernel_dispatch_packet_t>());
+            ptr::copy_nonoverlapping(pkt_bytes.as_ptr().add(4), (slot as *mut u8).add(4), pkt_bytes.len() - 4);
 
-            // Header + setup as one 32-bit atomic store.
+            // Atomic release store of header u32 transitions packet to KERNEL_DISPATCH.
             let header: u16 = (PACKET_TYPE_KERNEL_DISPATCH << PACKET_HEADER_TYPE)
                 | (1u16 << PACKET_HEADER_BARRIER)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
                 | (FENCE_SCOPE_SYSTEM << PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
             let setup: u16 = 3u16 << KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
             let full: u32 = (header as u32) | ((setup as u32) << 16);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            (slot as *mut u32).write_volatile(full);
+            // Full memory fence before publishing header — ensures all
+            // prior writes to packet body AND kernarg buffer are visible
+            // to the GPU before it observes the valid header type.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            (&*(slot as *const std::sync::atomic::AtomicU32))
+                .store(full, std::sync::atomic::Ordering::Release);
 
             hsa_signal_store_screlease(q.doorbell_signal, idx as i64);
 
