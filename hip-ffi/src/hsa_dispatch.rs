@@ -624,7 +624,11 @@ impl HsaDispatcher {
         );
         // FAST mode: async dispatch (no per-call wait). Engine drains via
         // submit_barrier_and_wait at end of forward.
-        if std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false) {
+        if {
+            use std::sync::OnceLock;
+            static F: OnceLock<bool> = OnceLock::new();
+            *F.get_or_init(|| std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false))
+        } {
             self.ctx.dispatch_async(kernel_info, karg, grid_wi, block, dynamic_lds)
         } else {
             self.ctx.dispatch_sync(kernel_info, karg, grid_wi, block, dynamic_lds)

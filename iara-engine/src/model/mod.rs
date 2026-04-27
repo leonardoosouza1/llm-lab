@@ -4338,11 +4338,16 @@ impl CausalLM {
 
         // HSA boundary sync at entry: drain HIP stream so HSA dispatches see
         // all prior HIP-written state. Active in NOSYNC and FAST modes.
+        // Env cached at startup to avoid per-token /proc/self/environ reads.
         #[cfg(feature = "rocm")]
         {
-            let nosync = std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false);
-            let fast   = std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false);
-            if nosync || fast {
+            use std::sync::OnceLock;
+            static MODE: OnceLock<bool> = OnceLock::new();
+            let active = *MODE.get_or_init(|| {
+                std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false)
+                    || std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false)
+            });
+            if active {
                 self.backend.device_sync();
             }
         }
@@ -4428,8 +4433,12 @@ impl CausalLM {
 
         // FAST mode: drain HSA queue once before reading results.
         #[cfg(feature = "rocm")]
-        if std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false) {
-            self.backend.hsa_barrier_and_wait();
+        {
+            use std::sync::OnceLock;
+            static FAST: OnceLock<bool> = OnceLock::new();
+            if *FAST.get_or_init(|| std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false)) {
+                self.backend.hsa_barrier_and_wait();
+            }
         }
 
         // GPU argmax runs on same stream (ordered after graph/direct kernels)

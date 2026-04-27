@@ -338,10 +338,22 @@ impl GpuKernels {
     }
 
     /// True when HSA dispatcher active and the named kernel is registered.
-    /// Hot path uses this to skip building byte slices when HIP is the path.
     #[inline(always)]
     pub fn hsa_has(&self, name: &'static str) -> bool {
         self.hsa.as_ref().map_or(false, |h| h.kernels.contains_key(name))
+    }
+
+    /// Cached env check (read ONCE at first call, never again). Per-call
+    /// std::env::var on Linux reads /proc/self/environ each time and adds
+    /// 5-15us of overhead — ~3ms/tok across 200 kernel calls.
+    #[inline(always)]
+    pub fn hsa_skip_drain() -> bool {
+        use std::sync::OnceLock;
+        static SKIP: OnceLock<bool> = OnceLock::new();
+        *SKIP.get_or_init(|| {
+            std::env::var("IARA_HSA_NOSYNC").map(|v| v == "1").unwrap_or(false)
+                || std::env::var("IARA_HSA_FAST").map(|v| v == "1").unwrap_or(false)
+        })
     }
 
     /// Initialize the optional HSA AQL dispatcher and pre-register all kernels
@@ -456,7 +468,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("embed_lookup") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -522,7 +534,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("rms_norm") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -586,7 +598,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("add_bias_inplace") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -647,7 +659,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("rope_inplace") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -712,7 +724,7 @@ impl GpuKernels {
         let block = (block_x, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -778,7 +790,7 @@ impl GpuKernels {
         let block = (bsz, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -831,7 +843,7 @@ impl GpuKernels {
         let block = (bsz, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -898,7 +910,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("copy_to_kv_cache") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -947,7 +959,7 @@ impl GpuKernels {
         let grid_x = ceil_div(n as u32, block_x);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -989,7 +1001,7 @@ impl GpuKernels {
         let grid_x = ceil_div(n as u32, block_x);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1061,7 +1073,7 @@ impl GpuKernels {
         };
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1140,7 +1152,7 @@ impl GpuKernels {
         let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1207,7 +1219,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1274,7 +1286,7 @@ impl GpuKernels {
         let shared_mem = (8 * std::mem::size_of::<f32>()) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1339,7 +1351,7 @@ impl GpuKernels {
         // HSA path with hidden-arg auto-fill (BlockCount/GroupSize/etc populated).
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("quantize_f32_q8_1") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -1393,7 +1405,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1459,7 +1471,7 @@ impl GpuKernels {
         let shared_bytes = (nq8 * 36) as u32;  // Q8_1 blocks in LDS
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1519,7 +1531,7 @@ impl GpuKernels {
         let block = (32u32, NROWS, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1578,7 +1590,7 @@ impl GpuKernels {
         let block = (32u32, NROWS, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1636,7 +1648,7 @@ impl GpuKernels {
         let block = (32u32, NROWS, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1699,7 +1711,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1758,7 +1770,7 @@ impl GpuKernels {
         let block = (32u32, 8, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1816,7 +1828,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1868,7 +1880,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1922,7 +1934,7 @@ impl GpuKernels {
         let shared_bytes = (nq8 * 36) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -1983,7 +1995,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4) as u32;  // K floats in shared memory
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2047,7 +2059,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2110,7 +2122,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2173,7 +2185,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2231,7 +2243,7 @@ impl GpuKernels {
         let shared_bytes = ((cols + rank) as u32) * 4;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2298,7 +2310,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2355,7 +2367,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4) as u32; // K F32 values in shared memory
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2427,7 +2439,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4) as u32;  // K floats in shared
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2517,7 +2529,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("fused_rms_gate_up_silu_q4k_f32") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -2584,7 +2596,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4 + 8 * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2677,7 +2689,7 @@ impl GpuKernels {
         let shared_bytes = (k * 4 + 8 * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2756,7 +2768,7 @@ impl GpuKernels {
         let shared_bytes = (nq8 * 36) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2840,7 +2852,7 @@ impl GpuKernels {
         let shared_bytes = ((block_size + hidden) as u32) * 4;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -2899,7 +2911,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("fused_rope_kv_copy") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -2986,7 +2998,7 @@ impl GpuKernels {
         let block = (n_heads as u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3050,7 +3062,7 @@ impl GpuKernels {
         let shared_bytes = block_x * std::mem::size_of::<f32>() as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3112,7 +3124,7 @@ impl GpuKernels {
         let grid_x = ceil_div(cfc_dim as u32, block_x);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3179,7 +3191,7 @@ impl GpuKernels {
         let block = (block_x, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3247,7 +3259,7 @@ impl GpuKernels {
         let block = (block_x, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3316,7 +3328,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3404,7 +3416,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3482,7 +3494,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3548,7 +3560,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3608,7 +3620,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3668,7 +3680,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3726,7 +3738,7 @@ impl GpuKernels {
         let block = (256u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3791,7 +3803,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("fused_attention_decode") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -3867,7 +3879,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("argmax_f32") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
@@ -3926,7 +3938,7 @@ impl GpuKernels {
         let shared_bytes = (head_dim as u32 + n_warps) * 4;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -3991,7 +4003,7 @@ impl GpuKernels {
         let shared_bytes = (head_dim as u32 + n_warps) * 4;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4062,7 +4074,7 @@ impl GpuKernels {
         let shared_bytes = 2 * FA_TILE * head_dim as u32 * 4 + (FA_NWARPS + 1) * 4;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4133,7 +4145,7 @@ impl GpuKernels {
         let shared_bytes = 0u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4198,7 +4210,7 @@ impl GpuKernels {
         let block = (64u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4259,7 +4271,7 @@ impl GpuKernels {
             if let Some(kinfo) = hsa.get("mmvq_q4k_llama") {
                 let layouts = crate::kernel_layouts::all_layouts();
                 if let Some(layout) = layouts.get("mmvq_q4k_llama") {
-                    if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                    if !Self::hsa_skip_drain() {
                         use crate::raw::hipStreamSynchronize;
                         let _ = hipStreamSynchronize(self.stream);
                     }
@@ -4321,7 +4333,7 @@ impl GpuKernels {
         let block = (64u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4380,7 +4392,7 @@ impl GpuKernels {
         let shared_bytes = (nq8 * 36 + 32) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4452,7 +4464,7 @@ impl GpuKernels {
         let block = (64u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4524,7 +4536,7 @@ impl GpuKernels {
         let block = (32u32, 1, 1);
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4600,7 +4612,7 @@ impl GpuKernels {
         let shared_bytes = ((k + 8) * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4688,7 +4700,7 @@ impl GpuKernels {
         let shared_bytes = ((k + 8) * 4) as u32;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4771,7 +4783,7 @@ impl GpuKernels {
         dim: i32,
     ) -> Result<(), HipError> {
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4816,7 +4828,7 @@ impl GpuKernels {
         let grid_x = ((n as u32) + 255) / 256;
 
         if let Some(hsa) = self.hsa.as_ref() {
-            if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+            if !Self::hsa_skip_drain() {
                 use crate::raw::hipStreamSynchronize;
                 let _ = hipStreamSynchronize(self.stream);
             }
@@ -4877,7 +4889,7 @@ impl GpuKernels {
 
         if let Some(hsa) = self.hsa.as_ref() {
             if let Some((kinfo, layout)) = hsa.lookup("fused_rms_qkv_q4k_q6k_f32") {
-                if std::env::var("IARA_HSA_NOSYNC").map(|v| v != "1").unwrap_or(true) {
+                if !Self::hsa_skip_drain() {
                     use crate::raw::hipStreamSynchronize;
                     let _ = hipStreamSynchronize(self.stream);
                 }
