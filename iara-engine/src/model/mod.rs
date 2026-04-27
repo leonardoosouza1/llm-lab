@@ -2846,7 +2846,10 @@ impl CausalLM {
                 else { true }
             })
         };
-        let force_fuse_qkv = std::env::var("IARA_FUSE_QKV").is_ok();
+        // QKV super-fusion: empirically a win on Qwen2.5 1.5B Q4K (77 tok/s
+        // vs 75 unfused). MLP super-fusion is a loss on the same model
+        // (71 tok/s vs 75 unfused) — kept as opt-in only.
+        let force_fuse_qkv = std::env::var("IARA_FUSE_QKV").map(|v| v != "0").unwrap_or(true);
         let force_fuse_mlp = std::env::var("IARA_FUSE_MLP").is_ok();
         // fused attention + rope/kv-copy fusion default ON even in unfused
         // mode — these are pure dependent ops (no extra blocks lost) and
