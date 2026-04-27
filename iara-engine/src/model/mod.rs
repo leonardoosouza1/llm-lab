@@ -2848,8 +2848,11 @@ impl CausalLM {
         };
         let force_fuse_qkv = std::env::var("IARA_FUSE_QKV").is_ok();
         let force_fuse_mlp = std::env::var("IARA_FUSE_MLP").is_ok();
-        let force_fuse_attn = std::env::var("IARA_FUSE_ATTN").is_ok();
-        let force_fuse_rope = std::env::var("IARA_FUSE_ROPE").is_ok();
+        // fused attention + rope/kv-copy fusion default ON even in unfused
+        // mode — these are pure dependent ops (no extra blocks lost) and
+        // each saves 2-3 launches per layer.
+        let force_fuse_attn = std::env::var("IARA_FUSE_ATTN").map(|v| v != "0").unwrap_or(true);
+        let force_fuse_rope = std::env::var("IARA_FUSE_ROPE").map(|v| v != "0").unwrap_or(true);
         let force_fuse_q6kf32 = std::env::var("IARA_FUSE_Q6KF32").is_ok();
         // Q8 dp4a wave64 for MLP & projections: ~40% faster than F32 super-fused.
         // Disable with IARA_NO_Q8_MLP=1 to revert to F32 super-fused path.

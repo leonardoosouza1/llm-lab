@@ -1110,13 +1110,12 @@ impl ComputeBackend for RocmBackend {
             self.kernels.argmax_f32(
                 logits_ptr,
                 dst_ptr,
-                std::ptr::null_mut(),  // no max value needed
+                std::ptr::null_mut(),
                 ncols as i32,
             )
         }
         .map_err(|e| BackendError::Kernel(e.to_string()))?;
 
-        // Download just 4 bytes instead of 608KB
         let result = self.argmax_buf.to_host()
             .map_err(|e| BackendError::Kernel(e.to_string()))?;
         Ok(result[0])
