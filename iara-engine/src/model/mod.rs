@@ -2832,9 +2832,20 @@ impl CausalLM {
 
     fn forward_inner(&mut self, token_ids: &[u32], layer_budget: Option<LayerBudget>, skip_logits_download: bool, skip_embed: bool) -> ModelResult<(Vec<f32>, Vec<LayerTrace>)> {
         let _fwd_t0 = std::time::Instant::now();
-        // Debug: IARA_UNFUSED=1 disables all fused kernels to test basic path
+        // IARA_FUSED=1 explicitly enables super_fused kernels (~2% slower
+        // than the unfused path on RX 6750 XT — fused kernels under-use
+        // GPU parallelism). Default = unfused for max throughput.
         // Individual flags: IARA_FUSE_QKV=1, IARA_FUSE_MLP=1, IARA_FUSE_ATTN=1, IARA_FUSE_ROPE=1, IARA_FUSE_Q6KF32=1
-        let unfused = std::env::var("IARA_UNFUSED").is_ok();
+        let unfused = {
+            use std::sync::OnceLock;
+            static U: OnceLock<bool> = OnceLock::new();
+            *U.get_or_init(|| {
+                // Default: unfused (best perf empirically). IARA_FUSED=1 forces fused.
+                if std::env::var("IARA_FUSED").map(|v| v == "1").unwrap_or(false) { false }
+                else if std::env::var("IARA_UNFUSED").map(|v| v == "0").unwrap_or(false) { false }
+                else { true }
+            })
+        };
         let force_fuse_qkv = std::env::var("IARA_FUSE_QKV").is_ok();
         let force_fuse_mlp = std::env::var("IARA_FUSE_MLP").is_ok();
         let force_fuse_attn = std::env::var("IARA_FUSE_ATTN").is_ok();
