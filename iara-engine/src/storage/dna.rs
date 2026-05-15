@@ -36,8 +36,9 @@ use std::sync::Arc;
 
 use compute_core::{AnyTensor, ComputeBackend};
 use compute_core::dna_format::{
-    DNA_MAGIC, CHUNK_TSVD, CHUNK_TRAW,
-    DTYPE_BF16, DTYPE_Q4_0, Q4_0_BLOCK, Q4_0_BYTES_PER_BLOCK,
+    DNA_MAGIC, CHUNK_TSVD, CHUNK_TRAW, CHUNK_TBLK,
+    DTYPE_BF16, DTYPE_Q4_0, DTYPE_Q4_K, DTYPE_Q6_K, DTYPE_Q8_0,
+    Q4_0_BLOCK, Q4_0_BYTES_PER_BLOCK,
     dequantize_q4_0,
     read_magic, read_u32, read_u64, read_name, read_u16_vec, read_f32_vec,
 };
@@ -79,6 +80,14 @@ pub enum DnaTensor {
         cols: usize,
         rank: usize,
     },
+    /// DNA-V5: ggml block-quantized tensor (Q4_K, Q6_K, Q8_0). Raw bytes uploaded
+    /// to device; forward uses the existing gemv_q4k / gemv_q6k kernels (same
+    /// path as the GGUF loader).
+    Block {
+        data: AnyTensor,
+        shape: Vec<usize>,
+        dtype: u32, // DTYPE_Q4_K | DTYPE_Q6_K | DTYPE_Q8_0
+    },
 }
 
 impl DnaTensor {
@@ -86,6 +95,7 @@ impl DnaTensor {
         match self {
             DnaTensor::Full { shape, .. } => shape.clone(),
             DnaTensor::Svd { rows, cols, .. } => vec![*rows, *cols],
+            DnaTensor::Block { shape, .. } => shape.clone(),
         }
     }
 
@@ -116,7 +126,7 @@ impl DnaModel {
             return Err(DnaError::BadMagic { expected: *DNA_MAGIC, got: magic });
         }
         let version = read_u32(&mut f)?;
-        if version != 1 {
+        if version != 1 && version != 5 {
             return Err(DnaError::UnsupportedVersion(version));
         }
         let tensor_count = read_u32(&mut f)? as usize;
@@ -139,6 +149,7 @@ impl DnaModel {
                     t
                 }
                 CHUNK_TRAW => parse_traw(&mut f, &name, payload_len, backend)?,
+                CHUNK_TBLK => parse_tblk(&mut f, &name, payload_len, backend)?,
                 _ => return Err(DnaError::UnknownChunk(chunk_magic)),
             };
 
@@ -268,6 +279,47 @@ fn parse_traw(
     };
 
     Ok(DnaTensor::Full { tensor, shape })
+}
+
+/// Parse a DNA-V5 TBLK chunk — ggml block-quantized tensor (Q4_K/Q6_K/Q8_0).
+/// Layout: ndim u32 + dims[ndim] u32 + dtype u32 + raw bytes.
+fn parse_tblk(
+    f: &mut File,
+    name: &str,
+    payload_len: usize,
+    backend: &Arc<dyn ComputeBackend>,
+) -> DnaResult<DnaTensor> {
+    let dim_count = read_u32(f)? as usize;
+    let mut shape: Vec<usize> = Vec::with_capacity(dim_count);
+    for _ in 0..dim_count {
+        shape.push(read_u32(f)? as usize);
+    }
+    let dtype = read_u32(f)?;
+    let header_bytes = 4 + dim_count * 4 + 4;
+    let blocks_bytes_len = payload_len.saturating_sub(header_bytes);
+    let mut blocks = vec![0u8; blocks_bytes_len];
+    f.read_exact(&mut blocks).map_err(DnaError::from)?;
+
+    // Validate dtype + sizing.
+    let (block_size, block_bytes) = match dtype {
+        DTYPE_Q4_K => (256usize, 144usize), // d + dmin + scales(12) + qs(128) = 144
+        DTYPE_Q6_K => (256, 210),           // ql(128) + qh(64) + scales(16) + d(2) = 210
+        DTYPE_Q8_0 => (32, 34),             // d(2) + qs(32) = 34
+        _ => return Err(DnaError::UnsupportedDtype(dtype)),
+    };
+    let numel: usize = shape.iter().product();
+    let n_blocks = (numel + block_size - 1) / block_size;
+    let expected = n_blocks * block_bytes;
+    if blocks_bytes_len != expected {
+        return Err(DnaError::Truncated {
+            name: format!("TBLK {} dtype={}", name, dtype),
+            expected,
+            got: blocks_bytes_len,
+        });
+    }
+
+    let data = backend.upload_raw(&blocks, &shape);
+    Ok(DnaTensor::Block { data, shape, dtype })
 }
 
 // ── Tests (binary-level roundtrip; backend integration tested separately) ──

@@ -24,14 +24,24 @@ use std::path::Path;
 pub const DNA_MAGIC: &[u8; 4] = b"DNA4";
 pub const CHUNK_TSVD: &[u8; 4] = b"TSVD";
 pub const CHUNK_TRAW: &[u8; 4] = b"TRAW";
+/// DNA-V5 block-quantized tensor (Q4_K / Q6_K / Q8_0 from ggml).
+/// Layout: name + ndim + shape[ndim] u32 + dtype u32 + n_bytes u64 + raw_bytes.
+pub const CHUNK_TBLK: &[u8; 4] = b"TBLK";
 
 pub const DTYPE_BF16: u32 = 0;
 pub const DTYPE_F16: u32 = 1;
 pub const DTYPE_I8: u32 = 2;
 pub const DTYPE_F32: u32 = 3;
 pub const DTYPE_Q4_0: u32 = 4;
+/// GGML block-quantized dtypes (match GgmlType enum codes in iara-engine/storage/gguf.rs).
+pub const DTYPE_Q4_K: u32 = 12;
+pub const DTYPE_Q5_K: u32 = 13;
+pub const DTYPE_Q6_K: u32 = 14;
+pub const DTYPE_Q8_0: u32 = 8;
 
 pub const VERSION: u32 = 1;
+/// DNA-V5: same .dna container, version=5 indicates TBLK chunks present.
+pub const VERSION_V5: u32 = 5;
 
 pub const Q4_0_BLOCK: usize = 32;
 pub const Q4_0_BYTES_PER_BLOCK: usize = 18; // fp16 scale (2) + 16 packed nibbles
@@ -134,6 +144,32 @@ impl DnaWriter {
         };
         self.f.write_all(bytes)?;
         self.tensor_count += 1;
+        Ok(())
+    }
+
+    /// DNA-V5 block-quantized tensor: name + ndim + shape + ggml_dtype + raw payload.
+    /// The dtype must be one of DTYPE_Q4_K, DTYPE_Q5_K, DTYPE_Q6_K, DTYPE_Q8_0 (or
+    /// any ggml block format). Payload is the exact byte layout produced by
+    /// llama.cpp's quantize_row_qX_K — no further interpretation here.
+    pub fn write_tblk(&mut self, name: &str, shape: &[u32], dtype: u32, blocks: &[u8]) -> io::Result<()> {
+        let hdr = 4 + shape.len() as u64 * 4 + 4;  // ndim + shape + dtype
+        let payload_len = hdr + blocks.len() as u64;
+        self.write_chunk_header(CHUNK_TBLK, name, payload_len)?;
+        self.f.write_all(&(shape.len() as u32).to_le_bytes())?;
+        for d in shape { self.f.write_all(&d.to_le_bytes())?; }
+        self.f.write_all(&dtype.to_le_bytes())?;
+        self.f.write_all(blocks)?;
+        self.tensor_count += 1;
+        Ok(())
+    }
+
+    /// Promote header to DNA-V5. Call BEFORE first tensor write; later writes
+    /// can mix any chunk type (V5 is a superset).
+    pub fn set_version_v5(&mut self) -> io::Result<()> {
+        let cur = self.f.stream_position()?;
+        self.f.seek(SeekFrom::Start(4))?;
+        self.f.write_all(&VERSION_V5.to_le_bytes())?;
+        self.f.seek(SeekFrom::Start(cur))?;
         Ok(())
     }
 

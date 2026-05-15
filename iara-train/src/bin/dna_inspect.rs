@@ -11,6 +11,7 @@ use clap::Parser;
 const DNA_MAGIC: &[u8; 4] = b"DNA4";
 const CHUNK_TSVD: [u8; 4] = *b"TSVD";
 const CHUNK_TRAW: [u8; 4] = *b"TRAW";
+const CHUNK_TBLK: [u8; 4] = *b"TBLK";
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -87,6 +88,17 @@ fn main() -> std::io::Result<()> {
                 let dtype = match dt { 0 => "BF16", 3 => "F32", _ => "?" };
                 let shape_str = format!("{:?}", shape);
                 ("TRAW", dtype.to_string(), shape_str, None)
+            }
+            m if m == &CHUNK_TBLK => {
+                let dim_count = read_u32(&mut f)? as usize;
+                let mut shape: Vec<u32> = Vec::with_capacity(dim_count);
+                for _ in 0..dim_count {
+                    shape.push(read_u32(&mut f)?);
+                }
+                let dt = read_u32(&mut f)?;
+                let dtype = match dt { 12 => "Q4_K", 14 => "Q6_K", 8 => "Q8_0", _ => "?" };
+                let shape_str = format!("{:?}", shape);
+                ("TBLK", dtype.to_string(), shape_str, None)
             }
             other => {
                 panic!("unknown chunk: {:?}", other);

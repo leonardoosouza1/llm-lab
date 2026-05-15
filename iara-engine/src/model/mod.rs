@@ -1303,6 +1303,7 @@ impl CausalLM {
                 Some(DnaTensor::Svd { .. }) => Err(ModelError::Model(format!(
                     "Tensor '{}' está como SVD mas esperado Full (norm/bias/embed)", name
                 ))),
+                Some(DnaTensor::Block { data, .. }) => Ok(data),
                 None => Err(ModelError::Model(format!("Tensor '{}' não encontrado no .dna", name))),
             }
         }
@@ -1316,12 +1317,25 @@ impl CausalLM {
             name: &str,
             max_m: usize,
         ) -> ModelResult<LayerWeight> {
+            use compute_core::dna_format::{DTYPE_Q4_K, DTYPE_Q6_K};
             match dna.tensors.remove(name) {
                 Some(DnaTensor::Svd { a, b, rows, cols, rank }) => {
                     let scratch = backend.alloc_f32(&[max_m * rank]);
                     Ok(LayerWeight::Svd { a, b, scratch, n: rows, k: cols, rank })
                 }
                 Some(DnaTensor::Full { tensor, .. }) => Ok(LayerWeight::Bf16(tensor)),
+                Some(DnaTensor::Block { data, shape, dtype }) => {
+                    // Shape is [out, in] (PyTorch nn.Linear). LayerWeight::Q4K/Q6K use n=out, k=in.
+                    let n = shape[0];
+                    let k = shape[1];
+                    match dtype {
+                        DTYPE_Q4_K => Ok(LayerWeight::Q4K { data, n, k }),
+                        DTYPE_Q6_K => Ok(LayerWeight::Q6K { data, n, k }),
+                        _ => Err(ModelError::Model(format!(
+                            "Tensor '{}' TBLK dtype={} unsupported as LayerWeight", name, dtype
+                        ))),
+                    }
+                }
                 None => Err(ModelError::Model(format!("Tensor '{}' não encontrado no .dna", name))),
             }
         }
