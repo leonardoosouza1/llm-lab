@@ -27,11 +27,83 @@ use log::{info, warn};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use safetensors::{tensor::TensorView, SafeTensors};
+use std::collections::HashMap;
 
 use iara_train::distill::dna::{
     compress_tensor, compress_tensor_randomized, compress_tensor_rsvd_gpu_raw,
     default_rank_policy, polish_svd, HostBf16Matrix, RankPolicy,
 };
+
+/// Aggregates one or more safetensors shards under a unified tensor-name API.
+///
+/// Single file: opens directly. Sharded directory (with `model.safetensors.index.json`):
+/// mmaps every shard, leaks them to `'static`, and routes `tensor(name)` to the right shard.
+struct ShardedSt {
+    names: Vec<String>,
+    by_name: HashMap<String, &'static SafeTensors<'static>>,
+}
+
+impl ShardedSt {
+    fn open(input: &std::path::Path) -> anyhow::Result<Self> {
+        // Decide single vs sharded.
+        let (shard_paths, parent): (Vec<PathBuf>, PathBuf) = if input.is_dir() {
+            let idx = input.join("model.safetensors.index.json");
+            let s = fs::read_to_string(&idx)
+                .map_err(|e| anyhow::anyhow!("read {}: {}", idx.display(), e))?;
+            let v: serde_json::Value = serde_json::from_str(&s)?;
+            let wm = v["weight_map"].as_object()
+                .ok_or_else(|| anyhow::anyhow!("index.json missing weight_map"))?;
+            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for (_, val) in wm.iter() {
+                if let Some(f) = val.as_str() { set.insert(f.to_string()); }
+            }
+            (set.into_iter().map(|f| input.join(f)).collect(), input.to_path_buf())
+        } else if input.extension().and_then(|e| e.to_str()) == Some("json") {
+            let s = fs::read_to_string(input)?;
+            let v: serde_json::Value = serde_json::from_str(&s)?;
+            let wm = v["weight_map"].as_object()
+                .ok_or_else(|| anyhow::anyhow!("index.json missing weight_map"))?;
+            let par = input.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for (_, val) in wm.iter() {
+                if let Some(f) = val.as_str() { set.insert(f.to_string()); }
+            }
+            (set.into_iter().map(|f| par.join(f)).collect(), par)
+        } else {
+            (vec![input.to_path_buf()], input.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
+        };
+
+        let _ = parent;
+        info!("Opening {} safetensors shard(s)", shard_paths.len());
+
+        let mut names: Vec<String> = Vec::new();
+        let mut by_name: HashMap<String, &'static SafeTensors<'static>> = HashMap::new();
+        for p in &shard_paths {
+            let file = fs::File::open(p)
+                .map_err(|e| anyhow::anyhow!("open {}: {}", p.display(), e))?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            // Leak mmap to 'static so SafeTensors can borrow with that lifetime.
+            let mmap_static: &'static Mmap = Box::leak(Box::new(mmap));
+            let st = SafeTensors::deserialize(&mmap_static[..])
+                .map_err(|e| anyhow::anyhow!("safetensors {}: {}", p.display(), e))?;
+            let st_static: &'static SafeTensors<'static> = Box::leak(Box::new(st));
+            for n in st_static.names() {
+                if by_name.insert(n.to_string(), st_static).is_none() {
+                    names.push(n.to_string());
+                }
+            }
+        }
+        Ok(Self { names, by_name })
+    }
+
+    fn names(&self) -> &[String] { &self.names }
+
+    fn tensor(&self, name: &str) -> anyhow::Result<TensorView<'static>> {
+        let st = self.by_name.get(name)
+            .ok_or_else(|| anyhow::anyhow!("tensor '{}' not found in any shard", name))?;
+        st.tensor(name).map_err(|e| anyhow::anyhow!("tensor '{}': {}", name, e))
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Compress safetensors → DNA V4 (.dna)")]
@@ -166,17 +238,18 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-    let file = fs::File::open(&cli.input)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let st = SafeTensors::deserialize(&mmap).map_err(|e| anyhow::anyhow!("safetensors: {e}"))?;
+    let st = ShardedSt::open(&cli.input)?;
 
     // Detect tied word embeddings from sibling config.json. If tied and the
     // safetensors lacks an explicit lm_head, duplicate embed bytes under
     // "lm_head.weight" in the .dna so the engine loader doesn't need a tie
     // resolver. Disk cost: one extra TRAW for a ~500MB embed.
-    let config_path = cli.input.parent()
-        .map(|p| p.join("config.json"))
-        .unwrap_or_else(|| std::path::PathBuf::from("config.json"));
+    let config_dir: PathBuf = if cli.input.is_dir() {
+        cli.input.clone()
+    } else {
+        cli.input.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+    };
+    let config_path = config_dir.join("config.json");
     let tied_embeddings = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
