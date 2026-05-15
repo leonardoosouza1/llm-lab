@@ -16,6 +16,7 @@ mod model;
 mod speculative; // Speculative decoding framework
 mod storage;
 mod tokenizer;
+mod trace;     // First-class introspection subsystem (DNA-V6-TRACING.md)
 mod transport;
 mod telemetry; // Adiciona o módulo de telemetria
 
@@ -276,13 +277,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frame_tx, _) = broadcast::channel::<String>(512);
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(64);
 
-    // 5. Start WebSocket server (port 8080)
-    let ws_addr: std::net::SocketAddr = "127.0.0.1:8080".parse()?;
-    let frame_tx_ws = frame_tx.clone();
-    tokio::spawn(async move {
-        start_ws_server(ws_addr, cmd_tx, frame_tx_ws.subscribe()).await;
-    });
-    log::info!("WebSocket em ws://127.0.0.1:8080");
+    // 5. Start WebSocket server (port 8080, override via IARA_WS_PORT,
+    //    skip when IARA_WS_DISABLE=1 — multi-engine parallel mode)
+    let ws_disabled = std::env::var("IARA_WS_DISABLE").ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !ws_disabled {
+        let ws_port_str = std::env::var("IARA_WS_PORT").unwrap_or_else(|_| "8080".into());
+        let ws_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ws_port_str).parse()?;
+        let frame_tx_ws = frame_tx.clone();
+        tokio::spawn(async move {
+            start_ws_server(ws_addr, cmd_tx, frame_tx_ws.subscribe()).await;
+        });
+        log::info!("WebSocket em ws://127.0.0.1:{}", ws_port_str);
+    } else {
+        log::info!("WebSocket DESABILITADO (IARA_WS_DISABLE=1)");
+        drop(cmd_tx);
+    }
 
     // 6. Engine command processor (bridges WS commands -> model)
     let engine_model    = qwen_model.clone();
