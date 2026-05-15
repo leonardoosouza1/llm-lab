@@ -234,20 +234,25 @@ impl RankPolicy {
 }
 
 /// Default policy: embed/lm_head and attention projections get higher rank.
-/// Tuned for Qwen-style models; adjust per-architecture as needed.
 ///
-/// V proj uses full rank (or 1024 capped) because:
-/// - V output is unbiased (Qwen3 has attention_bias=false) → any SVD residual leaks
-/// - V weights have flat singular spectrum (carry diverse content) → truncation kills info
-/// - Empirical: rank 256 caused 42% L2 drift on Qwen3-4B V_proj; rank 1024 ≈ exact
+/// Calibrated via SV-spectrum analysis (scripts/dna/sv_spectrum.py):
+/// - Qwen2.5-1.5B V/K_proj had only 256 SVs total (lucky narrow shape) → rank 256
+///   = 100% lossless. Qwen2.5 just worked at rank 256.
+/// - Qwen3-4B V/K_proj has 1024 SVs (8 KV heads × 128) → rank 256 captures only
+///   50% energy → 42% L2 drift in V → garbage logits.
+/// - Solution: rank multipliers per tensor type. Caller controls baseline via
+///   --rank; each suffix overrides upward when needed.
 pub fn default_rank_policy(default_rank: usize) -> RankPolicy {
     RankPolicy::new(default_rank)
         .with_suffix(".embed_tokens.weight", default_rank.max(256))
         .with_suffix("lm_head.weight", default_rank.max(256))
-        .with_suffix(".q_proj.weight", default_rank.max(128))
-        .with_suffix(".k_proj.weight", default_rank.max(128))
-        .with_suffix(".v_proj.weight", default_rank.max(1024))
+        .with_suffix(".q_proj.weight", default_rank.max(512))
+        .with_suffix(".k_proj.weight", default_rank.max(512))
+        .with_suffix(".v_proj.weight", default_rank.max(512))
         .with_suffix(".o_proj.weight", default_rank.max(512))
+        .with_suffix(".gate_proj.weight", default_rank.max(512))
+        .with_suffix(".up_proj.weight", default_rank.max(512))
+        .with_suffix(".down_proj.weight", default_rank.max(512))
 }
 
 /// Tensor-level polish: LoRA-style SGD on (A, B) with W_target as frozen ground truth.
