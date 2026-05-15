@@ -34,3 +34,7 @@ rocm = []
 [[bin]]
 name = "dna_compress"
 path = "src/bin/dna_compress.rs"
+
+[[bin]]
+name = "dna_inspect"
+path = "src/bin/dna_inspect.rs"
