@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use iara_train::distill::dna::{
     compress_tensor, compress_tensor_randomized, compress_tensor_rsvd_gpu_raw,
-    default_rank_policy, polish_svd, polish_svd_gpu, HostBf16Matrix, RankPolicy,
+    default_rank_policy, polish_svd, polish_svd_gpu, rank_policy_for, HostBf16Matrix, RankPolicy,
 };
 
 /// Aggregates one or more safetensors shards under a unified tensor-name API.
@@ -44,10 +44,35 @@ struct ShardedSt {
 }
 
 impl ShardedSt {
+    fn open_from_paths(shard_paths: Vec<PathBuf>) -> anyhow::Result<Self> {
+        let mut names: Vec<String> = Vec::new();
+        let mut by_name: HashMap<String, &'static SafeTensors<'static>> = HashMap::new();
+        for p in &shard_paths {
+            let file = fs::File::open(p)
+                .map_err(|e| anyhow::anyhow!("open {}: {}", p.display(), e))?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let mmap_static: &'static Mmap = Box::leak(Box::new(mmap));
+            let st = SafeTensors::deserialize(&mmap_static[..])
+                .map_err(|e| anyhow::anyhow!("safetensors {}: {}", p.display(), e))?;
+            let st_static: &'static SafeTensors<'static> = Box::leak(Box::new(st));
+            for n in st_static.names() {
+                if by_name.insert(n.to_string(), st_static).is_none() {
+                    names.push(n.to_string());
+                }
+            }
+        }
+        Ok(Self { names, by_name })
+    }
+
     fn open(input: &std::path::Path) -> anyhow::Result<Self> {
         // Decide single vs sharded.
         let (shard_paths, parent): (Vec<PathBuf>, PathBuf) = if input.is_dir() {
             let idx = input.join("model.safetensors.index.json");
+            let single = input.join("model.safetensors");
+            // Single safetensors fallback: dir contains one model.safetensors and no index.
+            if !idx.exists() && single.exists() {
+                return Self::open_from_paths(vec![single]);
+            }
             let s = fs::read_to_string(&idx)
                 .map_err(|e| anyhow::anyhow!("read {}: {}", idx.display(), e))?;
             let v: serde_json::Value = serde_json::from_str(&s)?;
@@ -156,6 +181,11 @@ struct Cli {
     #[arg(long)]
     force_raw_mlp: bool,
 
+    /// Architecture family hint for rank policy ("qwen2", "qwen3", ""). Empty
+    /// → auto-detect from config.json (model_type or architectures[0]).
+    #[arg(long, default_value = "")]
+    family: String,
+
     /// Worker threads for parallel compression (0 = rayon default = num CPUs).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -260,18 +290,33 @@ fn main() -> anyhow::Result<()> {
         cli.input.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
     };
     let config_path = config_dir.join("config.json");
-    let tied_embeddings = std::fs::read_to_string(&config_path)
+    let config_json: serde_json::Value = std::fs::read_to_string(&config_path)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("tie_word_embeddings").and_then(|b| b.as_bool()))
-        .unwrap_or(false);
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let tied_embeddings = config_json.get("tie_word_embeddings").and_then(|b| b.as_bool()).unwrap_or(false);
+    // Detect family for rank policy. Reads config.json model_type or architectures[0].
+    // Manual override via --family <name>.
+    let detected_family = if let Some(s) = config_json.get("model_type").and_then(|v| v.as_str()) {
+        s.to_string()
+    } else if let Some(arr) = config_json.get("architectures").and_then(|v| v.as_array()) {
+        arr.first().and_then(|v| v.as_str()).map(|s| {
+            // "Qwen3ForCausalLM" → "qwen3"; "Qwen2ForCausalLM" → "qwen2"
+            s.split("ForCausalLM").next().unwrap_or(s).to_lowercase()
+        }).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let family = if !cli.family.is_empty() { cli.family.clone() } else { detected_family.clone() };
+    info!("Detected family={:?}, using family={:?} for rank policy", detected_family, family);
     let safetensors_has_lm_head = st.names().iter().any(|n|
         *n == "lm_head.weight" || n.ends_with(".lm_head.weight"));
     let synth_lm_head = tied_embeddings && !safetensors_has_lm_head;
     if synth_lm_head {
         info!("Tied embeddings detected; will write lm_head.weight as a duplicate of embed_tokens.");
     }
-    let policy = default_rank_policy(cli.rank);
+    let policy = rank_policy_for(&family, cli.rank);
+    info!("Rank policy: family={:?}, base_rank={}", family, cli.rank);
 
     let names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
     let total = names.len();

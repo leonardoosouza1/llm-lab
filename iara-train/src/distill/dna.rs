@@ -233,16 +233,24 @@ impl RankPolicy {
     }
 }
 
-/// Default policy: embed/lm_head and attention projections get higher rank.
-///
-/// Calibrated via SV-spectrum analysis (scripts/dna/sv_spectrum.py):
-/// - Qwen2.5-1.5B V/K_proj had only 256 SVs total (lucky narrow shape) → rank 256
-///   = 100% lossless. Qwen2.5 just worked at rank 256.
-/// - Qwen3-4B V/K_proj has 1024 SVs (8 KV heads × 128) → rank 256 captures only
-///   50% energy → 42% L2 drift in V → garbage logits.
-/// - Solution: rank multipliers per tensor type. Caller controls baseline via
-///   --rank; each suffix overrides upward when needed.
+/// Default policy: Qwen2-friendly (rank 64-256 suffices). Use this for narrow
+/// matrices like Qwen2.5-1.5B where V/K_proj have only 256 SVs.
 pub fn default_rank_policy(default_rank: usize) -> RankPolicy {
+    RankPolicy::new(default_rank)
+        .with_suffix(".embed_tokens.weight", default_rank.max(256))
+        .with_suffix("lm_head.weight", default_rank.max(256))
+        .with_suffix(".q_proj.weight", default_rank.max(128))
+        .with_suffix(".k_proj.weight", default_rank.max(128))
+        .with_suffix(".v_proj.weight", default_rank.max(128))
+}
+
+/// Qwen3-tuned policy: bumps rank for wider attention/MLP matrices where rank 256
+/// captures <50% spectrum energy (see scripts/dna/sv_spectrum.py).
+///
+/// Numbers came from Qwen3-4B layer 0 spectrum: V/K_proj need rank ≥512 to keep
+/// ≈85% energy; gate/up/down_proj are flatter (≈70% at rank 512). Polish-svd
+/// refinement is the next lever before going higher.
+pub fn qwen3_rank_policy(default_rank: usize) -> RankPolicy {
     RankPolicy::new(default_rank)
         .with_suffix(".embed_tokens.weight", default_rank.max(256))
         .with_suffix("lm_head.weight", default_rank.max(256))
@@ -253,6 +261,15 @@ pub fn default_rank_policy(default_rank: usize) -> RankPolicy {
         .with_suffix(".gate_proj.weight", default_rank.max(512))
         .with_suffix(".up_proj.weight", default_rank.max(512))
         .with_suffix(".down_proj.weight", default_rank.max(512))
+}
+
+/// Pick a policy by family hint. "qwen3" → qwen3_rank_policy; everything else
+/// → default_rank_policy (Qwen2.5-compatible).
+pub fn rank_policy_for(family: &str, default_rank: usize) -> RankPolicy {
+    match family.to_lowercase().as_str() {
+        "qwen3" | "qwen-3" => qwen3_rank_policy(default_rank),
+        _ => default_rank_policy(default_rank),
+    }
 }
 
 /// Tensor-level polish: LoRA-style SGD on (A, B) with W_target as frozen ground truth.
