@@ -615,7 +615,12 @@ impl ComputeBackend for RocmBackend {
 
     fn gemv_q6k_q8(&self, p: &GemvQ6KQ8Params) -> Result<(), BackendError> {
         unsafe {
-            if self.use_v2 {
+            if self.use_mmvq_llama {
+                self.kernels.mmvq_q6k_llama(
+                    u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
+                    p.m as i32, p.n as i32, p.k as i32, p.beta,
+                )
+            } else if self.use_v2 {
                 self.kernels.gemv_q6k_q8_v2(
                     u8_ptr(p.data), u8_ptr(p.x_q8), f32_mut_ptr(p.out),
                     p.m as i32, p.n as i32, p.k as i32, p.beta,

@@ -131,6 +131,7 @@ pub struct GpuKernels {
     // llama.cpp-ported Q4K kernel (MIT), wave32, separate module
     module_mmvq: hipModule_t,
     fn_mmvq_q4k_llama: hipFunction_t,
+    fn_mmvq_q6k_llama: hipFunction_t,
     // Dynamic-pos variants for HIP graph capture-once-replay
     fn_fused_rope_kv_copy_dyn: hipFunction_t,
     fn_copy_to_kv_cache_dyn: hipFunction_t,
@@ -249,6 +250,7 @@ impl GpuKernels {
         // llama.cpp-ported mmvq kernel
         let module_mmvq = hip_module_load_data(KERNEL_MMVQ_BYTES)?;
         let fn_mmvq_q4k_llama = hip_module_get_function(module_mmvq, "mmvq_q4k_llama")?;
+        let fn_mmvq_q6k_llama = hip_module_get_function(module_mmvq, "mmvq_q6k_llama")?;
 
         // Dynamic-pos variants for HIP graph replay
         let fn_fused_rope_kv_copy_dyn = get_fn!("fused_rope_kv_copy_dyn");
@@ -330,6 +332,7 @@ impl GpuKernels {
             fn_gemv_q6k_q8_v2,
             module_mmvq,
             fn_mmvq_q4k_llama,
+            fn_mmvq_q6k_llama,
             fn_fused_rope_kv_copy_dyn,
             fn_copy_to_kv_cache_dyn,
             fn_fused_attention_decode_dyn,
@@ -4303,6 +4306,73 @@ impl GpuKernels {
 
         hip_launch_kernel(
             self.fn_mmvq_q4k_llama,
+            grid,
+            block,
+            0,
+            self.stream,
+            &mut [
+                &mut p_data as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_x_q8 as *mut *const u8 as *mut std::ffi::c_void,
+                &mut p_out as *mut *mut f32 as *mut std::ffi::c_void,
+                &mut p_m as *mut i32 as *mut std::ffi::c_void,
+                &mut p_n as *mut i32 as *mut std::ffi::c_void,
+                &mut p_k as *mut i32 as *mut std::ffi::c_void,
+                &mut p_beta as *mut f32 as *mut std::ffi::c_void,
+            ],
+        )
+    }
+
+    /// Q6_K × Q8_1 GEMV — llama.cpp-ported kernel. Used for down_proj.
+    /// Same signature as mmvq_q4k_llama. Grid (N, M, 1), Block (32, 1, 1).
+    pub unsafe fn mmvq_q6k_llama(
+        &self,
+        data: *const u8,
+        x_q8: *const u8,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        beta: f32,
+    ) -> Result<(), HipError> {
+        let grid = (n as u32, m.max(1) as u32, 1);
+        let block = (32u32, 1, 1);
+
+        if let Some(hsa) = self.hsa.as_ref() {
+            if let Some(kinfo) = hsa.get("mmvq_q6k_llama") {
+                let layouts = crate::kernel_layouts::all_layouts();
+                if let Some(layout) = layouts.get("mmvq_q6k_llama") {
+                    if !Self::hsa_skip_drain() {
+                        use crate::raw::hipStreamSynchronize;
+                        let _ = hipStreamSynchronize(self.stream);
+                    }
+                    let p_data = (data as u64).to_le_bytes();
+                    let p_xq8  = (x_q8 as u64).to_le_bytes();
+                    let p_out  = (out as u64).to_le_bytes();
+                    let b_m    = m.to_le_bytes();
+                    let b_n    = n.to_le_bytes();
+                    let b_k    = k.to_le_bytes();
+                    let b_beta = beta.to_le_bytes();
+                    let block16 = (block.0 as u16, block.1 as u16, block.2 as u16);
+                    hsa.pack_and_dispatch_sync(
+                        kinfo, layout,
+                        &[&p_data, &p_xq8, &p_out, &b_m, &b_n, &b_k, &b_beta],
+                        grid, block16, 0,
+                    ).map_err(|e| HipError::Hip { code: 0, msg: e.0 })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut p_data = data;
+        let mut p_x_q8 = x_q8;
+        let mut p_out = out;
+        let mut p_m = m;
+        let mut p_n = n;
+        let mut p_k = k;
+        let mut p_beta = beta;
+
+        hip_launch_kernel(
+            self.fn_mmvq_q6k_llama,
             grid,
             block,
             0,
