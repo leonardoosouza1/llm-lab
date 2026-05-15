@@ -2899,6 +2899,28 @@ impl CausalLM {
             }
         }
 
+        // ── IARA_DBG_HIDDEN: dump first 8 + L2 of each stage for bisecting DNA bugs ──
+        // Active only when env var = 1. Logs once per stage on first decode token of
+        // first prompt (controlled by DBG_FIRED atomic). For comparing safetensors vs DNA.
+        let dbg_hidden = std::env::var("IARA_DBG_HIDDEN").map(|v| v == "1").unwrap_or(false);
+        static DBG_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let dbg_should = dbg_hidden && !DBG_FIRED.load(std::sync::atomic::Ordering::Relaxed);
+        macro_rules! dbg_dump {
+            ($label:expr, $tensor:expr, $stride:expr) => {
+                if dbg_should {
+                    self.backend.device_sync();
+                    let d = self.backend.download_f32($tensor);
+                    let st = $stride.min(d.len());
+                    let preview: Vec<f32> = d.iter().take(8).copied().collect();
+                    let l2: f32 = d[..st].iter().map(|v| v*v).sum::<f32>().sqrt();
+                    let any_nan = d[..st].iter().any(|v| !v.is_finite());
+                    log::warn!("DBGH [{}] L2={:.4} nan={} head={:?}", $label, l2, any_nan, preview);
+                }
+            };
+        }
+
+        dbg_dump!("embed", &self.scratch.x, h);
+
         // Initialize telemetry vector
         let mut layer_traces: Vec<LayerTrace> = Vec::new();
 
@@ -3276,6 +3298,13 @@ impl CausalLM {
                         dim: kd,
                     })?;
                 }
+            }
+
+            // IARA_DBG_HIDDEN: raw QKV before QK norm (Qwen3 bisection)
+            if layer_idx == 0 {
+                dbg_dump!("L0.q_raw_postproj", &self.scratch.q, qd);
+                dbg_dump!("L0.k_raw_postproj", &self.scratch.k, kd);
+                dbg_dump!("L0.v_raw_postproj", &self.scratch.v, kd);
             }
 
             // ── QK Normalization (Qwen3) ─────────────────────────────────────
@@ -3686,6 +3715,15 @@ impl CausalLM {
                 log::info!("🔬 L0 attn_out[0..8] = {:?}", &attn_data[..8.min(attn_data.len())]);
                 let x_before = self.backend.download_f32(&self.scratch.x);
                 log::info!("🔬 L0 x_before_wo[0..8] = {:?}", &x_before[..8.min(x_before.len())]);
+            }
+
+            // IARA_DBG_HIDDEN bisection dumps — only layer 0 first decode token
+            if layer_idx == 0 {
+                dbg_dump!("L0.normed", &self.scratch.normed, h);
+                dbg_dump!("L0.q", &self.scratch.q, qd);
+                dbg_dump!("L0.k", &self.scratch.k, kd);
+                dbg_dump!("L0.v", &self.scratch.v, kd);
+                dbg_dump!("L0.attn_out", &self.scratch.attn_out, qd);
             }
 
             prof_sync!("attn_done");
@@ -4262,11 +4300,13 @@ impl CausalLM {
             self.backend.device_sync();
             log::warn!("PROF layers_done @ {:?}", t0.elapsed());
         }
+        dbg_dump!("pre_final_norm.x", &self.scratch.x, h);
         Self::apply_norm(
             &self.backend, norm_type,
             &self.scratch.x, &self.norm_w, self.norm_b.as_ref(),
             &self.scratch.normed, n, h, eps,
         )?;
+        dbg_dump!("post_final_norm", &self.scratch.normed, h);
 
         // ── lm_head (apenas o último token) ──────────────────────────────────
         // Suporta BF16 (load normal) ou Q4 (load_quantized): dispatch via project()
@@ -4277,6 +4317,8 @@ impl CausalLM {
             1, vocab, h, (n - 1) * h, 0.0,
             self.scratch.q8_scratch.as_ref(), false,
         )?;
+        dbg_dump!("logits", &self.scratch.logits, vocab);
+        if dbg_should { DBG_FIRED.store(true, std::sync::atomic::Ordering::Relaxed); }
 
         // Section prof: final norm + lm_head
         if do_section_prof {

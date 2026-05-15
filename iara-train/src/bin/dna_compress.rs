@@ -320,9 +320,34 @@ fn main() -> anyhow::Result<()> {
 
         let is_2d = view.shape().len() == 2;
         let small = numel < cli.min_numel_for_svd || view.shape().iter().any(|&d| d < 32);
+        // Force raw storage for tensors where SVD truncation breaks inference quality.
+        // - embed_tokens/lm_head: SVD breaks row-select semantics (any rank loses info)
+        // - attention v_proj: low-magnitude weights without bias (Qwen3 has no qkv bias)
+        //   are dominated by SVD residual → garbage logits even at rank=256.
+        //   Tested: V proj rank=256 yielded 42% L2 drift on Qwen3-4B layer 0; with TRAW
+        //   the drift drops to 0 (BF16 round-trip only).
+        // For Qwen2.5 with q/k/v_bias, the bias absorbed the SVD residual, so SVD was
+        // viable there. Qwen3 removed bias → must store raw.
         let force_full = name.ends_with(".embed_tokens.weight")
                        || name.ends_with("lm_head.weight")
-                       || name == "embed_tokens.weight";
+                       || name == "embed_tokens.weight"
+                       // Attention projections: SVD residual accumulates across
+                       // 36 layers + propagates through residual stream. Without QKV
+                       // bias (Qwen3 has attention_bias=false), residual error grows
+                       // exponentially. Tested: v_proj alone fixed L0 attn_out exactly
+                       // but pre_final_norm still 7× smaller than safetensors due to
+                       // q/k/o residuals through MLP path. Storing all attention raw
+                       // recovers correctness at modest disk cost.
+                       || name.ends_with(".q_proj.weight")
+                       || name.ends_with(".k_proj.weight")
+                       || name.ends_with(".v_proj.weight")
+                       || name.ends_with(".o_proj.weight")
+                       // MLP gate/up/down: SVD truncation accumulates across 36 layers
+                       // → repetition collapse (e.g. "ooksooks...") even at rank 512.
+                       // Until polish-based or lossless quantization arrives, store raw.
+                       || name.ends_with(".gate_proj.weight")
+                       || name.ends_with(".up_proj.weight")
+                       || name.ends_with(".down_proj.weight");
         let is_raw = !is_2d || small || force_full;
 
         if is_raw {
