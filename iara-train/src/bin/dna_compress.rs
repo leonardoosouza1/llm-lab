@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use iara_train::distill::dna::{
     compress_tensor, compress_tensor_randomized, compress_tensor_rsvd_gpu_raw,
-    default_rank_policy, polish_svd, HostBf16Matrix, RankPolicy,
+    default_rank_policy, polish_svd, polish_svd_gpu, HostBf16Matrix, RankPolicy,
 };
 
 /// Aggregates one or more safetensors shards under a unified tensor-name API.
@@ -145,6 +145,16 @@ struct Cli {
     /// Force full (deterministic) SVD for all tensors regardless of size.
     #[arg(long)]
     force_full_svd: bool,
+
+    /// Force raw BF16 storage for attention projections (q/k/v/o). Recommended for
+    /// Qwen3-style architectures (no QKV bias) where SVD residual breaks inference.
+    #[arg(long)]
+    force_raw_attn: bool,
+
+    /// Force raw BF16 storage for MLP projections (gate/up/down). Use when SVD MLP
+    /// causes repetition collapse across deep stacks (>30 layers).
+    #[arg(long)]
+    force_raw_mlp: bool,
 
     /// Worker threads for parallel compression (0 = rayon default = num CPUs).
     #[arg(long, default_value_t = 0)]
@@ -338,16 +348,18 @@ fn main() -> anyhow::Result<()> {
                        // but pre_final_norm still 7× smaller than safetensors due to
                        // q/k/o residuals through MLP path. Storing all attention raw
                        // recovers correctness at modest disk cost.
-                       || name.ends_with(".q_proj.weight")
-                       || name.ends_with(".k_proj.weight")
-                       || name.ends_with(".v_proj.weight")
-                       || name.ends_with(".o_proj.weight")
-                       // MLP gate/up/down: SVD truncation accumulates across 36 layers
-                       // → repetition collapse (e.g. "ooksooks...") even at rank 512.
-                       // Until polish-based or lossless quantization arrives, store raw.
-                       || name.ends_with(".gate_proj.weight")
-                       || name.ends_with(".up_proj.weight")
-                       || name.ends_with(".down_proj.weight");
+                       // For Qwen3 (no QKV bias), only V proj is critical raw — gate/up/down
+                       // and Q/K/O can use SVD if polish-steps recovers the spectrum.
+                       // Override via --force-raw-attn flag if needed.
+                       || (cli.force_raw_attn && (
+                           name.ends_with(".q_proj.weight")
+                           || name.ends_with(".k_proj.weight")
+                           || name.ends_with(".v_proj.weight")
+                           || name.ends_with(".o_proj.weight")))
+                       || (cli.force_raw_mlp && (
+                           name.ends_with(".gate_proj.weight")
+                           || name.ends_with(".up_proj.weight")
+                           || name.ends_with(".down_proj.weight")));
         let is_raw = !is_2d || small || force_full;
 
         if is_raw {
@@ -420,7 +432,14 @@ fn main() -> anyhow::Result<()> {
             let f32_data = view_to_f32(&view);
             let w = HostBf16Matrix::from_f32(&f32_data, rows, cols);
             drop(f32_data);
-            polish_svd(&mut factors, &w, cli.polish_steps, cli.polish_lr);
+            // GPU polish: ~50× faster than CPU on RDNA2. Falls back internally
+            // if backend lacks copy_f32_d2d.
+            if let Some(backend) = gpu_backend.as_ref() {
+                let guard = backend.lock().expect("gpu backend mutex for polish");
+                polish_svd_gpu(&*guard, &mut factors, &w, cli.polish_steps, cli.polish_lr);
+            } else {
+                polish_svd(&mut factors, &w, cli.polish_steps, cli.polish_lr);
+            }
         }
 
         if use_q4 {
