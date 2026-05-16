@@ -18,6 +18,6 @@ mod event;
 mod sink;
 mod tracer;
 
-pub use event::{Source, Stage, StageStats, TraceEvent};
+pub use event::{compute_stats, Source, Stage, StageStats, TraceEvent};
 pub use sink::{FileSink, RingSink, TraceSink};
 pub use tracer::{TraceLevel, Tracer};
