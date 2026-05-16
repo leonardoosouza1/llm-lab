@@ -281,6 +281,19 @@ fn parse_traw(
     Ok(DnaTensor::Full { tensor, shape })
 }
 
+/// Dequantize a block-quantized buffer to BF16 (u16 bits, ready for upload_bf16).
+/// Used when engine kernel hardcodes BF16 input (e.g. embed_lookup).
+pub fn dequantize_block_to_bf16(bytes: &[u8], dtype: u32, numel: usize) -> DnaResult<Vec<u16>> {
+    use crate::storage::gguf::{dequantize_q4_k, dequantize_q6_k, dequantize_q8_0};
+    let f32_data: Vec<f32> = match dtype {
+        DTYPE_Q4_K => dequantize_q4_k(bytes, numel),
+        DTYPE_Q6_K => dequantize_q6_k(bytes, numel),
+        DTYPE_Q8_0 => dequantize_q8_0(bytes, numel),
+        _ => return Err(DnaError::UnsupportedDtype(dtype)),
+    };
+    Ok(f32_data.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect())
+}
+
 /// Parse a DNA-V5 TBLK chunk — ggml block-quantized tensor (Q4_K/Q6_K/Q8_0).
 /// Layout: ndim u32 + dims[ndim] u32 + dtype u32 + raw bytes.
 fn parse_tblk(

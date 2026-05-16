@@ -152,11 +152,12 @@ impl LlamaEngine {
     /// For small models (1.5B target + 0.5B draft = 1.6x ratio), standard is faster.
     /// Speculative becomes valuable for 7B+ targets with 0.5B-1.5B drafts.
     pub fn generate(&mut self, prompt: &str, params: &GenerateParams) -> Result<GenerateResult, String> {
-        // Only use speculative if draft model loaded AND model is large enough
-        // (n_params > 3B means the draft/target ratio is likely > 3x)
+        // Speculative if draft + max_tokens > 4. Gate by env IARA_SPEC_FORCE=1 to
+        // bypass the 3B-params heuristic (lets us benchmark small-model spec too).
+        let force = std::env::var("IARA_SPEC_FORCE").map(|v| v == "1" || v == "true").unwrap_or(false);
         let use_spec = self.draft.is_some()
             && params.max_tokens > 4
-            && unsafe { llama_model_n_params(self.target.model) } > 3_000_000_000;
+            && (force || unsafe { llama_model_n_params(self.target.model) } > 3_000_000_000);
 
         if use_spec {
             self.generate_speculative(prompt, params)

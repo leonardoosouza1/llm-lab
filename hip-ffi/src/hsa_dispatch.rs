@@ -123,6 +123,22 @@ unsafe extern "C" fn pool_cb(pool: hsa_amd_memory_pool_t, data: *mut std::ffi::c
 
 impl HsaContext {
     pub fn init() -> Result<Self, HsaError> {
+        // Remove HSA_OVERRIDE_GFX_VERSION before hsa_init so HSA sees the physical
+        // gfx1031 GPU (RX 6750 XT / Navi 22).  The override is needed by other ROCm
+        // libs (hipBLAS, MIOpen, etc.) that may have already initialised earlier in
+        // the process; removing it here only affects our own hsa_init call and does
+        // not touch any other library's already-live state.
+        //
+        // WHY: with HSA_OVERRIDE_GFX_VERSION=10.3.0 the HSA runtime believes the
+        // GPU is gfx1030, accepts gfx1030 code objects, and issues dispatch packets
+        // — but the physical gfx1031 firmware silently ignores packets whose code
+        // objects are tagged gfx1030 → GPU never signals completion → CPU busy-waits
+        // forever inside hsa_signal_wait_scacquire (WAIT_STATE_ACTIVE + u64::MAX).
+        //
+        // Compiling for gfx1031 and removing the override here makes the runtime
+        // accept gfx1031 code objects and the hardware actually executes them.
+        std::env::remove_var("HSA_OVERRIDE_GFX_VERSION");
+
         unsafe {
             check(hsa_init(), "hsa_init")?;
 

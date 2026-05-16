@@ -329,7 +329,7 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
-fn dequantize_q4_k(data: &[u8], n_elem: usize) -> Vec<f32> {
+pub fn dequantize_q4_k(data: &[u8], n_elem: usize) -> Vec<f32> {
     const QK_K: usize = 256;
     const BLOCK_SIZE: usize = 144; // 2+2+12+128
 
@@ -458,7 +458,7 @@ fn dequantize_q5_k(data: &[u8], n_elem: usize) -> Vec<f32> {
 //   scales: 16 bytes (int8 scales, one per 16 values)
 //   d: FP16 super-block scale
 
-fn dequantize_q6_k(data: &[u8], n_elem: usize) -> Vec<f32> {
+pub fn dequantize_q6_k(data: &[u8], n_elem: usize) -> Vec<f32> {
     const QK_K: usize = 256;
     const BLOCK_SIZE: usize = 210; // 128 ql + 64 qh + 16 scales + 2 d
 
@@ -516,7 +516,7 @@ fn dequantize_q6_k(data: &[u8], n_elem: usize) -> Vec<f32> {
 //   d: FP16 scale
 //   qs: 32 int8 values
 
-fn dequantize_q8_0(data: &[u8], n_elem: usize) -> Vec<f32> {
+pub fn dequantize_q8_0(data: &[u8], n_elem: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 34; // 2 + 32
     const QK: usize = 32;
 

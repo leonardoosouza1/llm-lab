@@ -81,6 +81,10 @@ pub struct GenerateRequest {
     pub top_p: f32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// Optional layer budget: "fast" (N/4 layers), "medium" (3N/4), "slow"/"full" (all).
+    /// If present, forces CausalLM path (skips llama.cpp).
+    #[serde(default)]
+    pub budget: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -902,8 +906,11 @@ pub async fn generate_handler(
 
     let start = std::time::Instant::now();
 
+    // ── Skip llama.cpp if budget specified (need CausalLM path for layer skipping) ──
+    let force_native = req.budget.is_some();
+
     // ── Fast path: llama.cpp via batch server (supports concurrent requests) ──
-    {
+    if !force_native {
         let batch_guard = state.batch_handle.lock().await;
         if let Some(handle) = batch_guard.as_ref() {
             let params = crate::llama::GenerateParams {
@@ -1115,6 +1122,16 @@ async fn generate_internal(
 
     let mut decode_token = *prompt_ids.last().ok_or("Prompt vazio")?;
 
+    // Parse budget param
+    let layer_budget = req.budget.as_deref().map(|b| {
+        match b.to_lowercase().as_str() {
+            "fast" => Some(crate::lnn::esn::LayerBudget::Fast),
+            "medium" => Some(crate::lnn::esn::LayerBudget::Medium),
+            "slow" | "full" => Some(crate::lnn::esn::LayerBudget::Slow),
+            _ => None,
+        }
+    }).flatten();
+
     // Hold mutex for entire decode loop — avoids per-token lock/unlock overhead
     let decode_ms = {
         let mut model_guard = state.qwen_model.lock().await;
@@ -1123,8 +1140,16 @@ async fn generate_internal(
         let decode_start = std::time::Instant::now();
 
         for _step in 0..req.max_tokens {
-            let (tok_id, tok_str) = forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
-                .map_err(|e| format!("Forward pass error: {}", e))?;
+            let (tok_id, tok_str) = if let Some(budget) = layer_budget {
+                // Path com budget: usa forward_traced_buffered (suporta budget)
+                let gen_step = crate::inference::forward_traced_buffered(
+                    model, &[decode_token], &sampling, Some(budget), &mut sampling_buf)
+                    .map_err(|e| format!("Forward error: {}", e))?;
+                (gen_step.token_id, gen_step.token_str)
+            } else {
+                forward_decode_fast(model, &[decode_token], &sampling, &mut sampling_buf)
+                    .map_err(|e| format!("Forward pass error: {}", e))?
+            };
 
             decode_token = tok_id;
             last_token   = decode_token;

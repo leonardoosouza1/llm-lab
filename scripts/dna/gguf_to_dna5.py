@@ -165,34 +165,28 @@ def main():
             # Reconstruct raw bytes from the in-memory tensor.
             raw = bytes(t.data.tobytes())
 
-            # Engine's embed_lookup expects BF16. If embed is block-quantized (Q4_K/Q6_K),
-            # dequantize via gguf.quants.dequantize → fp32 → cast to bf16 → store as TRAW BF16.
-            # Same for lm_head if it exists as a separate tensor; if tied, the synthetic copy
-            # also gets BF16 since it shares the embed data.
-            if hf_name in ("model.embed_tokens.weight", "lm_head.weight") and \
-               ggml_dtype in (gguf.GGMLQuantizationType.Q4_K,
-                              gguf.GGMLQuantizationType.Q6_K,
-                              gguf.GGMLQuantizationType.Q8_0):
-                f32 = gguf.quants.dequantize(t.data, ggml_dtype).astype(np.float32)
-                # Cast to bf16 (top 16 bits of fp32 IEEE-754 binary32).
-                f32_u32 = f32.view(np.uint32)
-                bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
-                bf16_bytes = bf16_u16.tobytes()
-                write_traw(f, hf_name, shape, DTYPE_BF16, bf16_bytes)
-                counts["f16"] += 1
-                # Stash for synthetic lm_head (use BF16 bytes already cast).
-                if hf_name == "model.embed_tokens.weight":
-                    embed_raw_for_lm_head = bf16_bytes
-                    embed_shape = list(shape)
-                    embed_dna_dtype = DTYPE_BF16
-                n_written += 1
-                continue
-
-            # Stash embed for later synthetic lm_head (block path, e.g. Q4_0).
+            # Stash embed for synthetic lm_head (same Q6_K blocks). lm_head doesn't
+            # require dequant — engine maps DnaTensor::Block Q6_K → LayerWeight::Q6K
+            # → gemv_q6k path direto (mesmo que GGUF tied).
             if hf_name == "model.embed_tokens.weight":
                 embed_raw_for_lm_head = raw
                 embed_shape = list(shape)
                 embed_dna_dtype = dna_dtype
+
+            # Engine embed_lookup hardcoded BF16 u16. Dequant Q4_K/Q6_K embed →
+            # BF16 → write TRAW BF16 (engine take_full retorna AnyTensor BF16).
+            # lm_head pode ficar Q6_K porque LayerWeight::Q6K kernel suporta.
+            if hf_name == "model.embed_tokens.weight" and \
+               ggml_dtype in (gguf.GGMLQuantizationType.Q4_K,
+                              gguf.GGMLQuantizationType.Q6_K,
+                              gguf.GGMLQuantizationType.Q8_0):
+                f32 = gguf.quants.dequantize(t.data, ggml_dtype).astype(np.float32)
+                f32_u32 = f32.view(np.uint32)
+                bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
+                write_traw(f, hf_name, shape, DTYPE_BF16, bf16_u16.tobytes())
+                counts["f16"] += 1
+                n_written += 1
+                continue
 
             if ggml_dtype in (gguf.GGMLQuantizationType.Q4_K,
                               gguf.GGMLQuantizationType.Q6_K,

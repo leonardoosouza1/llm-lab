@@ -1,0 +1,23 @@
+[package]
+name = "iara-explore"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tateador"
+path = "src/main.rs"
+
+[[bin]]
+name = "medir"
+path = "src/medir.rs"
+
+[[bin]]
+name = "validar"
+path = "src/validar.rs"
+
+[[bin]]
+name = "iara_oi"
+path = "src/iara_oi.rs"
+
+[dependencies]
+serde_json = "1"
