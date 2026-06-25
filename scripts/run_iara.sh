@@ -8,9 +8,9 @@ set -e
 # 1. Limpeza de Travas
 rm -f iara-engine/target/.package-cache
 
-# 2. Caminhos Oficiais ROCm 6.4.4
-export ROCM_PATH=/opt/rocm-7.2.1
-export ROCM_LLVM_PATH=$ROCM_PATH/llvm
+# 2. ROCm paths — override ROCM_PATH para o seu install (default: /opt/rocm)
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export ROCM_LLVM_PATH="${ROCM_LLVM_PATH:-$ROCM_PATH/llvm}"
 # llama.cpp vendored libs + ROCm
 # Script mora em scripts/ — ROOT_DIR é o workspace raiz
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +19,9 @@ export LD_LIBRARY_PATH=$ROOT_DIR/vendor/llama-cpp/lib:$ROCM_PATH/lib:$ROCM_LLVM_
 # 3. Forçar Bindgen a usar o LLVM do ROCm
 export LIBCLANG_PATH=$ROCM_LLVM_PATH/lib
 export CLANG_PATH=$ROCM_LLVM_PATH/bin/clang
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem $ROCM_LLVM_PATH/lib/clang/22/include -I$ROCM_PATH/include"
+# clang resource-dir version varia por release do ROCm — auto-detecta, fallback 22
+ROCM_CLANG_INC="$(ls -d "$ROCM_LLVM_PATH"/lib/clang/*/include 2>/dev/null | head -1)"
+export BINDGEN_EXTRA_CLANG_ARGS="-isystem ${ROCM_CLANG_INC:-$ROCM_LLVM_PATH/lib/clang/22/include} -I$ROCM_PATH/include"
 
 # 4. Overrides de Hardware
 export HSA_OVERRIDE_GFX_VERSION=10.3.0

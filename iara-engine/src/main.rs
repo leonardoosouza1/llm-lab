@@ -352,6 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/lnn/status",         get(lnn_status_handler))
         .route("/api/debug/last-trace",   get(debug_trace_handler))
         .route("/api/neuroviz",           post(neuroviz_handler))
+        // OpenAI-compatible surface — drop-in for openai-python, llm_bridge, LangChain, …
+        .route("/v1/chat/completions",    post(crate::api::openai::chat_completions_handler))
+        .route("/v1/models",              get(crate::api::openai::list_models_handler))
         .nest("/acp/v1", acp::acp_router())
         .fallback_service(ServeDir::new(&frontend_dir))
         .layer(cors)
@@ -394,7 +397,7 @@ async fn run_engine_loop(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             EngineCommand::Resonate(text) | EngineCommand::Stimulus(text) => {
-                log::info!("Engine: '{}'", &text[..text.len().min(50)]);
+                log::info!("Engine: '{}'", text.chars().take(50).collect::<String>());
 
                 // Check model is ready
                 {
@@ -425,7 +428,7 @@ async fn run_engine_loop(
 
                 let _ = frame_tx.send(serde_json::json!({
                     "type": "status",
-                    "message": format!("Processando: '{}'", &text[..text.len().min(30)])
+                    "message": format!("Processando: '{}'", text.chars().take(30).collect::<String>())
                 }).to_string());
 
                 // Formato Q/A para modelo BASE: "Q: {pergunta}\nA:" para perguntas,

@@ -82,7 +82,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
 
     log::debug!(
         "🔤 Tokenizado: '{}' → {} tokens",
-        &text[..text.len().min(40)],
+        text.chars().take(40).collect::<String>(),
         tokens.len(),
     );
 
@@ -124,7 +124,7 @@ pub fn format_for_instruct(user_prompt: &str) -> String {
 /// Tokeniza com chat template Qwen Instruct — usar para todos os modelos instruct.
 pub fn tokenize_instruct(user_prompt: &str) -> Vec<Token> {
     let formatted = format_for_instruct(user_prompt);
-    log::debug!("tokenize_instruct: '{}' → '{}'", user_prompt, &formatted[..formatted.len().min(100)]);
+    log::debug!("tokenize_instruct: '{}' → '{}'", user_prompt, formatted.chars().take(100).collect::<String>());
     tokenize(&formatted)
 }
 

@@ -5,7 +5,6 @@ model.safetensors.index.json
 tokenizer_config.json
 tokenizer.json
 vocab.json
-Cargo.lock
 models/*
 target/*
 **/__pycache__
@@ -13,3 +12,11 @@ target/*
 .agent/events
 **/*.db
 .agent/events/*.db
+
+# logs
+*.log
+
+# build artifacts / experiment data (not needed to run the engine)
+iara-engine/test_debug
+data/weight_landscape_data.json
+data/cross_layer_topo.json

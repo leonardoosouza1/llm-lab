@@ -264,7 +264,7 @@ impl BrainTrace {
              Mean energy: {:.2}. \
              IARA resonance: {:.2}.",
             self.steps.len(),
-            &self.prompt[..self.prompt.len().min(30)],
+            self.prompt.chars().take(30).collect::<String>(),
             top_layers.iter().map(|(l, _)| l).take(3).collect::<Vec<_>>(),
             mean_energy,
             self.iara_resonance_score()

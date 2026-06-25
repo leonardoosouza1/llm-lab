@@ -408,6 +408,20 @@ pub async fn load_model_handler(
         ).into_response();
     }
 
+    // Reject path-traversal / absolute paths — the model name must be a plain
+    // file or directory name inside models_dir, never an escape like "../".
+    if req.name.is_empty()
+        || req.name.contains("..")
+        || req.name.contains('/')
+        || req.name.contains('\\')
+        || req.name.contains('\0')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Nome de modelo inválido" })),
+        ).into_response();
+    }
+
     let model_path = state.models_dir.join(&req.name);
 
     // Check for .gguf file: {name}.gguf in models_dir, or a single .gguf inside the model dir
@@ -898,11 +912,17 @@ pub async fn load_model_handler(
 
 pub async fn generate_handler(
     State(state): State<AppState>,
-    Json(req): Json<GenerateRequest>,
+    Json(mut req): Json<GenerateRequest>,
 ) -> impl IntoResponse {
     log::info!("📝 Generate: prompt={}, stream={}",
-        &req.prompt[..req.prompt.len().min(50)],
+        req.prompt.chars().take(50).collect::<String>(),
         req.stream);
+
+    // Clamp / sanitize sampling params — guards against DoS (huge max_tokens
+    // holds the model mutex for minutes) and garbage from NaN/negative inputs.
+    req.max_tokens = req.max_tokens.clamp(1, 4096);
+    if !(req.temperature.is_finite() && req.temperature >= 0.0) { req.temperature = 0.7; }
+    if !(req.top_p.is_finite() && req.top_p > 0.0 && req.top_p <= 1.0) { req.top_p = 0.9; }
 
     let start = std::time::Instant::now();
 
@@ -1067,7 +1087,7 @@ pub async fn deep_trace_handler(
 // Internal
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn generate_internal(
+pub(crate) async fn generate_internal(
     state: &AppState,
     req: &GenerateRequest,
 ) -> Result<GenerateResponse, Box<dyn std::error::Error>> {
@@ -1278,7 +1298,7 @@ pub async fn train_lnn_handler(
     }).to_string());
 
     for (idx, prompt) in prompts.iter().enumerate() {
-        log::info!("LNN Training [{}/{}]: '{}'", idx + 1, prompts.len(), &prompt[..prompt.len().min(40)]);
+        log::info!("LNN Training [{}/{}]: '{}'", idx + 1, prompts.len(), prompt.chars().take(40).collect::<String>());
 
         let tokens = crate::tokenizer::tokenize_qa(prompt);
         let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
