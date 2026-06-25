@@ -74,7 +74,14 @@ export const wsManager = {
 
   // Actions
   stimulus(text) { this.send({ type: 'stimulus', text }); },
-  resonate(text) { this.send({ type: 'resonate', text }); },
+  resonate(text) {
+    // Honor the Max Tokens control from the UI (if present).
+    const mtEl = document.getElementById('max-tokens-input');
+    const mt = mtEl ? parseInt(mtEl.value, 10) : NaN;
+    const msg = { type: 'resonate', text };
+    if (Number.isFinite(mt) && mt > 0) msg.max_tokens = mt;
+    this.send(msg);
+  },
   selectLayer(name) { this.send({ type: 'select_layer', name }); },
   listLayers() { this.send({ type: 'list_layers' }); },
   reset() { this.send({ type: 'reset' }); },

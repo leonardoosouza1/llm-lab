@@ -396,7 +396,7 @@ async fn run_engine_loop(
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            EngineCommand::Resonate(text) | EngineCommand::Stimulus(text) => {
+            EngineCommand::Resonate(text, ws_params) | EngineCommand::Stimulus(text, ws_params) => {
                 log::info!("Engine: '{}'", text.chars().take(50).collect::<String>());
 
                 // Check model is ready
@@ -446,7 +446,13 @@ async fn run_engine_loop(
 
                 let mut generated_text = String::new();
                 let mut generated_token_ids: Vec<u32> = Vec::new();
-                let mut sampling = SamplingParams::default(); // temperature=0.7, top_k=40, top_p=0.9
+                // Honor sampling params sent by the UI (fall back to sane defaults).
+                let mut sampling = SamplingParams {
+                    temperature: ws_params.temperature.unwrap_or(0.7),
+                    top_k: ws_params.top_k.unwrap_or(40) as usize,
+                    top_p: ws_params.top_p.unwrap_or(0.9),
+                };
+                let max_steps = ws_params.max_tokens.unwrap_or(MAX_STEPS).clamp(1, MAX_STEPS);
 
                 // Layer budget tracking: [Fast, Medium, Slow]
                 let mut budget_counts = [0u32; 3];
@@ -494,7 +500,7 @@ async fn run_engine_loop(
                 };
                 let mut sampling_buf = SamplingBuffer::with_vocab_size(vocab_size);
 
-                for step in 0..MAX_STEPS {
+                for step in 0..max_steps {
                     let (gen_step, layer_budget) = {
                         let mut guard = model.lock().await;
                         let m = match guard.as_mut() {
@@ -682,7 +688,8 @@ async fn run_engine_loop(
                         })
                     }).collect();
 
-                    generated_text.push_str(&gen_step.token_str);
+                    // Decode the full id sequence → correct multi-byte UTF-8 (PT-BR accents/emoji).
+                    generated_text = crate::tokenizer::decode(&generated_token_ids);
 
                     let result = serde_json::json!({
                         "type": "pipeline_result",

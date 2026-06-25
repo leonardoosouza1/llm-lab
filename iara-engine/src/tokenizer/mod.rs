@@ -108,6 +108,23 @@ pub fn token_id_to_text(id: u32) -> String {
     format!("[{}]", id)
 }
 
+/// Decodifica uma sequência inteira de token-ids para texto. Correto para
+/// UTF-8 multibyte que abrange vários tokens — ao contrário de decodificar
+/// token-a-token, que gera U+FFFD quando um codepoint (á, ç, emoji) cai em
+/// tokens byte-fallback separados.
+pub fn decode(ids: &[u32]) -> String {
+    {
+        let guard = get_lock().read().unwrap();
+        if let Some(tok) = guard.as_ref() {
+            if let Ok(text) = tok.decode(ids, false) {
+                return text;
+            }
+        }
+    }
+    // Fallback (tokenizer ausente): melhor esforço token-a-token.
+    ids.iter().map(|&id| token_id_to_text(id)).collect()
+}
+
 /// Aplica o chat template Qwen2.5/Qwen3 Instruct.
 /// Formato: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
 pub fn format_for_instruct(user_prompt: &str) -> String {

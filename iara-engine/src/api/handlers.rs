@@ -1128,6 +1128,7 @@ pub(crate) async fn generate_internal(
     let max_tokens = req.max_tokens.min(gen_cap);
     let prompt_eval_count = prompt_ids.len() as u32;
     let mut generated_text = String::new();
+    let mut generated_token_ids: Vec<u32> = Vec::new();
 
     let mut brain_trace = BrainTrace::new(req.prompt.clone());
     let mut eval_count = 0u32;
@@ -1177,7 +1178,7 @@ pub(crate) async fn generate_internal(
         let decode_start = std::time::Instant::now();
 
         for _step in 0..max_tokens {
-            let (tok_id, tok_str) = if let Some(budget) = layer_budget {
+            let (tok_id, _tok_str) = if let Some(budget) = layer_budget {
                 // Path com budget: usa forward_traced_buffered (suporta budget)
                 let gen_step = crate::inference::forward_traced_buffered(
                     model, &[decode_token], &sampling, Some(budget), &mut sampling_buf)
@@ -1191,11 +1192,13 @@ pub(crate) async fn generate_internal(
             decode_token = tok_id;
             last_token   = decode_token;
             if !eos_ids.contains(&last_token) {
-                generated_text.push_str(&tok_str);
+                generated_token_ids.push(tok_id);
             }
             eval_count += 1;
             if eos_ids.contains(&last_token) { break; }
         }
+        // Decode the whole id sequence at once → correct multi-byte UTF-8.
+        generated_text = crate::tokenizer::decode(&generated_token_ids);
         let decode_duration = decode_start.elapsed();
         let ms = decode_duration.as_millis() as u128;
         log::warn!("DECODE: {} tokens in {}ms = {:.1} tok/s",

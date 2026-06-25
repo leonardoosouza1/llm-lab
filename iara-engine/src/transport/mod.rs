@@ -23,15 +23,24 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+/// Parâmetros de amostragem opcionais que o frontend pode enviar junto do estímulo.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WsSampling {
+    pub temperature: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<usize>,
+}
+
 /// Mensagens que o frontend envia para o backend
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "stimulus")]
-    Stimulus { text: String },
+    Stimulus { text: String, #[serde(flatten)] sampling: WsSampling },
 
     #[serde(rename = "resonate")]
-    Resonate { text: String },
+    Resonate { text: String, #[serde(flatten)] sampling: WsSampling },
 
     #[serde(rename = "select_layer")]
     SelectLayer { name: String },
@@ -61,8 +70,8 @@ pub struct ServerMessage {
 /// Comandos internos enviados do handler WS para o loop principal
 #[derive(Debug)]
 pub enum EngineCommand {
-    Stimulus(String),
-    Resonate(String),
+    Stimulus(String, WsSampling),
+    Resonate(String, WsSampling),
     SelectLayer(String),
     Reset,
     ListLayers,
@@ -156,8 +165,8 @@ async fn handle_connection(
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => {
                         let cmd = match client_msg {
-                            ClientMessage::Stimulus { text } => EngineCommand::Stimulus(text),
-                            ClientMessage::Resonate { text } => EngineCommand::Resonate(text),
+                            ClientMessage::Stimulus { text, sampling } => EngineCommand::Stimulus(text, sampling),
+                            ClientMessage::Resonate { text, sampling } => EngineCommand::Resonate(text, sampling),
                             ClientMessage::SelectLayer { name } => EngineCommand::SelectLayer(name),
                             ClientMessage::Reset => EngineCommand::Reset,
                             ClientMessage::ListLayers => EngineCommand::ListLayers,
