@@ -7,7 +7,6 @@ members = [
     "rocm-backend",
     "opencl-backend",
     "ck-backend",
-    "metaverse-core",
     "llama-sys",
     "iara-train",
     "iara-observe",

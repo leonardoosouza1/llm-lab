@@ -434,14 +434,23 @@ async fn run_engine_loop(
                 // Formato Q/A para modelo BASE: "Q: {pergunta}\nA:" para perguntas,
                 // passthrough para completions diretas (ex: "1+1=").
                 let tokens = crate::tokenizer::tokenize_qa(&text);
-                let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+                let mut prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
 
                 if prompt_ids.is_empty() { continue; }
 
-                // Reset KV cache before generation
-                {
+                // Reset KV cache before generation + read the context window for the guard.
+                let max_seq = {
                     let mut guard = model.lock().await;
-                    if let Some(m) = guard.as_mut() { m.reset_cache(); }
+                    match guard.as_mut() {
+                        Some(m) => { m.reset_cache(); m.cfg.max_seq_len }
+                        None => continue,
+                    }
+                };
+                // Context guard: keep the prompt within the window (avoids OOB GPU write).
+                if prompt_ids.len() > max_seq.saturating_sub(1) {
+                    let keep = max_seq.saturating_sub(1).max(1);
+                    let cut = prompt_ids.len() - keep;
+                    prompt_ids.drain(..cut);
                 }
 
                 let mut generated_text = String::new();
@@ -452,7 +461,8 @@ async fn run_engine_loop(
                     top_k: ws_params.top_k.unwrap_or(40) as usize,
                     top_p: ws_params.top_p.unwrap_or(0.9),
                 };
-                let max_steps = ws_params.max_tokens.unwrap_or(MAX_STEPS).clamp(1, MAX_STEPS);
+                let gen_cap = max_seq.saturating_sub(prompt_ids.len()).max(1).min(MAX_STEPS);
+                let max_steps = ws_params.max_tokens.unwrap_or(gen_cap).clamp(1, gen_cap);
 
                 // Layer budget tracking: [Fast, Medium, Slow]
                 let mut budget_counts = [0u32; 3];
