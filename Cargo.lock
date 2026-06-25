@@ -301,6 +301,9 @@ name = "byte-language-lab"
 version = "0.8.1"
 dependencies = [
  "bytemuck",
+ "iara-byte",
+ "iara-cfc",
+ "iara-hdc",
  "num_cpus",
  "pollster",
  "rayon",
@@ -1406,6 +1409,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "iara-byte"
+version = "0.1.0"
+
+[[package]]
 name = "iara-byte-bench"
 version = "0.1.0"
 dependencies = [
@@ -1417,6 +1424,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "iara-cfc"
+version = "0.1.0"
 
 [[package]]
 name = "iara-engine"
@@ -1461,6 +1472,13 @@ name = "iara-explore"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "iara-hdc"
+version = "0.1.0"
+dependencies = [
+ "iara-byte",
 ]
 
 [[package]]
