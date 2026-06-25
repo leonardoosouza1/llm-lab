@@ -26,8 +26,11 @@ pub struct LayerTrace {
     pub residual_norm: f32,
     /// Máximo absoluto de ativação (placeholder)
     pub max_activation: f32,
-    /// Top-10 neurônios mais ativos (placeholder)
+    /// Top-10 neurônios mais ativos (índices, ordenados por magnitude desc)
     pub hot_neurons: Vec<usize>,
+    /// Magnitude |ativação| de cada hot neuron, paralelo a `hot_neurons`.
+    #[serde(default)]
+    pub hot_neuron_values: Vec<f32>,
     /// Microsegundos estimados nesta camada (forward total / num_layers)
     pub time_us: u128,
     /// Kuramoto phase coherence R ∈ [0,1] computed from hidden state

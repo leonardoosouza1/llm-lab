@@ -667,6 +667,7 @@ async fn run_engine_loop(
                             "residual_norm": trace.residual_norm,
                             "max_activation": trace.max_activation,
                             "hot_neurons": trace.hot_neurons,
+                            "hot_neuron_values": trace.hot_neuron_values,
                             "time_us": trace.time_us,
                             "spikes": trace.hot_neurons.len()
                         });

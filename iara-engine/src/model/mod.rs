@@ -116,7 +116,13 @@ impl ModelCfg {
         let hidden_size = get("embedding_length")?;
         let num_heads = get("attention.head_count")?;
         let num_kv_heads = get("attention.head_count_kv").unwrap_or(num_heads);
-        let head_dim = hidden_size / num_heads;
+        // Qwen3 (and others) use an independent head_dim, stored in GGUF as
+        // {arch}.attention.key_length. Falling back to hidden/heads silently
+        // mis-shapes Q/K/V + RoPE for those models, producing garbage output.
+        let head_dim = {
+            let key = format!("{}.attention.key_length", arch_name);
+            gguf.get_u32(&key).map(|v| v as usize).unwrap_or(hidden_size / num_heads)
+        };
 
         let rms_eps = {
             let key = format!("{}.attention.layer_norm_rms_epsilon", arch_name);
@@ -4125,12 +4131,17 @@ impl CausalLM {
                     .map(|v| v.abs())
                     .sum::<f32>() / h.max(1) as f32;
                 let threshold = mean_abs * 2.0;
-                let hot: Vec<usize> = token_data.iter()
+                // Top-10 most-active neurons BY MAGNITUDE (index + value), so the UI
+                // shows a real per-neuron value instead of repeating max_activation.
+                let mut hot_pairs: Vec<(usize, f32)> = token_data.iter()
                     .enumerate()
-                    .filter(|(_, v)| v.abs() > threshold)
-                    .take(10)
-                    .map(|(i, _)| i)
+                    .map(|(i, v)| (i, v.abs()))
+                    .filter(|(_, a)| *a > threshold)
                     .collect();
+                hot_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                hot_pairs.truncate(10);
+                let hot: Vec<usize> = hot_pairs.iter().map(|(i, _)| *i).collect();
+                let hot_values: Vec<f32> = hot_pairs.iter().map(|(_, a)| *a).collect();
 
                 // Phase coherence: Kuramoto order parameter from hidden state pairs
                 let phase_coherence = iara_observe::phase_coherence_from(
@@ -4155,6 +4166,7 @@ impl CausalLM {
                     residual_norm,
                     max_activation,
                     hot_neurons: hot,
+                    hot_neuron_values: hot_values,
                     time_us: 0,
                     phase_coherence,
                     mlp_activation_rate,
@@ -4167,6 +4179,7 @@ impl CausalLM {
                     residual_norm: 0.0,
                     max_activation: 0.0,
                     hot_neurons: vec![],
+                    hot_neuron_values: vec![],
                     time_us: 0,
                     phase_coherence: 0.0,
                     mlp_activation_rate: 0.0,

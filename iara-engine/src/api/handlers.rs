@@ -1108,7 +1108,24 @@ pub(crate) async fn generate_internal(
 
     // Chat template Qwen Instruct: <|im_start|>system/user/assistant
     let tokens = crate::tokenizer::tokenize_instruct(&req.prompt);
-    let prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+    let mut prompt_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
+
+    // Context guard: scratch + KV buffers are sized to max_seq_len, so prompt +
+    // generated tokens must fit. Truncate the prompt (keep the most recent tail)
+    // and cap generation to the remaining window instead of overrunning device
+    // buffers — an unguarded long prompt is an out-of-bounds GPU write.
+    let max_seq = {
+        let guard = state.qwen_model.lock().await;
+        guard.as_ref().map(|m| m.cfg.max_seq_len).unwrap_or(2048)
+    };
+    if prompt_ids.len() > max_seq.saturating_sub(1) {
+        let keep = max_seq.saturating_sub(1).max(1);
+        let start = prompt_ids.len() - keep;
+        prompt_ids.drain(..start);
+        log::warn!("Prompt truncated to last {} tokens (max_seq_len={})", keep, max_seq);
+    }
+    let gen_cap = max_seq.saturating_sub(prompt_ids.len()).max(1);
+    let max_tokens = req.max_tokens.min(gen_cap);
     let prompt_eval_count = prompt_ids.len() as u32;
     let mut generated_text = String::new();
 
@@ -1159,7 +1176,7 @@ pub(crate) async fn generate_internal(
         let mut sampling_buf = SamplingBuffer::with_vocab_size(model.cfg.vocab_size);
         let decode_start = std::time::Instant::now();
 
-        for _step in 0..req.max_tokens {
+        for _step in 0..max_tokens {
             let (tok_id, tok_str) = if let Some(budget) = layer_budget {
                 // Path com budget: usa forward_traced_buffered (suporta budget)
                 let gen_step = crate::inference::forward_traced_buffered(
@@ -1707,7 +1724,7 @@ pub async fn neuroviz_handler(
         trace.steps.iter().flat_map(|s| s.layer_traces.iter()).take(num_layers).map(|lt| {
             LayerNeuronViz {
                 layer_idx:           lt.layer_idx,
-                mlp_top:             lt.hot_neurons.iter().map(|&i| (i, lt.max_activation)).collect(),
+                mlp_top:             lt.hot_neurons.iter().cloned().zip(lt.hot_neuron_values.iter().cloned()).collect(),
                 mlp_activation_rate: 0.0,
                 attn_top:            Vec::new(),
                 attn_entropy:        0.0,
@@ -1789,8 +1806,8 @@ fn build_neuroviz_token(
     // Build per-layer viz from LayerTrace
     let layers: Vec<LayerNeuronViz> = layer_traces.iter().map(|lt| {
         // Represent hot neurons as (index, max_activation) pairs
-        let mlp_top: Vec<(usize, f32)> = lt.hot_neurons.iter()
-            .map(|&i| (i, lt.max_activation))
+        let mlp_top: Vec<(usize, f32)> = lt.hot_neurons.iter().cloned()
+            .zip(lt.hot_neuron_values.iter().cloned())
             .collect();
 
         LayerNeuronViz {

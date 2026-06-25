@@ -13,7 +13,16 @@ pub fn f32_to_fp8_e4m3(val: f32) -> u8 {
     let f32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
     let f32_mant = bits & 0x7FFFFF;
 
-    // FP8 E4M3: bias = 7, exp range [0, 15], mant = 3 bits
+    // FP8 E4M3: bias = 7, exp range [0, 15], mant = 3 bits.
+    // Round-to-nearest on the kept mantissa bits (add the round bit at position
+    // 19 = just below the 3 retained bits, then carry into the exponent on
+    // overflow). Plain truncation biases every weight toward zero.
+    let rounded = f32_mant + (1 << 19);
+    let (f32_mant, f32_exp) = if rounded & 0x0080_0000 != 0 {
+        (0u32, f32_exp + 1) // mantissa carried out of 23 bits → bump exponent
+    } else {
+        (rounded, f32_exp)
+    };
     let fp8_exp = (f32_exp + 7).clamp(0, 15) as u8;
     let fp8_mant = ((f32_mant >> 20) & 0x7) as u8; // Top 3 mantissa bits
 

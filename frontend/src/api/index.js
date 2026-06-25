@@ -5,7 +5,8 @@ import { wsManager } from './websocket.js';
 /**
  * Unified API Service Entry Point
  */
-const HTTP_URL = 'http://localhost:3000';
+// Same origin the dashboard was served from — works on localhost, LAN IP, or a remote host.
+const HTTP_URL = window.location.origin;
 
 export const api = {
   // Re-export WebSocket for legacy or unified access

@@ -187,7 +187,7 @@ function buildScene(tokenData) {
     }
 
     const neuronMap = new Map();
-    if (layer.hot_neurons) layer.hot_neurons.forEach(idx => neuronMap.set(idx, layer.max_activation || 1.0));
+    if (layer.hot_neurons) layer.hot_neurons.forEach((idx, k) => neuronMap.set(idx, (layer.hot_neuron_values && layer.hot_neuron_values[k]) || layer.max_activation || 1.0));
     if (layer.mlp_top) layer.mlp_top.forEach(([idx, v]) => neuronMap.set(idx, v));
 
     const displayCount = 48;
@@ -274,7 +274,7 @@ function renderBottom(tokenData, layerIdx) {
   if (layer && chipsDiv) {
     const top = layer.mlp_top && layer.mlp_top.length > 0
       ? layer.mlp_top
-      : (layer.hot_neurons || []).map(i => [i, layer.max_activation || 1.0]);
+      : (layer.hot_neurons || []).map((i, k) => [i, (layer.hot_neuron_values && layer.hot_neuron_values[k]) || layer.max_activation || 1.0]);
     top.slice(0, 20).forEach(([idx, val]) => {
       const chip = document.createElement('div');
       chip.className = 'nv-neuron-chip' + (idx === highlightedNeuronIdx ? ' highlighted' : '');
@@ -441,7 +441,7 @@ export async function runNeurovizAnalysis() {
   if (cpOverlay) cpOverlay.style.display = 'none';
 
   try {
-    const resp = await fetch('http://localhost:3000/api/neuroviz', {
+    const resp = await fetch(`${window.location.origin}/api/neuroviz`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt, max_tokens: 30 })

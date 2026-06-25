@@ -72,22 +72,14 @@ export function renderSaeActivationHeatmap() {
   ctx.fillStyle = '#0a0e27';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Draw heatmap cells (mock data for now — would be populated from actual history)
-  for (let i = 0; i < numTokens; i++) {
-    for (let j = 0; j < numFeatures; j++) {
-      const x = j * cellWidth;
-      const y = i * cellHeight;
-
-      // Mock intensity based on feature index and token position
-      const intensity = Math.random() * 0.5;
-      const hue = 120; // Green
-      const saturation = 100 * intensity;
-      const lightness = 25 + 50 * (1 - intensity);
-
-      ctx.fillStyle = `hsl(${hue}, ${saturation}%, ${lightness}%)`;
-      ctx.fillRect(x, y, cellWidth, cellHeight);
-    }
-  }
+  // SAE per-token feature activations are not wired into the live inference
+  // loop yet. Show an explicit empty state instead of fabricating random noise
+  // that would masquerade as real telemetry.
+  ctx.fillStyle = '#5a6b7a';
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('SAE activations not available in this build', canvas.width / 2, canvas.height / 2);
 }
 
 export function updateSaeChart() {

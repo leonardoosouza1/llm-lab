@@ -10,7 +10,7 @@ export const wsManager = {
   reconnectDelay: 1000,
   _reconnectAttempt: 0,
   _backoffDelays: [1000, 2000, 4000, 8000, 16000, 30000],
-  url: 'ws://localhost:8080',
+  url: `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8080`,
 
   connect() {
     if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
@@ -129,6 +129,7 @@ export const wsManager = {
           residual_norm: msg.residual_norm,
           max_activation: msg.max_activation,
           hot_neurons: msg.hot_neurons || [],
+          hot_neuron_values: msg.hot_neuron_values || [],
           time_us: msg.time_us,
           spikes: msg.spikes,
           phase: msg.phase,
