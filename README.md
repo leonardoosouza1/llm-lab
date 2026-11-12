@@ -1,205 +1,159 @@
-# IARA Engine
+# llm-lab: IARA Engine
 
-**A from-scratch LLM inference engine in pure Rust — multi-GPU backend, runs on a consumer AMD card, and lets you _watch the model think_ in real time.**
+**An LLM inference engine written from scratch in Rust, with hand-written HIP kernels. It runs Qwen on a consumer AMD
+card (RX 6750 XT, gfx1031) and streams per-layer telemetry while it generates.**
 
-No PyTorch. No candle. No `llama-cpp-python`. IARA loads `safetensors` / `GGUF` / its own quantized formats straight into VRAM through a hand-written compute backend (ROCm/HIP **or** OpenCL, auto-detected at runtime), runs the full transformer forward pass, and streams **per-layer telemetry** — attention energy, MLP activation, hot neurons — to a live dashboard, token by token.
+It does not use PyTorch, candle or `llama-cpp-python`. Weights (`safetensors`, `GGUF`, or the in-house `.dna` / `.iara`
+containers) are loaded straight into VRAM through a `ComputeBackend` trait with two implementations, ROCm/HIP and
+OpenCL. The engine runs the transformer forward pass, exposes a native API plus an OpenAI-compatible `/v1` surface, and
+broadcasts layer-by-layer telemetry over WebSocket.
 
-It speaks the **OpenAI API**, so anything that talks to OpenAI talks to IARA.
+## Highlights
+
+All numbers were measured on one AMD RX 6750 XT (12 GB, RDNA2). "Reported" means the number comes from a log line that
+has not been re-measured since.
+
+- **Qwen3-4B, native path: 77 tok/s** in the DNA-V5 block-quant format (3.6 GB VRAM). That is 5.5x the engine's own
+  bf16 safetensors path (14 tok/s) and 13% slower than llama.cpp on GGUF Q4_K_M (88 tok/s) on the same card.
+  [docs/architecture/QWEN3.md](docs/architecture/QWEN3.md)
+- **One kernel port gave 2.1x (37 to 77 tok/s).** Profiling showed MLP at 44% of the time, plus a hidden GEMV
+  bottleneck in the Q6_K `lm_head` (vocab 151,936). Porting llama.cpp's `vec_dot_q6_K_q8_1` (dp4a, one warp per row)
+  to HIP fixed it. The kernel is in `hip-ffi/kernels/mmvq_llama.hip`.
+- **Qwen2.5-1.5B on the native ROCm path: 69.3 tok/s decode** (14 tokens in 202 ms, 751 ms end to end for a short
+  Portuguese chat reply).
+- **`iara-semente`: a byte-level model trained from scratch in Rust/HIP**, with 19 kernels and the backward pass
+  written by hand (no autograd). It runs at 116k tokens/s. Analytic gradients agree with finite differences of an f64
+  host loss to between 1e-6 and 7.9e-3 (worst case).
+- **Multi-digit arithmetic, 300 problems: Qwen2.5-1.5B Q4_K_M gets 62.0% and a digit-by-digit byte solver gets 94.0%.**
+  The byte solver is exact by construction for + and −, so this measures where the LLM fails (0% on 3+ digit
+  multiplication). It is not a model-vs-model contest. [BENCH_RESULTS.md](BENCH_RESULTS.md)
+
+## How it works
 
 ```
-   safetensors / GGUF / .iara / .dna
+   safetensors / GGUF / .dna / .iara
                   │
                   ▼
-        ┌───────────────────┐     HTTP  :3000  ── /api/* + /v1/* (OpenAI)
-        │    IARA Engine     │     WS    :8080  ── per-layer telemetry stream
-        │   (Rust · tokio)   │     Web   :3000  ── live "watch it think" dashboard
-        └───────────────────┘
-            │            │
-     ROCm/HIP        OpenCL          (runtime auto-detect — no rebuild)
-   AMD RX 6750 XT   Intel iGPU / any OpenCL 3.0 GPU
+        ┌────────────────────┐    HTTP :3000  /api/*, /v1/* (OpenAI), /acp/v1/*
+        │    iara-engine     │    WS   :8080  per-token, per-layer telemetry
+        │  (Rust, tokio/axum)│    Web  :3000  dashboard (frontend/)
+        └────────────────────┘
+             │            │
+        ROCm/HIP        OpenCL           backend chosen at runtime behind ComputeBackend
+     hipBLAS + .hip    JIT C kernels
+     kernels; GGUF via llama.cpp FFI (llama-sys)
 ```
 
-> Part of the **IARA** ecosystem. Built and tuned on hardware AMD doesn't officially
-> support for ML (an RX 6750 XT gaming card), forcing `HSA_OVERRIDE_GFX_VERSION=10.3.0`.
+- **Generation flow:** tokenize (ChatML) → reset KV cache → batched prefill → per-token `forward_traced` (RMSNorm →
+  QKV → RoPE → KV cache → attention → MLP, with telemetry per layer) → sample → JSON response + WebSocket broadcast.
+- **Telemetry:** each forward pass emits a `LayerTrace` per layer with attention energy, MLP energy, residual norm,
+  the top-10 neurons by magnitude, and timing.
+- **Formats:**
+  - `.gguf` goes to llama.cpp through FFI.
+  - `.dna`, `.iara` and safetensors go to the native HIP path.
+  - DNA-V5 stores ggml block-quantized tensors (Q4_K/Q6_K/Q8_0) in a TLV container and reuses the GGUF-path kernels.
+  - DNA-V4 (SVD-factorized) is kept for reference only; see "What didn't work".
+- **Device-side quantization kernels:** Q4_K, Q6_K, FP8 (e4m3), and 2-bit ternary (BitNet-style).
 
----
+| Crate | Role |
+|---|---|
+| `iara-engine` | server, inference pipeline, telemetry, OpenAI surface |
+| `compute-core` | `ComputeBackend` trait and parameter structs (no hardware code) |
+| `rocm-backend` / `hip-ffi` | ROCm/HIP backend, HIP + hipBLAS bindings, `.hip` kernels |
+| `opencl-backend` | OpenCL backend (JIT C kernels + naive GEMM) |
+| `ck-backend` | Composable Kernel backend stub |
+| `llama-sys` | thin llama.cpp FFI for the GGUF path |
+| `iara-train` | LoRA fine-tuning, DNA compression, ternary MoE bench example |
+| `iara-observe`, `iara-explore` | observability, exploration binaries (embedding-only "0-layer" probes, measurements) |
+| `iara-byte-bench` | accuracy harness (arithmetic bench above) |
+| `iara-semente` | from-scratch byte model, Rust/HIP, hand-written backward (experimental) |
 
-## Three things this PoC shows
+## Results
 
-### 1. 👁️ You can watch the model think
-Every forward pass emits a `LayerTrace` per transformer layer — attention energy, MLP energy,
-residual norm, the hottest neurons, and per-layer timing. The Vue dashboard at
-`http://localhost:3000` renders this as a **live heatmap that lights up layer-by-layer as each
-token is generated**, plus the top-k candidate tokens and an attention view. It turns an opaque
-matmul pipeline into something you can actually see.
+| What | Number | Baseline / note | Status |
+|---|---|---|---|
+| Qwen3-4B decode, DNA-V5 native | 77 tok/s, 3.6 GB VRAM | GGUF Q4_K_M via llama.cpp 88 tok/s; safetensors native 14 tok/s | measured |
+| Q6_K mmvq kernel port | 37 → 77 tok/s | same model and format | measured |
+| Qwen2.5-1.5B decode, native ROCm | 69.3 tok/s | 14 tokens / 202 ms | measured |
+| `iara-semente` byte model | 116k tokens/s; 1.44M equivalent weights in 268 KB | gradient check vs f64 finite differences, worst 7.9e-3 | measured |
+| 30B MoE (Qwen3-30B-A3B) experts in ternary, FFN only, Rust + `gemv_ternary` | 15.23 ms/token for 48 FFN layers, 7.2 GB (4.0x smaller than FP8) | 238x the Python version; per-layer cosine 0.873, end-to-end quality not measured | partial |
+| wave64 vs wave32 GEMV on RDNA2 | 88.4 vs 68 tok/s | memory-bound GEMV; wave64 kernels compiled as a separate `.hsaco` | reported |
+| Arithmetic, 300 problems | Qwen 62.0% vs byte solver 94.0% | byte solver exact by construction | reported (repo file) |
 
-<!-- TODO(Leonardo): drop a GIF of the dashboard here — docs/dashboard.gif — it's the strongest visual asset -->
+## What didn't work (and why)
 
-### 2. ⚙️ It's a real systems project (no ML framework)
-- **Dynamic GPU backend** behind a single `ComputeBackend` trait. **ROCm/HIP** (hand-written
-  hipBLAS + HIP kernels) and **OpenCL** (JIT-compiled C kernels) are selected at runtime —
-  same binary, different hardware.
-- **Multi-format loader:** `safetensors` (zero-copy mmap, BF16 on device), `GGUF` (via a thin
-  llama.cpp FFI), and two in-house formats — **`.iara`** (quantization-recipe container) and
-  **`.dna`** (SVD-factorized weights).
-- **Quantization, device-side:** `Q4_K`, `Q6_K`, `FP8 (e4m3)`, and **BitNet 2-bit ternary**
-  (16× smaller than BF16) — ported/written from scratch.
-- **Universal architecture auto-detect:** Qwen, Llama, Mistral, Phi, Gemma… read straight from
-  `config.json` / GGUF metadata.
+- **SVD compression (DNA-V4) does not shrink Qwen.** Truncated SVD at 95% energy took Qwen2.5-1.5B from 2620 MB to
+  2550 MB (1.03x), because the MLP needs more than 80% of full rank. On Qwen3-4B, rank-256 `v_proj` keeps only about
+  50% of the energy and the output drifts 42% (garbage). Rank 256 had been lossless on Qwen2.5-1.5B only because that
+  `v_proj` is [256, 1536]. DNA-V5 (block quantization, full rank) replaced it.
+- **The remaining 13% gap to llama.cpp comes from launch overhead.** An older profile measured GEMV effective bandwidth
+  at 73 GB/s, about 17% of peak, with roughly 395 kernel launches per token (reported). llama.cpp runs a fused graph.
+  The existing fused gate+up kernel (`IARA_FUSE_MLP=1`) is slower (62 tok/s) because it predates the mmvq port.
+- **The native backend is not thread-safe.** Two to four concurrent workers hit HIP error 700 (illegal memory access)
+  through races on shared buffers, and two processes on the same GPU crash. Requests are serialized behind one mutex.
+- **Flash-decode kernels assume `head_dim = 128`** (4 elements × 32 lanes). Models with `head_dim = 64` (Qwen2.5-0.5B)
+  give wrong output without any error. The context limit on that path is 1024.
+- **"Pointer weights" (`iara-semente`) lost to a dense control.** Storing each weight as a learned address into a
+  shared bank lost 17% perplexity at equal disk size and 25% at equal parameter count. The kernels and gradient check
+  are correct. The idea is what failed.
 
-### 3. 🔌 It's OpenAI-compatible
-A drop-in `/v1/chat/completions` + `/v1/models` surface means existing tooling
-(`openai-python`, **`llm_bridge`**, LangChain, …) points at IARA with one base-URL change.
-Chat messages are rendered to the correct ChatML template internally and routed through the same
-generation path as the native API.
+## Hardware and stack
 
----
+- AMD RX 6750 XT, 12 GB, Navi22 **gfx1031**, run as gfx1030 with `HSA_OVERRIDE_GFX_VERSION=10.3.0`. The card is not
+  officially supported by ROCm. Kernels are wave32 except the dedicated wave64 GEMV set.
+- ROCm 7.2.1, hipBLAS, Rust 2021, tokio/axum. An Intel Iris Plus (Gen 11) iGPU is supported through OpenCL.
+- RDNA2 has no matrix cores and no fast bf16 path, so the engine keeps fp16/fp32 on the device and uses dp4a for
+  quantized dot products.
 
-## Quickstart
+## Build and run
 
-### 1 · Clone & get a model
-
-The engine ships **no weights** (they're git-ignored). Grab any supported model into `models/`.
-A single-file GGUF is the easiest start (uses the fast llama.cpp path):
+The repo ships no weights (`models/` is git-ignored).
 
 ```bash
 git clone https://github.com/leonardoosouza1/llm-lab.git
 cd llm-lab
 mkdir -p models
-
-# Option A — GGUF (one file, recommended for a first run)
+# single-file GGUF (llama.cpp path):
 wget -c "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf" \
      -O models/qwen2.5-1.5b.gguf
+# or safetensors for the native path: config.json, tokenizer.json, model.safetensors in models/<name>/
 
-# Option B — safetensors (full native backend + telemetry)
-#   download config.json, tokenizer.json and model.safetensors into models/qwen2.5-1.5b/
+export ROCM_PATH=/opt/rocm             # your ROCm install
+./scripts/run_iara.sh release          # builds with --features rocm, serves :3000 (HTTP) and :8080 (WS)
+./scripts/run_igpu.sh release          # OpenCL instead
 ```
 
-### 2 · Run
+A GPU feature is required. A plain `cargo build --release` produces a binary that exits with "no compute backend
+available", so build with `--features rocm` or `--features opencl`.
 
 ```bash
-# AMD (ROCm) — override ROCM_PATH if yours isn't /opt/rocm
-./scripts/run_iara.sh release        # builds + serves on :3000 / :8080
-
-# Intel iGPU / other OpenCL GPU
-./scripts/run_igpu.sh release
-```
-
-First build of the workspace takes a while (13 crates, LTO). Then open **http://localhost:3000**.
-
-### 3 · Generate
-
-Load a model, then call it — native API or OpenAI-compatible, your choice:
-
-```bash
-# Load (returns 202; first load JIT-compiles + pre-warms GPU kernels)
-curl -s localhost:3000/api/load-model -H 'content-type: application/json' \
-     -d '{"name":"qwen2.5-1.5b"}'
-
-# OpenAI-compatible
+curl -s localhost:3000/api/load-model -H 'content-type: application/json' -d '{"name":"qwen2.5-1.5b"}'
 curl -s localhost:3000/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "qwen2.5-1.5b",
-  "messages": [{"role":"user","content":"Explique o que é um byte em uma frase."}],
-  "max_tokens": 80
-}'
+  "model": "qwen2.5-1.5b", "messages": [{"role":"user","content":"Hello!"}], "max_tokens": 60}'
 ```
-
-…or point the official OpenAI SDK at it:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:3000/v1", api_key="not-needed")
-print(client.chat.completions.create(
-    model="qwen2.5-1.5b",
-    messages=[{"role": "user", "content": "Hello!"}],
-).choices[0].message.content)
-```
-
----
-
-## API
 
 | Method | Route | Purpose |
-|--------|-------|---------|
-| `GET`  | `/health` | Server + model status, VRAM info |
-| `GET`  | `/api/models` | Discover models in `models/` |
-| `POST` | `/api/load-model` | Load a model into VRAM (background, 202) |
-| `POST` | `/api/unload-model` | Free VRAM |
-| `POST` | `/api/generate` | Native generation (temperature, top-k/p, optional layer `budget`) |
-| `POST` | `/api/trace` | Deep single-token trace (rich per-layer telemetry) |
-| `POST` | **`/v1/chat/completions`** | **OpenAI-compatible chat** (non-streaming) |
-| `GET`  | **`/v1/models`** | **OpenAI-compatible model list** |
-| `WS`   | `:8080` | Live per-token / per-layer telemetry stream |
-| `*`    | `/acp/v1/*` | Agent Communication Protocol (runs, agents, events) |
+|---|---|---|
+| GET | `/health`, `/ping` | status, VRAM |
+| GET | `/api/models` | models found in `models/` |
+| POST | `/api/load-model`, `/api/unload-model` | load (async, 202) / free VRAM |
+| POST | `/api/generate` | native generation (temperature, top-k/p, optional layer `budget`) |
+| POST | `/api/trace` | single-token trace with full per-layer telemetry |
+| POST / GET | `/v1/chat/completions`, `/v1/models` | OpenAI-compatible (non-streaming) |
+| * | `/acp/v1/*` | Agent Communication Protocol (runs, agents, events) |
+| WS | `:8080` | live telemetry stream |
 
----
+## Status
 
-## Architecture
-
-A Cargo workspace; the engine never imports a hardware backend directly — only the
-`ComputeBackend` trait.
-
-| Crate | Role |
-|-------|------|
-| `iara-engine` | tokio + axum server, inference pipeline, telemetry, OpenAI surface |
-| `compute-core` | `ComputeBackend` trait + param structs (no hardware code) |
-| `rocm-backend` | AMD ROCm/HIP impl — hipBLAS + hand-written HIP kernels |
-| `opencl-backend` | OpenCL impl — JIT C kernels + GEMM |
-| `hip-ffi` | low-level HIP / hipBLAS bindings |
-| `llama-sys` | thin llama.cpp FFI (GGUF fast path) |
-| `iara-train` | LoRA fine-tuning + DNA compression |
-| `iara-observe` | telemetry / observability subsystem |
-| `iara-byte-bench` | accuracy benchmark harness |
-
-**Generation flow:** `POST /api/generate` → tokenize (ChatML) → reset KV cache → batched prefill →
-per-token `forward_traced` (RMSNorm → QKV → RoPE → KV-cache → attention → MLP, telemetry per layer)
-→ sample → JSON response + WebSocket broadcast.
-
-See [`CLAUDE.md`](CLAUDE.md) and [`iara-engine/CLAUDE.md`](iara-engine/CLAUDE.md) for the deep dive.
-
----
-
-## Performance & benchmarks
-
-Measured on a single **AMD RX 6750 XT (12 GB, RDNA2, gfx1032)**:
-
-- **~160 tok/s** for Qwen2.5-1.5B (Q4_K_M) via the llama.cpp backend.
-- **77 tok/s** for the native `.dna` SVD path after porting the llama.cpp `Q6_K` mmvq kernel
-  (up from 37 tok/s — a 2× kernel win).
-- Kernel **pre-warm on load** eliminates the 30–60 s JIT stall on the first request.
-
-The engine also drives a head-to-head arithmetic benchmark (Qwen-1.5B vs a byte-level model):
-**62% vs 94%** over 300 problems — see [`BENCH_RESULTS.md`](BENCH_RESULTS.md).
-
----
-
-## Hardware & reproducibility
-
-| Backend | Hardware | Cargo feature |
-|---------|----------|---------------|
-| ROCm/HIP | AMD RX 6750 XT (gfx1032, RDNA2) | `--features rocm` |
-| OpenCL | Intel Iris Plus Gen 11 / any OpenCL 3.0 GPU | `--features opencl` |
-
-```bash
-# RDNA2 needs the gfx override (card not officially ROCm-supported) + wave32
-export HSA_OVERRIDE_GFX_VERSION=10.3.0 ROCR_VISIBLE_DEVICES=0
-export ROCM_PATH=/opt/rocm        # point at your install
-```
-
----
-
-## Status & honest limitations
-
-- ✅ **Native + GGUF inference, telemetry dashboard, multi-backend** are the battle-tested core.
-- 🆕 **OpenAI `/v1` surface** is new in this PoC — non-streaming only (no SSE yet); chat content
-  is treated as text (no tool-calls / vision).
-- ⚠️ **One model at a time** (`Arc<Mutex<Option<CausalLM>>>`); the native backend serializes
-  requests behind that mutex (the GGUF batch server handles concurrency).
-- ⚠️ OpenCL GEMM is a naive K-loop — correct but slow for large models.
-- 🚧 VLMs load the text decoder only (vision encoder is future work).
-
----
+- Working: native and GGUF inference, the telemetry dashboard, both backends, the OpenAI `/v1` surface (no SSE
+  streaming, no tool calls or vision).
+- Limits: one model loaded at a time, requests serialized, the OpenCL GEMM is a naive K-loop, and VLMs load only the
+  text decoder.
+- Next: a fused gate+up mmvq kernel to close the remaining 13%, flash decode for `head_dim = 64`, and per-request
+  buffers for concurrency.
+- New experiments (draft-verify, layer-parallel decode) live in the sibling Rust workspace `iara-lab`, which reuses
+  `hip-ffi` from this repo.
 
 ## License
 
-[MIT](LICENSE) © 2026 Leonardo Souza
+[MIT](LICENSE), by leonardoosouza1.
